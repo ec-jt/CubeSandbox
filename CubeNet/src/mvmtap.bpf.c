@@ -983,8 +983,32 @@ int from_cube(struct __sk_buff *skb)
 		mvm_port.listen_port = l4->source;
 		host_port = bpf_map_lookup_elem(&local_port_mapping, &mvm_port);
 		if (host_port) {
+			struct egress_desc *desc;
+
 			if (l4->syn && !l4->ack)
 				return TC_ACT_SHOT;
+			desc = bpf_map_lookup_elem(&host_port_egress, host_port);
+
+			/* TEMP DEBUG: cross-node reply path validation. Logs the sandbox
+			 * ifindex, the guest source port, the host port, the reply
+			 * destination IP, and that the reply is force-redirected out
+			 * nodenic_ifindex (primary NIC). Confirms whether the reply can
+			 * ever reach a cross-node client on the vSwitch.
+			 * bpf_trace_printk is limited to 3 value args, hence two calls.
+			 */
+			bpf_printk("cnode reply: ifi=%u sport=%u hport=%u\n",
+				   ifindex, bpf_ntohs(l4->source), bpf_ntohs(*host_port));
+			bpf_printk("cnode reply: dst=%u desc=%u\n",
+				   bpf_ntohl(daddr), desc ? desc->ifindex : 0);
+
+			if (desc) {
+				err = snat_tcp_desc(skb, l2, l3, l4, l4->source,
+						    *host_port, desc);
+				if (err)
+					return TC_ACT_SHOT;
+
+				return bpf_redirect(desc->ifindex, 0);
+			}
 
 			err = snat_tcp(skb, ifindex, l2, l3, l4, l4->source, *host_port);
 			if (err)

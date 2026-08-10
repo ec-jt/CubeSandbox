@@ -20,6 +20,8 @@
 static int tcp_nat_proxy(struct __sk_buff *skb, struct ethhdr *l2, struct iphdr *l3, struct tcphdr *l4,
 			 struct mvm_port *mvm_port)
 {
+	struct egress_desc desc = {};
+	union macaddr *macaddr;
 	__u32 old_daddr, new_daddr, tcp_csum_off;
 	__u16 old_dport, new_dport;
 	__u16 ip_hlen;
@@ -34,6 +36,24 @@ static int tcp_nat_proxy(struct __sk_buff *skb, struct ethhdr *l2, struct iphdr 
 	ip_hlen = BPF_CORE_READ_BITFIELD(l3, ihl);
 	ip_hlen <<= 2;
 	tcp_csum_off = TCP_CSUM_OFF(ip_hlen);
+
+	/* Learn the return path before set_mac_pair overwrites the client's source
+	 * MAC. host ports and map keys are consistently kept in network byte order.
+	 */
+	if (skb->vlan_present) {
+		__u32 ingress_ifindex = skb->ifindex;
+
+		desc.ifindex = cross_node_ifindex;
+		desc.ip = cross_node_ip;
+		desc.smac_p1 = cross_node_macaddr_p1;
+		desc.smac_p2 = cross_node_macaddr_p2;
+		macaddr = (union macaddr *)l2->h_source;
+		desc.dmac_p1 = macaddr->p1;
+		desc.dmac_p2 = macaddr->p2;
+		err = bpf_map_update_elem(&host_port_egress, &old_dport, &desc, BPF_ANY);
+		bpf_printk("cnode egress: hport=%u ifi=%u err=%d\n",
+			   bpf_ntohs(old_dport), ingress_ifindex, err);
+	}
 
 	/* update L2 first: csum/store helpers may invalidate packet pointers */
 	set_mac_pair(l2, cubegw0_macaddr_p1, cubegw0_macaddr_p2,
@@ -64,6 +84,32 @@ static int tcp_nat_proxy(struct __sk_buff *skb, struct ethhdr *l2, struct iphdr 
 	err = bpf_skb_store_bytes(skb, IP_DADDR_OFF, &new_daddr, sizeof(new_daddr), 0);
 	if (err)
 		return TC_ACT_OK;
+
+	/* TEMP DEBUG: cross-node ingress validation.
+	 * Logs the ingress ifindex, the skb VLAN tag (metadata), the host port
+	 * we matched, the guest listen port, and the redirect target ifindex.
+	 * Lets us confirm (a) from_world fires on vlan4000, (b) the 802.1Q tag
+	 * rides in skb->vlan_tci, and (c) the redirect targets the sandbox TAP.
+	 * bpf_trace_printk is limited to 3 value args, hence two calls.
+	 */
+	bpf_printk("cnode proxy: ifi=%u vlan=%u dport=%u\n",
+		   skb->ifindex, skb->vlan_tci, bpf_ntohs(old_dport));
+	bpf_printk("cnode proxy: lport=%u rdir=%u\n",
+		   bpf_ntohs(new_dport), mvm_port->ifindex);
+
+	/* Cross-node ingress on an 802.1Q sub-interface (e.g. vlan4000) leaves the
+	 * VLAN tag in skb->vlan_tci metadata (skb_vlan_untag pulled it from the
+	 * data at the TC ingress hook). The kernel re-inserts that tag into the
+	 * frame written to the sandbox TAP fd, and the guest NIC silently drops
+	 * the tagged frame — the cross-node request never reaches the sandbox.
+	 * Pop the tag (clears the metadata tag; no-op when untagged) before the
+	 * redirect so the frame delivered to the guest is clean.
+	 */
+	if (skb->vlan_present) {
+		err = bpf_skb_vlan_pop(skb);
+		if (err)
+			return TC_ACT_OK;
+	}
 
 	return bpf_redirect(mvm_port->ifindex, 0);
 }
@@ -385,11 +431,20 @@ static int do_tcp_nat(struct __sk_buff *skb)
 	if (!__pull_headers(skb, &l2, &l3, &l4))
 		return TC_ACT_OK;
 
-	/* Port mapping is exposed only on the configured primary NIC. The same
-	 * from_world program also runs on cube-router egress, where port mapping
-	 * must be skipped and only reverse NAT sessions are relevant.
+	/* Port mapping is exposed on node-facing ingress NICs. The same from_world
+	 * program also runs on cube-router egress, where the destination port is a
+	 * sandbox's own outbound port and NOT a registered host port — so the
+	 * port-mapping redirect must be skipped there. We therefore fire the
+	 * redirect on every interface EXCEPT the cube-router device. This enables
+	 * cross-node ingress: a packet to a registered host_port arriving on a
+	 * non-primary node NIC (e.g. a vSwitch interface) is reverse-NATed and
+	 * redirected to the local sandbox TAP exactly as primary-NIC traffic is.
+	 *
+	 * When cube_router_ifindex is 0 (router disabled / single node), the gate
+	 * is effectively "fire everywhere", which matches the original single-node
+	 * behaviour because from_world is then only attached to the primary NIC.
 	 */
-	if (skb->ifindex == nodenic_ifindex) {
+	if (skb->ifindex != cube_router_ifindex) {
 		dport = l4->dest;
 		mvm_port = bpf_map_lookup_elem(&remote_port_mapping, &dport);
 		if (mvm_port)

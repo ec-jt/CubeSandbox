@@ -19,6 +19,7 @@ import (
 	"github.com/cilium/ebpf"
 	"github.com/tencentcloud/CubeSandbox/CubeNet/cubevs"
 	CubeLog "github.com/tencentcloud/CubeSandbox/cubelog"
+	"github.com/vishvananda/netlink"
 )
 
 var (
@@ -107,6 +108,29 @@ func NewLocalService(cfg Config) (Service, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Optional cross-node ingress NIC (e.g. vSwitch). Resolve only its ifindex
+	// so the from_world port-mapping redirect also attaches there on ingress.
+	// We deliberately do NOT use getMachineDevice here: a point-to-point vSwitch
+	// NIC has no default gateway, which getMachineDevice requires.
+	var crossNodeIfindex uint32
+	var crossNodeIP net.IP
+	var crossNodeMacAddr net.HardwareAddr
+	if cfg.CrossNodeEthName != "" {
+		link, err := netlinkLinkByName(cfg.CrossNodeEthName)
+		if err != nil {
+			return nil, fmt.Errorf("cross-node eth %q: %w", cfg.CrossNodeEthName, err)
+		}
+		addrs, err := netlink.AddrList(link, netlink.FAMILY_V4)
+		if err != nil {
+			return nil, fmt.Errorf("list IPv4 addresses on cross-node eth %q: %w", cfg.CrossNodeEthName, err)
+		}
+		if len(addrs) != 1 || addrs[0].IP.To4() == nil {
+			return nil, fmt.Errorf("ipv4 address on cross-node eth %q is not unique", cfg.CrossNodeEthName)
+		}
+		crossNodeIfindex = uint32(link.Attrs().Index)
+		crossNodeIP = addrs[0].IP.To4()
+		crossNodeMacAddr = link.Attrs().HardwareAddr
+	}
 	cdev, err := getOrCreateCubeDev(allocator.GatewayIP(), allocator.mask, cfg.MvmMtu, cfg.MvmGwMacAddr)
 	if err != nil {
 		return nil, err
@@ -152,20 +176,23 @@ func NewLocalService(cfg Config) (Service, error) {
 		return nil, err
 	}
 	params := cubevs.Params{
-		MVMInnerIP:          mvmInnerIP,
-		MVMMacAddr:          mvmMacAddr,
-		MVMGatewayIP:        mvmGatewayIP,
-		Cubegw0Ifindex:      uint32(cdev.Index),
-		Cubegw0IP:           cdev.IP,
-		Cubegw0MacAddr:      cdev.Mac,
-		EgressSrcMacAddr:    egressSrcMac,
-		EgressDstMacAddr:    egressDstMac,
-		EgressRedirectFlags: egressRedirectFlags,
-		CubeRouterIfindex:   cubeRouterIfindex,
-		NodeIfindex:         uint32(device.Index),
-		NodeIP:              device.IP,
-		NodeMacAddr:         device.Mac,
-		NodeGatewayMacAddr:  device.GatewayMac,
+		MVMInnerIP:              mvmInnerIP,
+		MVMMacAddr:              mvmMacAddr,
+		MVMGatewayIP:            mvmGatewayIP,
+		Cubegw0Ifindex:          uint32(cdev.Index),
+		Cubegw0IP:               cdev.IP,
+		Cubegw0MacAddr:          cdev.Mac,
+		EgressSrcMacAddr:        egressSrcMac,
+		EgressDstMacAddr:        egressDstMac,
+		EgressRedirectFlags:     egressRedirectFlags,
+		CubeRouterIfindex:       cubeRouterIfindex,
+		NodeIfindex:             uint32(device.Index),
+		CrossNodeIngressIfindex: crossNodeIfindex,
+		CrossNodeIP:             crossNodeIP,
+		CrossNodeMacAddr:        crossNodeMacAddr,
+		NodeIP:                  device.IP,
+		NodeMacAddr:             device.Mac,
+		NodeGatewayMacAddr:      device.GatewayMac,
 	}
 	if err := cubevs.Init(params); err != nil {
 		return nil, err

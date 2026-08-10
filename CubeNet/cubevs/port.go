@@ -74,6 +74,17 @@ func DelPortMapping(ifindex uint32, listenPort uint16, hostPort uint16) error {
 		return fmt.Errorf("map.Delete failed: %w, name: %s", err, MapNameRemotePortMapping)
 	}
 
+	m3, err := loadPinnedMap(MapNameHostPortEgress)
+	if err != nil {
+		return err
+	}
+	defer m3.Close()
+
+	err = m3.Delete(&hostPort)
+	if err != nil && !errors.Is(err, ebpf.ErrKeyNotExist) {
+		return fmt.Errorf("map.Delete failed: %w, name: %s", err, MapNameHostPortEgress)
+	}
+
 	return nil
 }
 

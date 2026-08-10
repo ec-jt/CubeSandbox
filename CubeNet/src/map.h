@@ -57,6 +57,29 @@ struct {
 	__uint(pinning, LIBBPF_PIN_BY_NAME);
 } local_port_mapping SEC(".maps");
 
+/* Cross-node reply egress descriptor, learned from ingress packets.
+ *
+ * key:   host port (network byte order)
+ * value: ingress interface, source identity and peer L2 address
+ */
+struct egress_desc {
+	__u32 ifindex;
+	__u32 ip;
+	__u32 smac_p1;
+	__u16 smac_p2;
+	__u32 dmac_p1;
+	__u16 dmac_p2;
+	__u16 pad;
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, MAX_PORTS);
+	__type(key, __u16);
+	__type(value, struct egress_desc);
+	__uint(pinning, LIBBPF_PIN_BY_NAME);
+} host_port_egress SEC(".maps");
+
 /* Egress session table
  *
  * key:   5-tuple for egress packet

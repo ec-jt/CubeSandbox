@@ -58,8 +58,23 @@ func rewriteConstants(vars map[string]*ebpf.VariableSpec, params Params) error {
 	}
 	err = errors.Join(err, vars[globalNameNodeIP].Set(ipToUint32(params.NodeIP)))
 	err = errors.Join(err, vars[globalNameNodeIfindex].Set(params.NodeIfindex))
+	if v := vars[globalNameCubeRouterIfindex]; v != nil {
+		err = errors.Join(err, v.Set(params.CubeRouterIfindex))
+	}
 	err = errors.Join(err, vars[globalNameNodeMacaddrP1].Set(hardwareAddrToUint32(params.NodeMacAddr)))
 	err = errors.Join(err, vars[globalNameNodeMacaddrP2].Set(hardwareAddrToUint16(params.NodeMacAddr)))
+	if v := vars[globalNameCrossNodeIP]; v != nil {
+		err = errors.Join(err, v.Set(ipToUint32(params.CrossNodeIP)))
+	}
+	if v := vars[globalNameCrossNodeIfindex]; v != nil {
+		err = errors.Join(err, v.Set(params.CrossNodeIngressIfindex))
+	}
+	if v := vars[globalNameCrossNodeMacaddrP1]; v != nil {
+		err = errors.Join(err, v.Set(hardwareAddrToUint32(params.CrossNodeMacAddr)))
+	}
+	if v := vars[globalNameCrossNodeMacaddrP2]; v != nil {
+		err = errors.Join(err, v.Set(hardwareAddrToUint16(params.CrossNodeMacAddr)))
+	}
 	err = errors.Join(err, vars[globalNameNodeGatewayMacaddrP1].Set(hardwareAddrToUint32(params.NodeGatewayMacAddr)))
 	err = errors.Join(err, vars[globalNameNodeGatewayMacaddrP2].Set(hardwareAddrToUint16(params.NodeGatewayMacAddr)))
 	return err
@@ -277,6 +292,15 @@ func Init(params Params) error {
 	err = attachTCFilter(programNameFromWorld, params.NodeIfindex, TCIngress)
 	if err != nil {
 		return err
+	}
+
+	// attach TC filter to the optional cross-node ingress NIC (e.g. vSwitch) so
+	// the from_world port-mapping redirect also fires for traffic arriving there.
+	if params.CrossNodeIngressIfindex != 0 {
+		err = attachTCFilter(programNameFromWorld, params.CrossNodeIngressIfindex, TCIngress)
+		if err != nil {
+			return err
+		}
 	}
 
 	return nil

@@ -54,6 +54,12 @@ type Config struct {
 	CubeRouterEnable  bool
 	CubeRouterCIDR    string
 	CubeRouterMacAddr string
+
+	// CrossNodeEthName is an optional additional node-facing NIC (e.g. a
+	// vSwitch interface) whose ingress should also run the from_world
+	// port-mapping redirect so that cross-node sandbox traffic arriving on it
+	// is reverse-NATed into local sandboxes. Empty disables.
+	CrossNodeEthName string
 }
 
 func DefaultConfig() Config {
@@ -104,6 +110,9 @@ type cubeletNetworkConfig struct {
 	CubeRouterEnable  bool   `toml:"cube_router_enable"`
 	CubeRouterCIDR    string `toml:"cube_router_cidr"`
 	CubeRouterMacAddr string `toml:"cube_router_mac_addr"`
+
+	// Cross-node ingress NIC (optional).
+	CrossNodeEthName string `toml:"cross_node_eth_name"`
 }
 
 const cubeletNetworkPluginKey = "io.cubelet.internal.v1.network"
@@ -161,6 +170,9 @@ func LoadConfigFromCubeletTOML(base Config, path string) (Config, error) {
 	}
 	if networkCfg.CubeRouterMacAddr != "" {
 		base.CubeRouterMacAddr = networkCfg.CubeRouterMacAddr
+	}
+	if networkCfg.CrossNodeEthName != "" {
+		base.CrossNodeEthName = networkCfg.CrossNodeEthName
 	}
 	if networkCfg.TapInitNum != 0 {
 		base.TapInitNum = networkCfg.TapInitNum

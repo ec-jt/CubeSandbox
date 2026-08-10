@@ -103,6 +103,23 @@ const volatile __u32 nodenic_ifindex    = 2;
 const volatile __u32 nodenic_macaddr_p1 = 0x68005452;	/* 52:54:00:68:dd:16 */
 const volatile __u16 nodenic_macaddr_p2 = 0x16dd;
 
+/* IP and MAC address of the optional cross-node ingress interface. */
+const volatile __u32 cross_node_ip         = 0;
+const volatile __u32 cross_node_ifindex    = 0;
+const volatile __u32 cross_node_macaddr_p1 = 0;
+const volatile __u16 cross_node_macaddr_p2 = 0;
+
+/* Ifindex of the cube-router device. The from_world TC program is also
+ * attached to cube-router egress, where the destination port is a sandbox's
+ * own outbound port and NOT a registered host port — so port-mapping redirect
+ * must be skipped there. Rewritten at load time from Params.CubeRouterIfindex.
+ * Default 0 (no router) means the gate in do_tcp_nat falls back to firing on
+ * any interface that is not the (unset) router, which preserves the
+ * single-node behaviour while enabling cross-node ingress on the node-facing
+ * NICs (e.g. a vSwitch interface).
+ */
+const volatile __u32 cube_router_ifindex = 0;
+
 /* MAC address of the Node gateway (next hop) */
 const volatile __u32 nodegw_macaddr_p1  = 0x4732eefe;	/* fe:ee:32:47:6b:93 */
 const volatile __u16 nodegw_macaddr_p2  = 0x936b;

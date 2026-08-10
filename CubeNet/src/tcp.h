@@ -258,6 +258,51 @@ static __always_inline long snat_tcp(struct __sk_buff *skb,
 	return 0;
 }
 
+static __always_inline long snat_tcp_desc(struct __sk_buff *skb,
+					  struct ethhdr *l2, struct iphdr *l3, struct tcphdr *l4,
+					  __u16 listen_port, __u16 host_port,
+					  const struct egress_desc *desc)
+{
+	__u32 saddr, offset, node_ip;
+	union macaddr *macaddr;
+	__u16 ip_hlen;
+	__u64 flags;
+	long err;
+
+	saddr = l3->saddr;
+	node_ip = desc->ip;
+	ip_hlen = BPF_CORE_READ_BITFIELD(l3, ihl);
+	ip_hlen <<= 2;
+
+	macaddr = (union macaddr *)l2->h_dest;
+	macaddr->p1 = desc->dmac_p1;
+	macaddr->p2 = desc->dmac_p2;
+	macaddr = (union macaddr *)l2->h_source;
+	macaddr->p1 = desc->smac_p1;
+	macaddr->p2 = desc->smac_p2;
+
+	offset = TCP_CSUM_OFF(ip_hlen);
+	flags = BPF_F_PSEUDO_HDR | sizeof(saddr);
+	err = bpf_l4_csum_replace(skb, offset, saddr, node_ip, flags);
+	if (err)
+		return err;
+
+	flags = sizeof(listen_port);
+	err = bpf_l4_csum_replace(skb, offset, listen_port, host_port, flags);
+	if (err)
+		return err;
+
+	err = bpf_skb_store_bytes(skb, TCP_SRC_OFF(ip_hlen), &host_port, sizeof(host_port), 0);
+	if (err)
+		return err;
+
+	err = bpf_l3_csum_replace(skb, IP_CSUM_OFF, saddr, node_ip, sizeof(saddr));
+	if (err)
+		return err;
+
+	return bpf_skb_store_bytes(skb, IP_SADDR_OFF, &node_ip, sizeof(node_ip), 0);
+}
+
 static __always_inline void update_session(enum ip_conntrack_dir dir, struct nat_session *sess,
 					   __u64 now_ns, bool syn, bool ack, bool fin, bool rst)
 {
