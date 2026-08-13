@@ -91,6 +91,18 @@ pub async fn expose_sandbox_port(
     Ok(Json(exposed))
 }
 
+pub async fn close_sandbox_port(
+    State(state): State<AppState>,
+    Path((sandbox_id, container_port)): Path<(String, u16)>,
+) -> AppResult<impl IntoResponse> {
+    state
+        .services
+        .sandboxes
+        .close_port(&sandbox_id, container_port)
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 // ─── GET /v2/sandboxes ────────────────────────────────────────────────────────
 
 #[utoipa::path(

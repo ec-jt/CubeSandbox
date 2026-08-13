@@ -312,6 +312,7 @@ const (
 	UpdateActionRemoveDevice = "removeDevice"
 	UpdateActionPause        = "pause"
 	UpdateActionExposePort   = "exposePort"
+	UpdateActionClosePort    = "closePort"
 	UpdateActionResume       = "resume"
 	PreStopTypePause         = "pause"
 	PreStopTypeDestroy       = "destroy"

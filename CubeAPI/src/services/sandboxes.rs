@@ -365,6 +365,22 @@ impl SandboxService {
         })
     }
 
+    pub async fn close_port(&self, sandbox_id: &str, container_port: u16) -> AppResult<()> {
+        let mut req = self.build_update_request(sandbox_id, "closePort", None);
+        req.container_port = Some(i32::from(container_port));
+        let resp = self
+            .cubemaster
+            .update_sandbox(&req)
+            .await
+            .map_err(|e| map_update_cubemaster_err(e, sandbox_id))?;
+        ensure_update_result(
+            resp.ret.ret_code,
+            resp.ret.ret_msg,
+            sandbox_id,
+            "port release failed",
+        )
+    }
+
     pub async fn resume_sandbox(
         &self,
         sandbox_id: &str,
@@ -1596,6 +1612,8 @@ mod tests {
                 instance_type: "cubebox".to_string(),
                 action: "resume".to_string(),
                 timeout: Some(value),
+                container_port: None,
+                port_limit: None,
             };
             let json = serde_json::to_value(&req).unwrap();
             assert_eq!(

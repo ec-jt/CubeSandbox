@@ -102,6 +102,8 @@ func (s *service) Update(ctx context.Context, req *cubebox.UpdateCubeSandboxRequ
 		return s.UpdateWithResume(ctx, req, sb)
 	case constants.UpdateActionExposePort:
 		return s.UpdateWithExposePort(ctx, req, sb)
+	case constants.UpdateActionClosePort:
+		return s.UpdateWithClosePort(ctx, req, sb)
 	default:
 		rsp.Ret.RetMsg = "invalid update action"
 		rsp.Ret.RetCode = errorcode.ErrorCode_InvalidParamFormat
@@ -115,6 +117,7 @@ var reservedUserServicePorts = map[int32]struct{}{
 	17300: {}, // Rust sandbox HTTP/WebSocket API
 	17301: {}, // Cap'n Proto process RPC
 	49983: {}, // envd/E2B control API
+	49999: {}, // template readiness probe
 }
 
 func (s *service) UpdateWithExposePort(ctx context.Context, req *cubebox.UpdateCubeSandboxRequest, sb *cubeboxstore.CubeBox) (*cubebox.UpdateCubeSandboxResponse, error) {
@@ -148,6 +151,13 @@ func (s *service) UpdateWithExposePort(ctx context.Context, req *cubebox.UpdateC
 		rsp.Ret.RetMsg = err.Error()
 		return rsp, nil
 	}
+	metadata, err := networkplugin.GetNetworkMetadata(ctx, req.SandboxID)
+	if err != nil {
+		rsp.Ret.RetCode = errorcode.ErrorCode_CreateNetworkFailed
+		rsp.Ret.RetMsg = err.Error()
+		return rsp, nil
+	}
+	dynamicPorts := networkplugin.DynamicPortSet(metadata)
 	alreadyExposed := false
 	for _, mapping := range current {
 		if mapping.ContainerPort == port {
@@ -155,21 +165,49 @@ func (s *service) UpdateWithExposePort(ctx context.Context, req *cubebox.UpdateC
 			break
 		}
 	}
-	if !alreadyExposed && (len(current) >= int(limit64) || len(current) >= hardExposedPortLimit) {
+	if !alreadyExposed && (len(dynamicPorts) >= int(limit64) || len(dynamicPorts) >= hardExposedPortLimit) {
 		rsp.Ret.RetCode = errorcode.ErrorCode_InvalidParamFormat
 		rsp.Ret.RetMsg = fmt.Sprintf("exposed port quota exceeded: limit=%d", limit64)
 		return rsp, nil
 	}
-	mappings, err := networkplugin.ExposePort(ctx, req.SandboxID, req.RequestID, port)
+	_, err = networkplugin.ExposePort(ctx, req.SandboxID, req.RequestID, port)
 	if err != nil {
 		rsp.Ret.RetCode = errorcode.ErrorCode_CreateNetworkFailed
 		rsp.Ret.RetMsg = err.Error()
 		return rsp, nil
 	}
-	if len(mappings) > int(limit64) || len(mappings) > hardExposedPortLimit {
-		rsp.Ret.RetCode = errorcode.ErrorCode_InvalidParamFormat
-		rsp.Ret.RetMsg = fmt.Sprintf("exposed port quota exceeded: limit=%d", limit64)
+	return rsp, nil
+}
+
+func (s *service) UpdateWithClosePort(ctx context.Context, req *cubebox.UpdateCubeSandboxRequest, sb *cubeboxstore.CubeBox) (*cubebox.UpdateCubeSandboxResponse, error) {
+	rsp := &cubebox.UpdateCubeSandboxResponse{RequestID: req.RequestID, Ret: &errorcode.Ret{RetCode: errorcode.ErrorCode_Success}}
+	if sb.GetStatus().Get().State() != cubebox.ContainerState_CONTAINER_RUNNING {
+		rsp.Ret.RetCode = errorcode.ErrorCode_TaskStateInvalid
+		rsp.Ret.RetMsg = "sandbox must be running to close a port"
 		return rsp, nil
+	}
+	port64, err := strconv.ParseInt(req.Annotations["cube.master.container_port"], 10, 32)
+	if err != nil || port64 < 1 || port64 > 65535 {
+		rsp.Ret.RetCode = errorcode.ErrorCode_InvalidParamFormat
+		rsp.Ret.RetMsg = "container_port must be between 1 and 65535"
+		return rsp, nil
+	}
+	port := int32(port64)
+	if _, reserved := reservedUserServicePorts[port]; reserved {
+		rsp.Ret.RetCode = errorcode.ErrorCode_InvalidParamFormat
+		rsp.Ret.RetMsg = fmt.Sprintf("container port %d is reserved", port)
+		return rsp, nil
+	}
+	_, removed, err := networkplugin.ClosePort(ctx, req.SandboxID, req.RequestID, port)
+	if err != nil {
+		rsp.Ret.RetCode = errorcode.ErrorCode_CreateNetworkFailed
+		rsp.Ret.RetMsg = err.Error()
+		return rsp, nil
+	}
+	if !removed {
+		// Dynamic membership is authoritative. An absent entry is idempotent and
+		// also protects every original template mapping from removal.
+		rsp.Ret.RetMsg = "port was not dynamically exposed"
 	}
 	return rsp, nil
 }

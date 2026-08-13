@@ -6,11 +6,13 @@ package network
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
 	"path"
 	"path/filepath"
+	"slices"
 	"time"
 
 	"github.com/containerd/containerd/v2/plugins"
@@ -42,6 +44,7 @@ type delegateNetworkManager struct {
 var dnm *delegateNetworkManager
 
 const DBBucketNetwork = "network/v1"
+const DynamicPortsMetadataKey = "cube.dynamic_ports"
 const (
 	networkMetricCreate = "cube-network-create"
 	networkMetricGetBdf = "cube-network-bdf"
@@ -105,22 +108,94 @@ func ExposePort(ctx context.Context, sandboxID, requestID string, containerPort 
 	if err != nil {
 		return nil, err
 	}
+	metadata := cloneMetadata(current.PersistMetadata)
+	dynamicPorts := DynamicPortSet(metadata)
 	for _, mapping := range current.PortMappings {
 		if mapping.ContainerPort == containerPort {
+			// A pre-existing mapping not present in the dynamic set belongs to the
+			// template and must never be converted into user quota or made closable.
 			return current.PortMappings, nil
 		}
 	}
 	desired := append([]networkagentclient.PortMapping(nil), current.PortMappings...)
 	desired = append(desired, networkagentclient.PortMapping{Protocol: "tcp", HostIP: "127.0.0.1", ContainerPort: containerPort})
+	dynamicPorts[containerPort] = struct{}{}
+	metadata[DynamicPortsMetadataKey] = encodeDynamicPortSet(dynamicPorts)
 	resp, err := dnm.tapPlugin.networkAgentClient.ReconcileNetwork(ctx, &networkagentclient.ReconcileNetworkRequest{
 		SandboxID: sandboxID, NetworkHandle: current.NetworkHandle, IdempotencyKey: requestID,
 		Interfaces: current.Interfaces, Routes: current.Routes, ARPNeighbors: current.ARPNeighbors,
-		PortMappings: desired, PersistMetadata: current.PersistMetadata,
+		PortMappings: desired, PersistMetadata: metadata,
 	})
 	if err != nil {
 		return nil, err
 	}
 	return resp.PortMappings, nil
+}
+
+// ClosePort removes a mapping only when it was created by ExposePort. Passing
+// an absent dynamic port is idempotent and leaves template mappings untouched.
+func ClosePort(ctx context.Context, sandboxID, requestID string, containerPort int32) ([]networkagentclient.PortMapping, bool, error) {
+	if dnm == nil || dnm.tapPlugin == nil {
+		return nil, false, fmt.Errorf("network plugin is unavailable")
+	}
+	current, err := dnm.tapPlugin.networkAgentClient.GetNetwork(ctx, &networkagentclient.GetNetworkRequest{SandboxID: sandboxID, NetworkHandle: sandboxID})
+	if err != nil {
+		return nil, false, err
+	}
+	metadata := cloneMetadata(current.PersistMetadata)
+	dynamicPorts := DynamicPortSet(metadata)
+	if _, ok := dynamicPorts[containerPort]; !ok {
+		return current.PortMappings, false, nil
+	}
+	desired := make([]networkagentclient.PortMapping, 0, len(current.PortMappings))
+	for _, mapping := range current.PortMappings {
+		if mapping.ContainerPort != containerPort {
+			desired = append(desired, mapping)
+		}
+	}
+	delete(dynamicPorts, containerPort)
+	metadata[DynamicPortsMetadataKey] = encodeDynamicPortSet(dynamicPorts)
+	resp, err := dnm.tapPlugin.networkAgentClient.ReconcileNetwork(ctx, &networkagentclient.ReconcileNetworkRequest{
+		SandboxID: sandboxID, NetworkHandle: current.NetworkHandle, IdempotencyKey: requestID,
+		Interfaces: current.Interfaces, Routes: current.Routes, ARPNeighbors: current.ARPNeighbors,
+		PortMappings: desired, PersistMetadata: metadata,
+	})
+	if err != nil {
+		return nil, false, err
+	}
+	return resp.PortMappings, true, nil
+}
+
+func cloneMetadata(metadata map[string]string) map[string]string {
+	cloned := make(map[string]string, len(metadata)+1)
+	for key, value := range metadata {
+		cloned[key] = value
+	}
+	return cloned
+}
+
+func DynamicPortSet(metadata map[string]string) map[int32]struct{} {
+	ports := make(map[int32]struct{})
+	var values []int32
+	if metadata == nil || json.Unmarshal([]byte(metadata[DynamicPortsMetadataKey]), &values) != nil {
+		return ports
+	}
+	for _, port := range values {
+		if port >= 1 && port <= 65535 {
+			ports[port] = struct{}{}
+		}
+	}
+	return ports
+}
+
+func encodeDynamicPortSet(ports map[int32]struct{}) string {
+	values := make([]int32, 0, len(ports))
+	for port := range ports {
+		values = append(values, port)
+	}
+	slices.Sort(values)
+	encoded, _ := json.Marshal(values)
+	return string(encoded)
 }
 
 func GetExposedPorts(ctx context.Context, sandboxID string) ([]networkagentclient.PortMapping, error) {
@@ -134,6 +209,17 @@ func GetExposedPorts(ctx context.Context, sandboxID string) ([]networkagentclien
 		return nil, err
 	}
 	return current.PortMappings, nil
+}
+
+func GetNetworkMetadata(ctx context.Context, sandboxID string) (map[string]string, error) {
+	if dnm == nil || dnm.tapPlugin == nil {
+		return nil, fmt.Errorf("network plugin is unavailable")
+	}
+	current, err := dnm.tapPlugin.networkAgentClient.GetNetwork(ctx, &networkagentclient.GetNetworkRequest{SandboxID: sandboxID, NetworkHandle: sandboxID})
+	if err != nil {
+		return nil, err
+	}
+	return cloneMetadata(current.PersistMetadata), nil
 }
 
 func (m *delegateNetworkManager) Init(ctx context.Context, opts *workflow.InitInfo) error {

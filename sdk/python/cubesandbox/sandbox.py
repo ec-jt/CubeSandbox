@@ -186,6 +186,18 @@ class Sandbox:
         _check_response(resp)
         return str(resp.json()["publicURL"])
 
+    def close_port(self, port: int) -> None:
+        """Idempotently remove a dynamically exposed TCP port mapping.
+
+        Template-static and reserved service ports cannot be removed.
+        """
+        if not 1 <= port <= 65535:
+            raise ValueError("port must be between 1 and 65535")
+        resp = self._session.delete(
+            f"{self._config.api_url}/sandboxes/{self.sandbox_id}/ports/{port}",
+        )
+        _check_response(resp)
+
     @property
     def commands(self) -> "Commands":
         return self._commands

@@ -42,9 +42,9 @@ func Update(ctx context.Context, req *types.UpdateRequest) (rsp *types.Res) {
 		rsp.Ret.RetMsg = "should provide InstanceType,SandboxID,Action"
 		return
 	}
-	if req.Action != "pause" && req.Action != "resume" && req.Action != constants.UpdateActionExposePort {
+	if req.Action != "pause" && req.Action != "resume" && req.Action != constants.UpdateActionExposePort && req.Action != constants.UpdateActionClosePort {
 		rsp.Ret.RetCode = int(errorcode.ErrorCode_MasterParamsError)
-		rsp.Ret.RetMsg = "action should be pause, resume, or exposePort"
+		rsp.Ret.RetMsg = "action should be pause, resume, exposePort, or closePort"
 		return
 	}
 	if ret := normalizeSandboxIDInReq(ctx, &req.SandboxID); ret != nil {
@@ -96,7 +96,7 @@ func Update(ctx context.Context, req *types.UpdateRequest) (rsp *types.Res) {
 	}
 	rsp.Ret.RetCode = int(cubeRsp.GetRet().GetRetCode())
 	rsp.Ret.RetMsg = cubeRsp.GetRet().GetRetMsg()
-	if rsp.Ret.RetCode == int(errorcode.ErrorCode_Success) && req.Action == constants.UpdateActionExposePort {
+	if rsp.Ret.RetCode == int(errorcode.ErrorCode_Success) && (req.Action == constants.UpdateActionExposePort || req.Action == constants.UpdateActionClosePort) {
 		proxyMap, ok := localcache.GetSandboxProxyMap(ctx, req.SandboxID)
 		if !ok || proxyMap == nil {
 			rsp.Ret.RetCode = int(errorcode.ErrorCode_NotFound)
