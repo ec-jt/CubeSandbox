@@ -86,7 +86,12 @@ pub async fn expose_sandbox_port(
     let exposed = state
         .services
         .sandboxes
-        .expose_port(&sandbox_id, container_port, body.port_limit)
+        .expose_port(
+            &sandbox_id,
+            container_port,
+            body.port_limit,
+            body.port_class.as_deref(),
+        )
         .await?;
     Ok(Json(exposed))
 }

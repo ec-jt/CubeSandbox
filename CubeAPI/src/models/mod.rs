@@ -339,6 +339,10 @@ pub struct ExposePortRequest {
     /// Caller-enforced per-sandbox quota. CubeSandbox also enforces a hard cap of 100.
     #[serde(rename = "portLimit")]
     pub port_limit: i32,
+    /// Dynamic port ownership. Defaults to `user`; platform callers use
+    /// `infrastructure` for lifecycle-tracked, quota-free mappings.
+    #[serde(rename = "portClass", default)]
+    pub port_class: Option<String>,
 }
 
 // ─── Sandbox — pause/resume/connect/snapshot ──────────────────────────────

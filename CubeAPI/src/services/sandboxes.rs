@@ -336,15 +336,22 @@ impl SandboxService {
         sandbox_id: &str,
         container_port: u16,
         port_limit: i32,
+        port_class: Option<&str>,
     ) -> AppResult<ExposedPort> {
-        if port_limit < 1 || port_limit > 100 {
+        if port_class != Some("infrastructure") && (port_limit < 1 || port_limit > 100) {
             return Err(AppError::BadRequest(
                 "portLimit must be between 1 and 100".into(),
+            ));
+        }
+        if !matches!(port_class, None | Some("user") | Some("infrastructure")) {
+            return Err(AppError::BadRequest(
+                "portClass must be user or infrastructure".into(),
             ));
         }
         let mut req = self.build_update_request(sandbox_id, "exposePort", None);
         req.container_port = Some(i32::from(container_port));
         req.port_limit = Some(port_limit);
+        req.port_class = port_class.map(str::to_owned);
         let resp = self
             .cubemaster
             .update_sandbox(&req)
@@ -667,6 +674,7 @@ impl SandboxService {
             timeout,
             container_port: None,
             port_limit: None,
+            port_class: None,
         }
     }
 
@@ -1598,6 +1606,7 @@ mod tests {
             timeout: None,
             container_port: None,
             port_limit: None,
+            port_class: None,
         };
         let json = serde_json::to_value(&req).unwrap();
         assert!(
@@ -1614,6 +1623,7 @@ mod tests {
                 timeout: Some(value),
                 container_port: None,
                 port_limit: None,
+                port_class: None,
             };
             let json = serde_json::to_value(&req).unwrap();
             assert_eq!(

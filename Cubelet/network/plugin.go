@@ -44,7 +44,14 @@ type delegateNetworkManager struct {
 var dnm *delegateNetworkManager
 
 const DBBucketNetwork = "network/v1"
-const DynamicPortsMetadataKey = "cube.dynamic_ports"
+const (
+	// DynamicPortsMetadataKey contains quota-counted user-service ports.
+	DynamicPortsMetadataKey = "cube.dynamic_ports"
+	// DynamicInfraPortsMetadataKey contains dynamically exposed infrastructure
+	// ports. Both sets are persisted through pause/resume and participate in
+	// lifecycle cleanup, but only DynamicPortsMetadataKey is quota-counted.
+	DynamicInfraPortsMetadataKey = "cube.dynamic_infra_ports"
+)
 const (
 	networkMetricCreate = "cube-network-create"
 	networkMetricGetBdf = "cube-network-bdf"
@@ -98,7 +105,7 @@ func (m *delegateNetworkManager) ID() string {
 // ExposePort lazily adds one container-port mapping to an existing sandbox.
 // The network-agent owns allocation and persistence; this wrapper preserves
 // the complete desired list required by ReconcileNetwork.
-func ExposePort(ctx context.Context, sandboxID, requestID string, containerPort int32) ([]networkagentclient.PortMapping, error) {
+func ExposePort(ctx context.Context, sandboxID, requestID string, containerPort int32, quotaCounted bool) ([]networkagentclient.PortMapping, error) {
 	if dnm == nil || dnm.tapPlugin == nil {
 		return nil, fmt.Errorf("network plugin is unavailable")
 	}
@@ -110,6 +117,7 @@ func ExposePort(ctx context.Context, sandboxID, requestID string, containerPort 
 	}
 	metadata := cloneMetadata(current.PersistMetadata)
 	dynamicPorts := DynamicPortSet(metadata)
+	dynamicInfraPorts := DynamicInfraPortSet(metadata)
 	for _, mapping := range current.PortMappings {
 		if mapping.ContainerPort == containerPort {
 			// A pre-existing mapping not present in the dynamic set belongs to the
@@ -119,8 +127,13 @@ func ExposePort(ctx context.Context, sandboxID, requestID string, containerPort 
 	}
 	desired := append([]networkagentclient.PortMapping(nil), current.PortMappings...)
 	desired = append(desired, networkagentclient.PortMapping{Protocol: "tcp", HostIP: "127.0.0.1", ContainerPort: containerPort})
-	dynamicPorts[containerPort] = struct{}{}
+	if quotaCounted {
+		dynamicPorts[containerPort] = struct{}{}
+	} else {
+		dynamicInfraPorts[containerPort] = struct{}{}
+	}
 	metadata[DynamicPortsMetadataKey] = encodeDynamicPortSet(dynamicPorts)
+	metadata[DynamicInfraPortsMetadataKey] = encodeDynamicPortSet(dynamicInfraPorts)
 	resp, err := dnm.tapPlugin.networkAgentClient.ReconcileNetwork(ctx, &networkagentclient.ReconcileNetworkRequest{
 		SandboxID: sandboxID, NetworkHandle: current.NetworkHandle, IdempotencyKey: requestID,
 		Interfaces: current.Interfaces, Routes: current.Routes, ARPNeighbors: current.ARPNeighbors,
@@ -144,7 +157,10 @@ func ClosePort(ctx context.Context, sandboxID, requestID string, containerPort i
 	}
 	metadata := cloneMetadata(current.PersistMetadata)
 	dynamicPorts := DynamicPortSet(metadata)
-	if _, ok := dynamicPorts[containerPort]; !ok {
+	dynamicInfraPorts := DynamicInfraPortSet(metadata)
+	_, isUserPort := dynamicPorts[containerPort]
+	_, isInfraPort := dynamicInfraPorts[containerPort]
+	if !isUserPort && !isInfraPort {
 		return current.PortMappings, false, nil
 	}
 	desired := make([]networkagentclient.PortMapping, 0, len(current.PortMappings))
@@ -154,7 +170,9 @@ func ClosePort(ctx context.Context, sandboxID, requestID string, containerPort i
 		}
 	}
 	delete(dynamicPorts, containerPort)
+	delete(dynamicInfraPorts, containerPort)
 	metadata[DynamicPortsMetadataKey] = encodeDynamicPortSet(dynamicPorts)
+	metadata[DynamicInfraPortsMetadataKey] = encodeDynamicPortSet(dynamicInfraPorts)
 	resp, err := dnm.tapPlugin.networkAgentClient.ReconcileNetwork(ctx, &networkagentclient.ReconcileNetworkRequest{
 		SandboxID: sandboxID, NetworkHandle: current.NetworkHandle, IdempotencyKey: requestID,
 		Interfaces: current.Interfaces, Routes: current.Routes, ARPNeighbors: current.ARPNeighbors,
@@ -175,9 +193,17 @@ func cloneMetadata(metadata map[string]string) map[string]string {
 }
 
 func DynamicPortSet(metadata map[string]string) map[int32]struct{} {
+	return dynamicPortSetForKey(metadata, DynamicPortsMetadataKey)
+}
+
+func DynamicInfraPortSet(metadata map[string]string) map[int32]struct{} {
+	return dynamicPortSetForKey(metadata, DynamicInfraPortsMetadataKey)
+}
+
+func dynamicPortSetForKey(metadata map[string]string, key string) map[int32]struct{} {
 	ports := make(map[int32]struct{})
 	var values []int32
-	if metadata == nil || json.Unmarshal([]byte(metadata[DynamicPortsMetadataKey]), &values) != nil {
+	if metadata == nil || json.Unmarshal([]byte(metadata[key]), &values) != nil {
 		return ports
 	}
 	for _, port := range values {

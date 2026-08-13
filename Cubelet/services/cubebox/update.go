@@ -139,11 +139,24 @@ func (s *service) UpdateWithExposePort(ctx context.Context, req *cubebox.UpdateC
 		rsp.Ret.RetMsg = fmt.Sprintf("container port %d is reserved", port)
 		return rsp, nil
 	}
-	limit64, err := strconv.ParseInt(req.Annotations["cube.master.port_limit"], 10, 32)
-	if err != nil || limit64 < 1 || limit64 > hardExposedPortLimit {
+	portClass := req.Annotations["cube.master.port_class"]
+	if portClass != "" && portClass != "user" && portClass != "infrastructure" {
 		rsp.Ret.RetCode = errorcode.ErrorCode_InvalidParamFormat
-		rsp.Ret.RetMsg = fmt.Sprintf("port_limit must be between 1 and %d", hardExposedPortLimit)
+		rsp.Ret.RetMsg = "port_class must be user or infrastructure"
 		return rsp, nil
+	}
+	// Dynamic ports have no predefined numeric range. Callers explicitly mark
+	// platform-owned infrastructure mappings; absent classification preserves
+	// backward compatibility by treating a dynamic exposure as a user port.
+	quotaCounted := portClass != "infrastructure"
+	var limit64 int64
+	if quotaCounted {
+		limit64, err = strconv.ParseInt(req.Annotations["cube.master.port_limit"], 10, 32)
+		if err != nil || limit64 < 1 || limit64 > hardExposedPortLimit {
+			rsp.Ret.RetCode = errorcode.ErrorCode_InvalidParamFormat
+			rsp.Ret.RetMsg = fmt.Sprintf("port_limit must be between 1 and %d", hardExposedPortLimit)
+			return rsp, nil
+		}
 	}
 	current, err := networkplugin.GetExposedPorts(ctx, req.SandboxID)
 	if err != nil {
@@ -165,12 +178,12 @@ func (s *service) UpdateWithExposePort(ctx context.Context, req *cubebox.UpdateC
 			break
 		}
 	}
-	if !alreadyExposed && (len(dynamicPorts) >= int(limit64) || len(dynamicPorts) >= hardExposedPortLimit) {
+	if quotaCounted && !alreadyExposed && (len(dynamicPorts) >= int(limit64) || len(dynamicPorts) >= hardExposedPortLimit) {
 		rsp.Ret.RetCode = errorcode.ErrorCode_InvalidParamFormat
 		rsp.Ret.RetMsg = fmt.Sprintf("exposed port quota exceeded: limit=%d", limit64)
 		return rsp, nil
 	}
-	_, err = networkplugin.ExposePort(ctx, req.SandboxID, req.RequestID, port)
+	_, err = networkplugin.ExposePort(ctx, req.SandboxID, req.RequestID, port, quotaCounted)
 	if err != nil {
 		rsp.Ret.RetCode = errorcode.ErrorCode_CreateNetworkFailed
 		rsp.Ret.RetMsg = err.Error()

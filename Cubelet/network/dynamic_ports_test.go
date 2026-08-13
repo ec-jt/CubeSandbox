@@ -18,3 +18,20 @@ func TestDynamicPortSetInvalidMetadataIsEmpty(t *testing.T) {
 		t.Fatalf("invalid metadata produced ports=%v", ports)
 	}
 }
+
+func TestDynamicUserAndInfraPortSetsAreIndependent(t *testing.T) {
+	metadata := map[string]string{
+		DynamicPortsMetadataKey:      `[3000,4000]`,
+		DynamicInfraPortsMetadataKey: `[9000,2999,4001]`,
+	}
+	if got := len(DynamicPortSet(metadata)); got != 2 {
+		t.Fatalf("quota-counted dynamic ports=%d, want 2", got)
+	}
+	infra := DynamicInfraPortSet(metadata)
+	if got := len(infra); got != 3 {
+		t.Fatalf("infrastructure dynamic ports=%d, want 3", got)
+	}
+	if _, ok := infra[9000]; !ok {
+		t.Fatal("infrastructure port 9000 was not retained")
+	}
+}

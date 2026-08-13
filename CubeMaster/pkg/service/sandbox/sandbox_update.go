@@ -77,6 +77,7 @@ func Update(ctx context.Context, req *types.UpdateRequest) (rsp *types.Res) {
 			constants.CubeAnnotationsInsType:      req.InstanceType,
 			"cube.master.container_port":          fmt.Sprintf("%d", req.ContainerPort),
 			"cube.master.port_limit":              fmt.Sprintf("%d", req.PortLimit),
+			"cube.master.port_class":              req.PortClass,
 		},
 	}
 	cubeRsp, err := cubelet.Update(ctx, calleeEndpoint, cubeletReq)

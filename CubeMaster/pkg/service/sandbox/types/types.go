@@ -791,6 +791,7 @@ type UpdateRequest struct {
 	Action        string `json:"action"`
 	ContainerPort int32  `json:"container_port,omitempty"`
 	PortLimit     int32  `json:"port_limit,omitempty"`
+	PortClass     string `json:"port_class,omitempty"`
 }
 
 // SetTimeoutRequest is the wire shape for POST /cube/sandbox/timeout.

@@ -1404,6 +1404,8 @@ pub struct SandboxUpdateRequest {
     pub container_port: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub port_limit: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub port_class: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
