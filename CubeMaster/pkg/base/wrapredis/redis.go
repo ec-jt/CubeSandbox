@@ -33,6 +33,15 @@ var (
 	mutex   sync.Mutex
 )
 
+// ResetPoolForTest drops the cached connection pool so the next GetRedis call
+// rebuilds it from the current config. Intended for tests that point
+// config.RedisConf at a fresh miniredis instance per case; without this the
+// process-global pool keeps connections to a previous test's (now closed)
+// server and subsequent commands fail with EOF.
+func ResetPoolForTest() {
+	safeMap.Delete(redisPoolKey)
+}
+
 func GetRedis() *RedisWrap {
 	r, ok := safeMap.Load(redisPoolKey)
 	if ok {

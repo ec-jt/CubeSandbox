@@ -228,6 +228,61 @@ func SetSandboxProxyMap(ctx context.Context, proxyInfo *types.SandboxProxyMap) e
 	return l.setByPassProsyToRedis(ctx, rediskey.SandboxProxy(proxyInfo.SandboxID), proxyInfo)
 }
 
+// MergeSandboxProxyPorts replaces only the container->host port mapping fields
+// of an existing sandbox proxy hash in Redis, leaving HostIP/SandboxIP/
+// CreatedAt/AllowPublicTraffic untouched. It first removes any stale numeric
+// port fields no longer present, then HSETs the current set. This is the
+// authoritative write path for dynamic exposePort/closePort updates.
+func MergeSandboxProxyPorts(ctx context.Context, sandboxID string, ports map[string]string) error {
+	key := rediskey.SandboxProxy(sandboxID)
+	existing, err := redis.StringMap(wrapredis.GetRedis().Do("HGETALL", key))
+	if err != nil {
+		log.G(ctx).Errorf("MergeSandboxProxyPorts HGETALL %s failed: %v", key, err)
+		return err
+	}
+	if len(existing) == 0 {
+		return fmt.Errorf("sandbox proxy metadata not found for %s", sandboxID)
+	}
+	// Delete stale dynamic port fields (numeric keys) that are no longer mapped.
+	stale := make([]interface{}, 0)
+	for field := range existing {
+		if _, isMeta := sandboxProxyMetaFields[field]; isMeta {
+			continue
+		}
+		if _, stillPresent := ports[field]; !stillPresent {
+			stale = append(stale, field)
+		}
+	}
+	if len(stale) > 0 {
+		if _, err := wrapredis.GetRedis().Do("HDEL", redis.Args{key}.AddFlat(stale)...); err != nil {
+			log.G(ctx).Errorf("MergeSandboxProxyPorts HDEL %s failed: %v", key, err)
+			return err
+		}
+	}
+	if len(ports) > 0 {
+		fieldValues := make([]interface{}, 0, len(ports)*2)
+		for k, v := range ports {
+			fieldValues = append(fieldValues, k, v)
+		}
+		if _, err := wrapredis.GetRedis().Do("HSET", redis.Args{key}.AddFlat(fieldValues)...); err != nil {
+			log.G(ctx).Errorf("MergeSandboxProxyPorts HSET %s failed: %v", key, err)
+			return err
+		}
+	}
+	return nil
+}
+
+// sandboxProxyMetaFields are the non-port fields of the sandbox proxy hash.
+var sandboxProxyMetaFields = map[string]struct{}{
+	"HostIP":             {},
+	"SandboxIP":          {},
+	"SandboxPort":        {},
+	"CreatedAt":          {},
+	"AllowPublicTraffic": {},
+	"TrafficAccessToken": {},
+	"MaskRequestHost":    {},
+}
+
 func GetSandboxProxyMap(ctx context.Context, sandboxID string) (*types.SandboxProxyMap, bool) {
 	for _, key := range rediskey.ReadKeysWithFallback(rediskey.SandboxProxy(sandboxID), rediskey.LegacySandboxProxy(sandboxID)) {
 		proxyMap, err := l.getByPassProsyFromRedis(ctx, key)

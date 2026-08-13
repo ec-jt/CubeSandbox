@@ -10,6 +10,7 @@ import (
 	"github.com/alicebob/miniredis/v2"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/base/config"
 	proxytypes "github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/base/types"
+	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/base/wrapredis"
 )
 
 func TestSandboxProxyMapMaskRequestHostRoundTrip(t *testing.T) {
@@ -23,6 +24,9 @@ func TestSandboxProxyMapMaskRequestHostRoundTrip(t *testing.T) {
 		DbNo:        0,
 		IdleTimeout: 30,
 	}
+	// Reset the process-global Redis pool so this case dials its own miniredis
+	// even when another test already initialized the pool.
+	wrapredis.ResetPoolForTest()
 
 	cache := &local{}
 	key := "test:sandbox:proxy:sandbox-1"

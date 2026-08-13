@@ -112,7 +112,13 @@ func Update(ctx context.Context, req *types.UpdateRequest) (rsp *types.Res) {
 			return
 		}
 		proxyMap.ContainerToHostPorts = info.Data[0].ExposedPorts
-		if err := localcache.SetSandboxProxyMap(ctx, proxyMap); err != nil {
+		// Merge-write the refreshed container->host port fields directly. A
+		// full SetSandboxProxyMap rewrite is correct in principle, but the
+		// localcache.SetSandboxProxyMap call was observed to silently no-op on
+		// this code path (its Redis HSET never reached the server), leaving
+		// dynamic ports missing from the proxy map. Writing the port fields
+		// here keeps the dynamic-port update on a single, verifiable path.
+		if err := localcache.MergeSandboxProxyPorts(ctx, req.SandboxID, proxyMap.ContainerToHostPorts); err != nil {
 			rsp.Ret.RetCode = int(errorcode.ErrorCode_Unknown)
 			rsp.Ret.RetMsg = err.Error()
 			return
