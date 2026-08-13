@@ -22,6 +22,7 @@ import (
 	"github.com/tencentcloud/CubeSandbox/Cubelet/pkg/config"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/pkg/constants"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/pkg/log"
+	"github.com/tencentcloud/CubeSandbox/Cubelet/pkg/networkagentclient"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/pkg/recov"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/pkg/ret"
 	cubeboxstore "github.com/tencentcloud/CubeSandbox/Cubelet/pkg/store/cubebox"
@@ -183,10 +184,15 @@ func (s *service) UpdateWithExposePort(ctx context.Context, req *cubebox.UpdateC
 		rsp.Ret.RetMsg = fmt.Sprintf("exposed port quota exceeded: limit=%d", limit64)
 		return rsp, nil
 	}
-	_, err = networkplugin.ExposePort(ctx, req.SandboxID, req.RequestID, port, quotaCounted)
+	portMappings, err := networkplugin.ExposePort(ctx, req.SandboxID, req.RequestID, port, quotaCounted)
 	if err != nil {
 		rsp.Ret.RetCode = errorcode.ErrorCode_CreateNetworkFailed
 		rsp.Ret.RetMsg = err.Error()
+		return rsp, nil
+	}
+	if err := s.persistLivePortMappings(ctx, sb, portMappings); err != nil {
+		rsp.Ret.RetCode = errorcode.ErrorCode_Unknown
+		rsp.Ret.RetMsg = fmt.Sprintf("persist exposed port mappings: %v", err)
 		return rsp, nil
 	}
 	return rsp, nil
@@ -211,10 +217,15 @@ func (s *service) UpdateWithClosePort(ctx context.Context, req *cubebox.UpdateCu
 		rsp.Ret.RetMsg = fmt.Sprintf("container port %d is reserved", port)
 		return rsp, nil
 	}
-	_, removed, err := networkplugin.ClosePort(ctx, req.SandboxID, req.RequestID, port)
+	portMappings, removed, err := networkplugin.ClosePort(ctx, req.SandboxID, req.RequestID, port)
 	if err != nil {
 		rsp.Ret.RetCode = errorcode.ErrorCode_CreateNetworkFailed
 		rsp.Ret.RetMsg = err.Error()
+		return rsp, nil
+	}
+	if err := s.persistLivePortMappings(ctx, sb, portMappings); err != nil {
+		rsp.Ret.RetCode = errorcode.ErrorCode_Unknown
+		rsp.Ret.RetMsg = fmt.Sprintf("persist closed port mappings: %v", err)
 		return rsp, nil
 	}
 	if !removed {
@@ -223,6 +234,20 @@ func (s *service) UpdateWithClosePort(ctx context.Context, req *cubebox.UpdateCu
 		rsp.Ret.RetMsg = "port was not dynamically exposed"
 	}
 	return rsp, nil
+}
+
+func (s *service) persistLivePortMappings(ctx context.Context, sb *cubeboxstore.CubeBox, mappings []networkagentclient.PortMapping) error {
+	persisted := make([]*cubebox.PortMapping, 0, len(mappings))
+	for _, mapping := range mappings {
+		persisted = append(persisted, &cubebox.PortMapping{
+			ContainerPort: mapping.ContainerPort,
+			HostPort:      mapping.HostPort,
+		})
+	}
+	sb.Lock()
+	sb.PortMappings = persisted
+	sb.Unlock()
+	return s.cubeboxMgr.cubeboxManger.SyncByID(ctx, sb.ID)
 }
 
 func addSandboxTaskMetaData(ctx context.Context, sandboxID string) context.Context {
