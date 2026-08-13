@@ -339,14 +339,39 @@ func (s *localService) ReleaseNetwork(ctx context.Context, req *ReleaseNetworkRe
 func (s *localService) ReconcileNetwork(ctx context.Context, req *ReconcileNetworkRequest) (*ReconcileNetworkResponse, error) {
 	s.mu.Lock()
 	state, ok := s.lookupStateLocked(req.SandboxID, req.NetworkHandle)
-	s.mu.Unlock()
 	if !ok {
+		s.mu.Unlock()
 		return nil, fmt.Errorf("network %q not found", req.SandboxID)
 	}
-	if err := s.reconcileState(ctx, state); err != nil {
+
+	// ReconcileNetwork is also the mutation primitive for lazy port exposure.
+	// Hold the service lock through the desired-state transition so concurrent
+	// requests for the same sandbox cannot allocate duplicate host ports or lose
+	// each other's mappings.  Unrelated dataplane traffic is unaffected.
+	desired := s.normalizePortMappings(req.PortMappings)
+	if len(desired) == 0 {
+		desired = slices.Clone(state.PortMappings)
+	}
+	if err := s.reconcilePortMappingsLocked(state, desired); err != nil {
+		s.mu.Unlock()
 		return nil, err
 	}
-	return &ReconcileNetworkResponse{
+	if req.CubeNetworkConfig != nil {
+		state.CubeNetworkConfig = cloneCubeNetworkConfig(req.CubeNetworkConfig)
+		state.policyKnown = true
+	}
+	if len(req.PersistMetadata) > 0 {
+		state.PersistMetadata = s.persistMetadata(req.PersistMetadata, state.TapName, state.SandboxIP)
+	}
+	if err := s.reconcileState(ctx, state); err != nil {
+		s.mu.Unlock()
+		return nil, err
+	}
+	if err := s.store.Save(&state.persistedState); err != nil {
+		s.mu.Unlock()
+		return nil, err
+	}
+	resp := &ReconcileNetworkResponse{
 		SandboxID:       state.SandboxID,
 		NetworkHandle:   state.NetworkHandle,
 		Converged:       true,
@@ -355,7 +380,42 @@ func (s *localService) ReconcileNetwork(ctx context.Context, req *ReconcileNetwo
 		ARPNeighbors:    slices.Clone(state.ARPNeighbors),
 		PortMappings:    slices.Clone(state.PortMappings),
 		PersistMetadata: cloneStringMap(state.PersistMetadata),
-	}, nil
+	}
+	s.mu.Unlock()
+	return resp, nil
+}
+
+func (s *localService) reconcilePortMappingsLocked(state *managedState, desired []PortMapping) error {
+	if state == nil || state.tap == nil {
+		return fmt.Errorf("network state has no tap")
+	}
+	existing := make(map[int32]PortMapping, len(state.PortMappings))
+	for _, mapping := range state.PortMappings {
+		existing[mapping.ContainerPort] = mapping
+	}
+	actual := make([]PortMapping, 0, len(desired))
+	for _, mapping := range desired {
+		if current, ok := existing[mapping.ContainerPort]; ok {
+			actual = append(actual, current)
+			delete(existing, mapping.ContainerPort)
+			continue
+		}
+		before := len(state.tap.PortMappings)
+		created, err := s.configurePortMappings(state.tap, []PortMapping{mapping})
+		if err != nil {
+			return err
+		}
+		actual = append(actual, created[before:]...)
+	}
+	for _, mapping := range existing {
+		if err := cubevsDelPortMap(uint32(state.TapIfIndex), uint16(mapping.ContainerPort), uint16(mapping.HostPort)); err != nil {
+			return err
+		}
+		s.ports.Release(uint16(mapping.HostPort))
+	}
+	state.PortMappings = actual
+	state.tap.PortMappings = slices.Clone(actual)
+	return nil
 }
 
 func (s *localService) GetNetwork(ctx context.Context, req *GetNetworkRequest) (*GetNetworkResponse, error) {

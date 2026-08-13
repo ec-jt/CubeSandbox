@@ -1113,6 +1113,27 @@ class TestProperties:
         sb = make_sandbox()
         assert sb.get_host(8080) == f"8080-{SANDBOX_ID}.{DOMAIN}"
 
+    def test_expose_port_calls_lazy_api(self):
+        sb = make_sandbox()
+        public_url = f"https://3000-{SANDBOX_ID}.{DOMAIN}"
+        with patch.object(
+            sb._session, "post",
+            return_value=mock_response({"containerPort": 3000, "publicURL": public_url}),
+        ) as post:
+            assert sb.expose_port(3000, port_limit=5) == public_url
+        assert post.call_args.args[0].endswith(f"/sandboxes/{SANDBOX_ID}/ports/3000")
+        assert post.call_args.kwargs["json"] == {"portLimit": 5}
+
+    @pytest.mark.parametrize("port", [0, 65536])
+    def test_expose_port_rejects_invalid_port(self, port):
+        with pytest.raises(ValueError, match="between 1 and 65535"):
+            make_sandbox().expose_port(port)
+
+    @pytest.mark.parametrize("limit", [0, 101])
+    def test_expose_port_rejects_invalid_limit(self, limit):
+        with pytest.raises(ValueError, match="between 1 and 100"):
+            make_sandbox().expose_port(3000, port_limit=limit)
+
     def test_domain_fallback_to_config(self):
         sb = Sandbox(
             {**SANDBOX_DATA, "domain": ""},

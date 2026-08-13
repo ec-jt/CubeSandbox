@@ -6,6 +6,7 @@ package sandbox
 
 import (
 	"context"
+	"fmt"
 
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/api/services/cubebox/v1"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/base/config"
@@ -41,9 +42,9 @@ func Update(ctx context.Context, req *types.UpdateRequest) (rsp *types.Res) {
 		rsp.Ret.RetMsg = "should provide InstanceType,SandboxID,Action"
 		return
 	}
-	if req.Action != "pause" && req.Action != "resume" {
+	if req.Action != "pause" && req.Action != "resume" && req.Action != constants.UpdateActionExposePort {
 		rsp.Ret.RetCode = int(errorcode.ErrorCode_MasterParamsError)
-		rsp.Ret.RetMsg = "action should be pause or resume"
+		rsp.Ret.RetMsg = "action should be pause, resume, or exposePort"
 		return
 	}
 	if ret := normalizeSandboxIDInReq(ctx, &req.SandboxID); ret != nil {
@@ -74,6 +75,8 @@ func Update(ctx context.Context, req *types.UpdateRequest) (rsp *types.Res) {
 		Annotations: map[string]string{
 			constants.CubeAnnotationsUpdateAction: req.Action,
 			constants.CubeAnnotationsInsType:      req.InstanceType,
+			"cube.master.container_port":          fmt.Sprintf("%d", req.ContainerPort),
+			"cube.master.port_limit":              fmt.Sprintf("%d", req.PortLimit),
 		},
 	}
 	cubeRsp, err := cubelet.Update(ctx, calleeEndpoint, cubeletReq)
@@ -93,6 +96,27 @@ func Update(ctx context.Context, req *types.UpdateRequest) (rsp *types.Res) {
 	}
 	rsp.Ret.RetCode = int(cubeRsp.GetRet().GetRetCode())
 	rsp.Ret.RetMsg = cubeRsp.GetRet().GetRetMsg()
+	if rsp.Ret.RetCode == int(errorcode.ErrorCode_Success) && req.Action == constants.UpdateActionExposePort {
+		proxyMap, ok := localcache.GetSandboxProxyMap(ctx, req.SandboxID)
+		if !ok || proxyMap == nil {
+			rsp.Ret.RetCode = int(errorcode.ErrorCode_NotFound)
+			rsp.Ret.RetMsg = "sandbox proxy metadata not found"
+			return
+		}
+		info := SandboxInfo(ctx, &types.GetCubeSandboxReq{
+			RequestID: req.RequestID, SandboxID: req.SandboxID, InstanceType: req.InstanceType,
+		})
+		if info.Ret.RetCode != int(errorcode.ErrorCode_Success) || len(info.Data) == 0 {
+			rsp.Ret = info.Ret
+			return
+		}
+		proxyMap.ContainerToHostPorts = info.Data[0].ExposedPorts
+		if err := localcache.SetSandboxProxyMap(ctx, proxyMap); err != nil {
+			rsp.Ret.RetCode = int(errorcode.ErrorCode_Unknown)
+			rsp.Ret.RetMsg = err.Error()
+			return
+		}
+	}
 	if rsp.Ret.RetCode == int(errorcode.ErrorCode_Success) {
 		// Only on genuine success — IsAlreadyInState / NotFound are handled
 		// upstream by CLM's own reconciliation and would send misleading

@@ -8,6 +8,7 @@ import (
 	"context"
 	"fmt"
 	"runtime/debug"
+	"strconv"
 	"time"
 
 	containerd "github.com/containerd/containerd/v2/client"
@@ -17,6 +18,7 @@ import (
 
 	"github.com/tencentcloud/CubeSandbox/Cubelet/api/services/cubebox/v1"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/api/services/errorcode/v1"
+	networkplugin "github.com/tencentcloud/CubeSandbox/Cubelet/network"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/pkg/config"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/pkg/constants"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/pkg/log"
@@ -98,11 +100,78 @@ func (s *service) Update(ctx context.Context, req *cubebox.UpdateCubeSandboxRequ
 		return s.UpdateWithPause(ctx, req, sb)
 	case constants.UpdateActionResume:
 		return s.UpdateWithResume(ctx, req, sb)
+	case constants.UpdateActionExposePort:
+		return s.UpdateWithExposePort(ctx, req, sb)
 	default:
 		rsp.Ret.RetMsg = "invalid update action"
 		rsp.Ret.RetCode = errorcode.ErrorCode_InvalidParamFormat
 		return rsp, nil
 	}
+}
+
+const hardExposedPortLimit = 100
+
+var reservedUserServicePorts = map[int32]struct{}{
+	17300: {}, // Rust sandbox HTTP/WebSocket API
+	17301: {}, // Cap'n Proto process RPC
+	49983: {}, // envd/E2B control API
+}
+
+func (s *service) UpdateWithExposePort(ctx context.Context, req *cubebox.UpdateCubeSandboxRequest, sb *cubeboxstore.CubeBox) (*cubebox.UpdateCubeSandboxResponse, error) {
+	rsp := &cubebox.UpdateCubeSandboxResponse{RequestID: req.RequestID, Ret: &errorcode.Ret{RetCode: errorcode.ErrorCode_Success}}
+	if sb.GetStatus().Get().State() != cubebox.ContainerState_CONTAINER_RUNNING {
+		rsp.Ret.RetCode = errorcode.ErrorCode_TaskStateInvalid
+		rsp.Ret.RetMsg = "sandbox must be running to expose a port"
+		return rsp, nil
+	}
+	port64, err := strconv.ParseInt(req.Annotations["cube.master.container_port"], 10, 32)
+	if err != nil || port64 < 1 || port64 > 65535 {
+		rsp.Ret.RetCode = errorcode.ErrorCode_InvalidParamFormat
+		rsp.Ret.RetMsg = "container_port must be between 1 and 65535"
+		return rsp, nil
+	}
+	port := int32(port64)
+	if _, reserved := reservedUserServicePorts[port]; reserved {
+		rsp.Ret.RetCode = errorcode.ErrorCode_InvalidParamFormat
+		rsp.Ret.RetMsg = fmt.Sprintf("container port %d is reserved", port)
+		return rsp, nil
+	}
+	limit64, err := strconv.ParseInt(req.Annotations["cube.master.port_limit"], 10, 32)
+	if err != nil || limit64 < 1 || limit64 > hardExposedPortLimit {
+		rsp.Ret.RetCode = errorcode.ErrorCode_InvalidParamFormat
+		rsp.Ret.RetMsg = fmt.Sprintf("port_limit must be between 1 and %d", hardExposedPortLimit)
+		return rsp, nil
+	}
+	current, err := networkplugin.GetExposedPorts(ctx, req.SandboxID)
+	if err != nil {
+		rsp.Ret.RetCode = errorcode.ErrorCode_CreateNetworkFailed
+		rsp.Ret.RetMsg = err.Error()
+		return rsp, nil
+	}
+	alreadyExposed := false
+	for _, mapping := range current {
+		if mapping.ContainerPort == port {
+			alreadyExposed = true
+			break
+		}
+	}
+	if !alreadyExposed && (len(current) >= int(limit64) || len(current) >= hardExposedPortLimit) {
+		rsp.Ret.RetCode = errorcode.ErrorCode_InvalidParamFormat
+		rsp.Ret.RetMsg = fmt.Sprintf("exposed port quota exceeded: limit=%d", limit64)
+		return rsp, nil
+	}
+	mappings, err := networkplugin.ExposePort(ctx, req.SandboxID, req.RequestID, port)
+	if err != nil {
+		rsp.Ret.RetCode = errorcode.ErrorCode_CreateNetworkFailed
+		rsp.Ret.RetMsg = err.Error()
+		return rsp, nil
+	}
+	if len(mappings) > int(limit64) || len(mappings) > hardExposedPortLimit {
+		rsp.Ret.RetCode = errorcode.ErrorCode_InvalidParamFormat
+		rsp.Ret.RetMsg = fmt.Sprintf("exposed port quota exceeded: limit=%d", limit64)
+		return rsp, nil
+	}
+	return rsp, nil
 }
 
 func addSandboxTaskMetaData(ctx context.Context, sandboxID string) context.Context {

@@ -326,6 +326,21 @@ pub struct SandboxDetail {
     pub volume_mounts: Option<Vec<SandboxVolumeMount>>,
 }
 
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct ExposedPort {
+    #[serde(rename = "containerPort")]
+    pub container_port: u16,
+    #[serde(rename = "publicURL")]
+    pub public_url: String,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct ExposePortRequest {
+    /// Caller-enforced per-sandbox quota. CubeSandbox also enforces a hard cap of 100.
+    #[serde(rename = "portLimit")]
+    pub port_limit: i32,
+}
+
 // ─── Sandbox — pause/resume/connect/snapshot ──────────────────────────────
 
 /// Request body for POST /sandboxes/{id}/resume (deprecated).

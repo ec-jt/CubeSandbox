@@ -14,8 +14,8 @@ use crate::{
     error::{AppError, AppResult},
     logging::{LogEvent, LogLevel},
     models::{
-        ApiError, ConnectSandbox, ListSandboxesQuery, ListSandboxesV2Query, NewSandbox,
-        RefreshRequest, ResumedSandbox, Sandbox, SandboxDetail, SandboxLogsQuery,
+        ApiError, ConnectSandbox, ExposePortRequest, ListSandboxesQuery, ListSandboxesV2Query,
+        NewSandbox, RefreshRequest, ResumedSandbox, Sandbox, SandboxDetail, SandboxLogsQuery,
         SandboxLogsV2Query, SandboxLogsV2Response, SetTimeoutRequest,
     },
     state::AppState,
@@ -76,6 +76,19 @@ pub async fn list_sandboxes(
             Err(error)
         }
     }
+}
+
+pub async fn expose_sandbox_port(
+    State(state): State<AppState>,
+    Path((sandbox_id, container_port)): Path<(String, u16)>,
+    Json(body): Json<ExposePortRequest>,
+) -> AppResult<impl IntoResponse> {
+    let exposed = state
+        .services
+        .sandboxes
+        .expose_port(&sandbox_id, container_port, body.port_limit)
+        .await?;
+    Ok(Json(exposed))
 }
 
 // ─── GET /v2/sandboxes ────────────────────────────────────────────────────────

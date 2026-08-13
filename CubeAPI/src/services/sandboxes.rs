@@ -17,9 +17,9 @@ use crate::{
     },
     error::{AppError, AppResult},
     models::{
-        EgressRule, LogLevel as ModelLogLevel, NewSandbox, Sandbox, SandboxDetail, SandboxLog,
-        SandboxLogEntry, SandboxLogs, SandboxLogsV2Response, SandboxNetworkConfig, SandboxState,
-        SandboxVolumeMount,
+        EgressRule, ExposedPort, LogLevel as ModelLogLevel, NewSandbox, Sandbox, SandboxDetail,
+        SandboxLog, SandboxLogEntry, SandboxLogs, SandboxLogsV2Response, SandboxNetworkConfig,
+        SandboxState, SandboxVolumeMount,
     },
 };
 
@@ -331,6 +331,40 @@ impl SandboxService {
         )
     }
 
+    pub async fn expose_port(
+        &self,
+        sandbox_id: &str,
+        container_port: u16,
+        port_limit: i32,
+    ) -> AppResult<ExposedPort> {
+        if port_limit < 1 || port_limit > 100 {
+            return Err(AppError::BadRequest(
+                "portLimit must be between 1 and 100".into(),
+            ));
+        }
+        let mut req = self.build_update_request(sandbox_id, "exposePort", None);
+        req.container_port = Some(i32::from(container_port));
+        req.port_limit = Some(port_limit);
+        let resp = self
+            .cubemaster
+            .update_sandbox(&req)
+            .await
+            .map_err(|e| map_update_cubemaster_err(e, sandbox_id))?;
+        ensure_update_result(
+            resp.ret.ret_code,
+            resp.ret.ret_msg,
+            sandbox_id,
+            "port exposure failed",
+        )?;
+        Ok(ExposedPort {
+            container_port,
+            public_url: format!(
+                "https://{}-{}.{}",
+                container_port, sandbox_id, self.sandbox_domain
+            ),
+        })
+    }
+
     pub async fn resume_sandbox(
         &self,
         sandbox_id: &str,
@@ -615,6 +649,8 @@ impl SandboxService {
             instance_type: self.instance_type.clone(),
             action: action.to_string(),
             timeout,
+            container_port: None,
+            port_limit: None,
         }
     }
 
@@ -1544,6 +1580,8 @@ mod tests {
             instance_type: "cubebox".to_string(),
             action: "resume".to_string(),
             timeout: None,
+            container_port: None,
+            port_limit: None,
         };
         let json = serde_json::to_value(&req).unwrap();
         assert!(

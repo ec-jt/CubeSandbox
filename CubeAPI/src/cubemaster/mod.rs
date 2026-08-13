@@ -1400,6 +1400,10 @@ pub struct SandboxUpdateRequest {
     /// TTL in seconds (for resume; 0 = keep original). Optional for pause.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub timeout: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub container_port: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub port_limit: Option<i32>,
 }
 
 #[derive(Debug, Deserialize)]

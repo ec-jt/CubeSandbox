@@ -168,6 +168,24 @@ class Sandbox:
         """
         return f"{port}-{self.sandbox_id}.{self.domain}"
 
+    def expose_port(self, port: int, *, port_limit: int = 100) -> str:
+        """Lazily expose a TCP user-service port and return its public URL.
+
+        ``port_limit`` is a caller-selected quota up to CubeSandbox's hard cap
+        of 100. Platforms should pass their authenticated user's entitlement.
+        Repeating a request for the same port is idempotent.
+        """
+        if not 1 <= port <= 65535:
+            raise ValueError("port must be between 1 and 65535")
+        if not 1 <= port_limit <= 100:
+            raise ValueError("port_limit must be between 1 and 100")
+        resp = self._session.post(
+            f"{self._config.api_url}/sandboxes/{self.sandbox_id}/ports/{port}",
+            json={"portLimit": port_limit},
+        )
+        _check_response(resp)
+        return str(resp.json()["publicURL"])
+
     @property
     def commands(self) -> "Commands":
         return self._commands

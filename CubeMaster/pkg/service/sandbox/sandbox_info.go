@@ -6,6 +6,7 @@ package sandbox
 
 import (
 	"context"
+	"strconv"
 	"time"
 
 	"github.com/google/uuid"
@@ -180,6 +181,12 @@ func doget(ctx context.Context, calleep string, cubeletReq *cubebox.ListCubeSand
 		one.Labels = sandboxLabels
 		one.EndAt = LookupSandboxEndAt(ctx, sandbox.GetId())
 		one.VolumeMounts = volumeMountsToContainerInfo(collectVolumeMountsFromContainers(sandbox.GetContainers()))
+		for _, mapping := range sandbox.GetPortMappings() {
+			if one.ExposedPorts == nil {
+				one.ExposedPorts = make(map[string]string)
+			}
+			one.ExposedPorts[strconv.Itoa(int(mapping.GetContainerPort()))] = strconv.Itoa(int(mapping.GetHostPort()))
+		}
 		rsp.Data = append(rsp.Data, one)
 	}
 	return nil
@@ -209,6 +216,9 @@ func decorateSandboxInfo(ctx context.Context, req *types.GetCubeSandboxReq, rsp 
 	for _, item := range rsp.Data {
 		item.HostIP = proxyMap.HostIP
 		item.SandboxIP = proxyMap.SandboxIP
+		if len(item.ExposedPorts) > 0 {
+			proxyMap.ContainerToHostPorts = item.ExposedPorts
+		}
 	}
 	if req.ContainerPort == 0 {
 		return nil

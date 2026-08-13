@@ -583,6 +583,7 @@ type SandboxData struct {
 	ExposedPortEndpoint    string             `json:"exposed_port_endpoint,omitempty"`
 	ExposedPortMode        string             `json:"exposed_port_mode,omitempty"`
 	RequestedContainerPort int32              `json:"requested_container_port,omitempty"`
+	ExposedPorts           map[string]string  `json:"exposed_ports,omitempty"`
 	EndAt                  int64              `json:"end_at,omitempty"`
 	VolumeMounts           []*VolumeMountInfo `json:"volume_mounts,omitempty"`
 }
@@ -784,10 +785,12 @@ var FastestJsoniter = jsoniter.Config{
 }.Froze()
 
 type UpdateRequest struct {
-	RequestID    string `json:"requestID"`
-	SandboxID    string `json:"sandbox_id"`
-	InstanceType string `json:"instance_type"`
-	Action       string `json:"action"`
+	RequestID     string `json:"requestID"`
+	SandboxID     string `json:"sandbox_id"`
+	InstanceType  string `json:"instance_type"`
+	Action        string `json:"action"`
+	ContainerPort int32  `json:"container_port,omitempty"`
+	PortLimit     int32  `json:"port_limit,omitempty"`
 }
 
 // SetTimeoutRequest is the wire shape for POST /cube/sandbox/timeout.

@@ -23,6 +23,7 @@ import (
 	"github.com/tencentcloud/CubeSandbox/Cubelet/api/services/multimetadb/v1"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/pkg/constants"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/pkg/log"
+	"github.com/tencentcloud/CubeSandbox/Cubelet/pkg/networkagentclient"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/pkg/ret"
 	networkstore "github.com/tencentcloud/CubeSandbox/Cubelet/pkg/store/network"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/pkg/utils"
@@ -89,6 +90,50 @@ func init() {
 
 func (m *delegateNetworkManager) ID() string {
 	return constants.NetworkID.ID()
+}
+
+// ExposePort lazily adds one container-port mapping to an existing sandbox.
+// The network-agent owns allocation and persistence; this wrapper preserves
+// the complete desired list required by ReconcileNetwork.
+func ExposePort(ctx context.Context, sandboxID, requestID string, containerPort int32) ([]networkagentclient.PortMapping, error) {
+	if dnm == nil || dnm.tapPlugin == nil {
+		return nil, fmt.Errorf("network plugin is unavailable")
+	}
+	current, err := dnm.tapPlugin.networkAgentClient.GetNetwork(ctx, &networkagentclient.GetNetworkRequest{
+		SandboxID: sandboxID, NetworkHandle: sandboxID,
+	})
+	if err != nil {
+		return nil, err
+	}
+	for _, mapping := range current.PortMappings {
+		if mapping.ContainerPort == containerPort {
+			return current.PortMappings, nil
+		}
+	}
+	desired := append([]networkagentclient.PortMapping(nil), current.PortMappings...)
+	desired = append(desired, networkagentclient.PortMapping{Protocol: "tcp", HostIP: "127.0.0.1", ContainerPort: containerPort})
+	resp, err := dnm.tapPlugin.networkAgentClient.ReconcileNetwork(ctx, &networkagentclient.ReconcileNetworkRequest{
+		SandboxID: sandboxID, NetworkHandle: current.NetworkHandle, IdempotencyKey: requestID,
+		Interfaces: current.Interfaces, Routes: current.Routes, ARPNeighbors: current.ARPNeighbors,
+		PortMappings: desired, PersistMetadata: current.PersistMetadata,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return resp.PortMappings, nil
+}
+
+func GetExposedPorts(ctx context.Context, sandboxID string) ([]networkagentclient.PortMapping, error) {
+	if dnm == nil || dnm.tapPlugin == nil {
+		return nil, fmt.Errorf("network plugin is unavailable")
+	}
+	current, err := dnm.tapPlugin.networkAgentClient.GetNetwork(ctx, &networkagentclient.GetNetworkRequest{
+		SandboxID: sandboxID, NetworkHandle: sandboxID,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return current.PortMappings, nil
 }
 
 func (m *delegateNetworkManager) Init(ctx context.Context, opts *workflow.InitInfo) error {

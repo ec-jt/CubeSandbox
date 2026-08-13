@@ -152,7 +152,7 @@ func (s *localService) dequeueAbnormalLocked() *tapDevice {
 }
 
 func (s *localService) configurePortMappings(tap *tapDevice, requestedMappings []PortMapping) ([]PortMapping, error) {
-	actualMappings := make([]PortMapping, 0, len(requestedMappings))
+	actualMappings := append([]PortMapping(nil), tap.PortMappings...)
 	for _, mapping := range requestedMappings {
 		hostPort := mapping.HostPort
 		if hostPort == 0 {
