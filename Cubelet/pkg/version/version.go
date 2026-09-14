@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"runtime"
+	"runtime/debug"
 )
 
 var (
@@ -26,6 +27,39 @@ var (
 
 	GoVersion = runtime.Version()
 )
+
+func init() {
+	// Fallback: recover VCS commit/time from the binary's embedded build info
+	// when not injected via ldflags (default -buildvcs=true builds).
+	if Commit != "unknown" && Commit != "" {
+		return
+	}
+	bi, ok := debug.ReadBuildInfo()
+	if !ok {
+		return
+	}
+	var rev, t string
+	dirty := false
+	for _, s := range bi.Settings {
+		switch s.Key {
+		case "vcs.revision":
+			rev = s.Value
+		case "vcs.time":
+			t = s.Value
+		case "vcs.modified":
+			dirty = s.Value == "true"
+		}
+	}
+	if rev != "" {
+		Commit = rev
+		if dirty {
+			Commit += "-dirty"
+		}
+	}
+	if BuildTime == "unknown" && t != "" {
+		BuildTime = t
+	}
+}
 
 // VersionString returns the unified version string for the given binary name.
 func VersionString(binaryName string) string {
