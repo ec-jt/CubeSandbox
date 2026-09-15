@@ -6,6 +6,7 @@ package localcache
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strconv"
@@ -50,6 +51,18 @@ type RedisNodeInfo struct {
 	RealTimeCreateNum int64 `json:"RealTimeCreateNum,omitempty" redis:"realtime_create_num"`
 
 	NICQueues int64 `json:"nic_queues,omitempty" redis:"nic_queues"`
+
+	// Real host telemetry (not quota allocation). Populated from the
+	// cubelet's real_metrics heartbeat payload. PerCoreUtils is stored as a
+	// JSON array string because Redis HSET is flat key/value.
+	RealCpuUtilPct float64 `json:"RealCpuUtilPct" redis:"real_cpu_util_pct"`
+	PerCoreUtils   string  `json:"-" redis:"per_core_utils"`
+	RealLoad1      float64 `json:"RealLoad1" redis:"real_load1"`
+	RealLoad5      float64 `json:"RealLoad5" redis:"real_load5"`
+	RealLoad15     float64 `json:"RealLoad15" redis:"real_load15"`
+	RealDiskIOPS   float64 `json:"RealDiskIOPS" redis:"real_disk_iops"`
+	RealDiskReadBps  float64 `json:"RealDiskReadBps" redis:"real_disk_read_bps"`
+	RealDiskWriteBps float64 `json:"RealDiskWriteBps" redis:"real_disk_write_bps"`
 }
 
 // NodeMetric is the in-API-process view of a cubelet's resource report.
@@ -81,6 +94,18 @@ type NodeMetric struct {
 	DataDiskUsagePer    float64
 	StorageDiskUsagePer float64
 	SysDiskUsagePer     float64
+
+	// HasRealMetrics marks that the cubelet populated the real-metrics
+	// group; same partial-update semantics as HasAllocated / HasDisk.
+	HasRealMetrics bool
+	CpuUtilPct     float64
+	PerCoreUtils   []float64
+	Load1          float64
+	Load5          float64
+	Load15         float64
+	DiskIOPS       float64
+	DiskReadBps    float64
+	DiskWriteBps   float64
 }
 
 const (
@@ -115,7 +140,7 @@ func WriteNodeMetric(ctx context.Context, m *NodeMetric) error {
 	if m == nil || m.NodeID == "" {
 		return errors.New("WriteNodeMetric: node id required")
 	}
-	if !m.HasAllocated && !m.HasDisk {
+	if !m.HasAllocated && !m.HasDisk && !m.HasRealMetrics {
 		// Nothing to do: cubelet reported neither group, and writing
 		// just an update_at would falsely refresh MetricUpdate while
 		// the underlying values are stale.
@@ -146,6 +171,18 @@ func WriteNodeMetric(ctx context.Context, m *NodeMetric) error {
 			"data_disk_usage_per", m.DataDiskUsagePer,
 			"storage_disk_usage_per", m.StorageDiskUsagePer,
 			"sys_disk_usage_per", m.SysDiskUsagePer,
+		)
+	}
+	if m.HasRealMetrics {
+		fields = append(fields,
+			"real_cpu_util_pct", m.CpuUtilPct,
+			"per_core_utils", marshalFloatSlice(m.PerCoreUtils),
+			"real_load1", m.Load1,
+			"real_load5", m.Load5,
+			"real_load15", m.Load15,
+			"real_disk_iops", m.DiskIOPS,
+			"real_disk_read_bps", m.DiskReadBps,
+			"real_disk_write_bps", m.DiskWriteBps,
 		)
 	}
 	conn := wrapredis.GetRedis()
@@ -218,7 +255,7 @@ func UpdateNodeMetricInProcess(m *NodeMetric) error {
 	if m.NodeID == "" {
 		return errors.New("UpdateNodeMetricInProcess: node id required")
 	}
-	if !m.HasAllocated && !m.HasDisk {
+	if !m.HasAllocated && !m.HasDisk && !m.HasRealMetrics {
 		return nil
 	}
 	v, exist := l.cache.Get(m.NodeID)
@@ -244,7 +281,43 @@ func UpdateNodeMetricInProcess(m *NodeMetric) error {
 		old.StorageDiskUsagePer = m.StorageDiskUsagePer
 		old.SysDiskUsagePer = m.SysDiskUsagePer
 	}
+	if m.HasRealMetrics {
+		old.RealCpuUtilPct = m.CpuUtilPct
+		old.PerCoreUtils = append([]float64(nil), m.PerCoreUtils...)
+		old.RealLoad1 = m.Load1
+		old.RealLoad5 = m.Load5
+		old.RealLoad15 = m.Load15
+		old.RealDiskIOPS = m.DiskIOPS
+		old.RealDiskReadBps = m.DiskReadBps
+		old.RealDiskWriteBps = m.DiskWriteBps
+	}
 	return nil
+}
+
+// marshalFloatSlice encodes a float slice as a compact JSON array string
+// for flat Redis HSET storage. An empty/nil slice yields "".
+func marshalFloatSlice(v []float64) string {
+	if len(v) == 0 {
+		return ""
+	}
+	b, err := json.Marshal(v)
+	if err != nil {
+		return ""
+	}
+	return string(b)
+}
+
+// unmarshalFloatSlice decodes a JSON array string back to a float slice.
+// Returns nil on empty or malformed input.
+func unmarshalFloatSlice(s string) []float64 {
+	if s == "" {
+		return nil
+	}
+	var out []float64
+	if err := json.Unmarshal([]byte(s), &out); err != nil {
+		return nil
+	}
+	return out
 }
 
 func (l *local) loadMetricFromRedis() error {
@@ -328,6 +401,14 @@ func (l *local) getNodeMetricFromRedis(ctx context.Context, key string) (*node.N
 	n.MetricUpdate.UnmarshalText([]byte(redisNode.MetricUpdate))
 	n.RealTimeCreateNum = redisNode.RealTimeCreateNum
 	n.NicQueues = redisNode.NICQueues
+	n.RealCpuUtilPct = redisNode.RealCpuUtilPct
+	n.PerCoreUtils = unmarshalFloatSlice(redisNode.PerCoreUtils)
+	n.RealLoad1 = redisNode.RealLoad1
+	n.RealLoad5 = redisNode.RealLoad5
+	n.RealLoad15 = redisNode.RealLoad15
+	n.RealDiskIOPS = redisNode.RealDiskIOPS
+	n.RealDiskReadBps = redisNode.RealDiskReadBps
+	n.RealDiskWriteBps = redisNode.RealDiskWriteBps
 	if log.IsDebug() {
 		CubeLog.WithContext(ctx).Debugf("getNodeMetricFromRedis:%+v", utils.InterfaceToString(redisNode))
 	}

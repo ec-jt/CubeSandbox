@@ -351,6 +351,14 @@ func (l *local) updateNodeMetric(n *node.Node) error {
 		old.MvmNum = n.MvmNum
 		old.RealTimeCreateNum = n.RealTimeCreateNum
 		old.NicQueues = n.NicQueues
+		old.RealCpuUtilPct = n.RealCpuUtilPct
+		old.PerCoreUtils = append([]float64(nil), n.PerCoreUtils...)
+		old.RealLoad1 = n.RealLoad1
+		old.RealLoad5 = n.RealLoad5
+		old.RealLoad15 = n.RealLoad15
+		old.RealDiskIOPS = n.RealDiskIOPS
+		old.RealDiskReadBps = n.RealDiskReadBps
+		old.RealDiskWriteBps = n.RealDiskWriteBps
 		old.MetricLocalUpdateAt = time.Now().Local()
 		return nil
 	} else {

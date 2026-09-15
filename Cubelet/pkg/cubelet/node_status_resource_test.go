@@ -79,6 +79,41 @@ func TestAttachResourceReportRespectsNilFromCollector(t *testing.T) {
 	if req.Allocated != nil || req.DiskUsage != nil || !req.MetricTime.IsZero() {
 		t.Fatalf("expected unchanged request: %+v", req)
 	}
+	// Real metrics must not be attached when cubebox reported nothing, so
+	// the MetricUpdate freshness contract is preserved.
+	if req.RealMetrics != nil {
+		t.Fatalf("expected no RealMetrics when collector reports nothing: %+v", req.RealMetrics)
+	}
+}
+
+func TestAttachResourceReportAttachesRealMetrics(t *testing.T) {
+	t.Cleanup(func() {
+		resourcesource.Set(nil)
+		resourcesource.SetRealMetricsCollector(nil)
+	})
+
+	// Fresh collector + a warm-up sample so the second sample has a previous
+	// baseline to diff against (per-core rates are undefined on the first).
+	resourcesource.SetRealMetricsCollector(resourcesource.NewRealMetricsCollector())
+	resourcesource.SampleRealMetrics()
+
+	resourcesource.Set(&stubCollector{
+		alloc: &resourcesource.AllocatedResources{MilliCPU: 1000},
+	})
+	now := time.Unix(1700000000, 0).UTC()
+	req := &masterclient.UpdateNodeStatusRequest{}
+	attachResourceReport(req, now)
+
+	if req.RealMetrics == nil {
+		t.Fatal("expected RealMetrics to be attached when the collector reports")
+	}
+	// Linux /proc/stat always exposes at least one cpuN row.
+	if len(req.RealMetrics.PerCoreUtils) == 0 {
+		t.Fatalf("expected per-core utils to be populated, got %+v", req.RealMetrics)
+	}
+	if !req.MetricTime.Equal(now) {
+		t.Fatalf("MetricTime %v want %v", req.MetricTime, now)
+	}
 }
 
 func TestTryUpdateNodeStatusReportsPeriodicallyWithoutNodeChanges(t *testing.T) {

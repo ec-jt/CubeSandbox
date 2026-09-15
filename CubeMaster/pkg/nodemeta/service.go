@@ -91,8 +91,26 @@ type UpdateNodeStatusRequest struct {
 	DiskUsage  *DiskUsage          `json:"disk_usage,omitempty"`
 	MetricTime time.Time           `json:"metric_time,omitempty"`
 
+	// RealMetrics carries observed host CPU / load / disk-IO telemetry.
+	// Optional (omitempty) so older cubelets keep working unchanged.
+	RealMetrics *RealMetrics `json:"real_metrics,omitempty"`
+
 	Versions            []ComponentVersion `json:"versions,omitempty"`
 	InventoryIncomplete bool               `json:"inventory_incomplete,omitempty"`
+}
+
+// RealMetrics carries *real* host utilisation (not quota allocation) for a
+// node: aggregate + per-core CPU busy %, load averages, and disk IOPS /
+// throughput, as rates over the cubelet's report interval.
+type RealMetrics struct {
+	CpuUtilPct   float64   `json:"cpu_util_pct,omitempty"`
+	PerCoreUtils []float64 `json:"per_core_utils,omitempty"`
+	Load1        float64   `json:"load1,omitempty"`
+	Load5        float64   `json:"load5,omitempty"`
+	Load15       float64   `json:"load15,omitempty"`
+	DiskIOPS     float64   `json:"disk_iops,omitempty"`
+	DiskReadBps  float64   `json:"disk_read_bps,omitempty"`
+	DiskWriteBps float64   `json:"disk_write_bps,omitempty"`
 }
 
 // AllocatedResources is cubelet-side aggregation of sandbox-quota CPU /
@@ -552,7 +570,7 @@ func GetNodeComponentVersions(ctx context.Context, nodeID string) (map[string]st
 // to in-process update so the receiving replica still schedules correctly,
 // and the next heartbeat (≤NodeStatusUpdateFrequency) reattempts the write.
 func fanOutResourceMetric(ctx context.Context, nodeID string, req *UpdateNodeStatusRequest) {
-	if req == nil || (req.Allocated == nil && req.DiskUsage == nil) {
+	if req == nil || (req.Allocated == nil && req.DiskUsage == nil && req.RealMetrics == nil) {
 		return
 	}
 	metricTime := req.MetricTime
@@ -575,6 +593,17 @@ func fanOutResourceMetric(ctx context.Context, nodeID string, req *UpdateNodeSta
 		m.DataDiskUsagePer = d.DataDiskUsagePer
 		m.StorageDiskUsagePer = d.StorageDiskUsagePer
 		m.SysDiskUsagePer = d.SysDiskUsagePer
+	}
+	if rm := req.RealMetrics; rm != nil {
+		m.HasRealMetrics = true
+		m.CpuUtilPct = rm.CpuUtilPct
+		m.PerCoreUtils = append([]float64(nil), rm.PerCoreUtils...)
+		m.Load1 = rm.Load1
+		m.Load5 = rm.Load5
+		m.Load15 = rm.Load15
+		m.DiskIOPS = rm.DiskIOPS
+		m.DiskReadBps = rm.DiskReadBps
+		m.DiskWriteBps = rm.DiskWriteBps
 	}
 	if err := localcache.WriteNodeMetric(ctx, m); err != nil {
 		log.G(ctx).Warnf("write node metric to redis failed for %s: %v", nodeID, err)

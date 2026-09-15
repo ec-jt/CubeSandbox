@@ -80,6 +80,19 @@ type Node struct {
 
 	MvmNum int64 `json:"mvm_num,omitempty"`
 
+	// Real host telemetry (not quota allocation), reported by the cubelet's
+	// real_metrics heartbeat payload and fanned out via Redis. PerCoreUtils
+	// holds per-core busy percentages ordered by cpuN. All fields are
+	// optional: nodes running older cubelets leave them zero-valued.
+	RealCpuUtilPct   float64   `json:"RealCpuUtilPct,omitempty"`
+	PerCoreUtils     []float64 `json:"PerCoreUtils,omitempty"`
+	RealLoad1        float64   `json:"RealLoad1,omitempty"`
+	RealLoad5        float64   `json:"RealLoad5,omitempty"`
+	RealLoad15       float64   `json:"RealLoad15,omitempty"`
+	RealDiskIOPS     float64   `json:"RealDiskIOPS,omitempty"`
+	RealDiskReadBps  float64   `json:"RealDiskReadBps,omitempty"`
+	RealDiskWriteBps float64   `json:"RealDiskWriteBps,omitempty"`
+
 	MetricUpdate time.Time `json:"MetricUpdateAt,omitempty"`
 
 	MetricLocalUpdateAt time.Time `json:"MetricLocalUpdateAt,omitempty"`
@@ -183,6 +196,9 @@ func (n *Node) Clone() *Node {
 	cloned.labelsCache = nil
 	if n.VirtualNodeQuotaArray != nil {
 		cloned.VirtualNodeQuotaArray = append([]int64(nil), n.VirtualNodeQuotaArray...)
+	}
+	if n.PerCoreUtils != nil {
+		cloned.PerCoreUtils = append([]float64(nil), n.PerCoreUtils...)
 	}
 	if n.NodeLabels != nil {
 		cloned.NodeLabels = make(map[string]string, len(n.NodeLabels))

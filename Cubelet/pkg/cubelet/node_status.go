@@ -574,8 +574,12 @@ func (kl *Cubelet) collectVersionReport() ([]masterclient.ComponentVersion, bool
 func attachResourceReport(req *masterclient.UpdateNodeStatusRequest, now time.Time) {
 	collector := resourcesource.Get()
 	if collector == nil {
+		// Without a cubebox collector there is no resource report to attach.
+		// MetricTime stays zero, which cubemaster treats as "no metric in
+		// this heartbeat" (preserving the scheduling freshness contract).
 		return
 	}
+	attached := false
 	if alloc := collector.CollectAllocated(); alloc != nil {
 		req.Allocated = &masterclient.AllocatedResources{
 			MilliCPU:      alloc.MilliCPU,
@@ -587,6 +591,7 @@ func attachResourceReport(req *masterclient.UpdateNodeStatusRequest, now time.Ti
 			StorageDiskMB: alloc.StorageDiskMB,
 		}
 		req.MetricTime = now
+		attached = true
 	}
 	if du := collector.CollectDiskUsage(); du != nil {
 		req.DiskUsage = &masterclient.DiskUsage{
@@ -596,6 +601,29 @@ func attachResourceReport(req *masterclient.UpdateNodeStatusRequest, now time.Ti
 		}
 		if req.MetricTime.IsZero() {
 			req.MetricTime = now
+		}
+		attached = true
+	}
+
+	// Real host telemetry (CPU/load/disk-IO) rides along with the resource
+	// heartbeat. It is attached only when the cubebox collector reported a
+	// resource group so the MetricUpdate freshness contract (set solely when
+	// cubebox reports) keeps driving the scheduler's MetricUpdateTimeout
+	// filter. cubebox's CollectAllocated returns non-nil even with zero
+	// sandboxes, so in production real metrics flow on every heartbeat.
+	if !attached {
+		return
+	}
+	if rm := resourcesource.SampleRealMetrics(); rm != nil {
+		req.RealMetrics = &masterclient.RealMetrics{
+			CpuUtilPct:   rm.CpuUtilPct,
+			PerCoreUtils: rm.PerCoreUtils,
+			Load1:        rm.Load1,
+			Load5:        rm.Load5,
+			Load15:       rm.Load15,
+			DiskIOPS:     rm.DiskIOPS,
+			DiskReadBps:  rm.DiskReadBps,
+			DiskWriteBps: rm.DiskWriteBps,
 		}
 	}
 }
