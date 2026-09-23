@@ -13,7 +13,6 @@ import (
 
 	jsoniter "github.com/json-iterator/go"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/network"
-	netproto "github.com/tencentcloud/CubeSandbox/Cubelet/network/proto"
 	"github.com/tencentcloud/CubeSandbox/cubelog"
 )
 
@@ -61,19 +60,20 @@ func matchTapFd(buf []byte) (errCode errCode, retFile *os.File, du1, du2 time.Du
 	du1 = time.Since(startTime)
 	startTime = time.Now()
 
-	mvmNet, exist := network.Name2MvmNet.Load(req.Name)
-	if !exist {
-		return CannotFindDevice, nil, du1, du2
-	}
-	m := mvmNet.(*netproto.MvmNet)
-
-	if m.ID != req.SandboxId {
+	// LookupTapFile serves the in-memory pool first and, on a miss, repairs the
+	// pool from network-agent (the fd owner). Without the repair, every cubelet
+	// restart made Cloud Hypervisor vm.restore fall back to TUNSETIFF-by-name
+	// and fail with EBUSY, so no paused sandbox could ever resume.
+	file, ok, idMismatch := network.LookupTapFile(req.Name, req.SandboxId)
+	du2 = time.Since(startTime)
+	if idMismatch {
 		return TapDoesNotMatchId, nil, du1, du2
 	}
+	if !ok || file == nil {
+		return CannotFindDevice, nil, du1, du2
+	}
 
-	du2 = time.Since(startTime)
-
-	return Success, m.Tap.File, du1, du2
+	return Success, file, du1, du2
 }
 
 func run(beginTime time.Time, conn *net.UnixConn) {

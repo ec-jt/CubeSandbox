@@ -1228,6 +1228,175 @@ func (l *local) registerNetworkAgentTapForPool(ctx context.Context, sandboxID st
 	return nil
 }
 
+// RecoverTapFdPool rebuilds the in-memory tap fd pool (Name2MvmNet / ID2MvmNet)
+// from network-agent after a cubelet restart.
+//
+// Why this exists: the pool is populated only by Create(). It is not persisted,
+// so every cubelet restart empties it while the sandboxes themselves (running
+// or PAUSED with a snapshot on disk) keep their taps. Cloud Hypervisor resolves
+// a tap on vm.restore through Tap::lookup_from_pool -> cubetap.sock -> this
+// pool; on a miss it falls back to opening the tap by name with TUNSETIFF,
+// which EBUSYs because network-agent legitimately holds the IFF_ONE_QUEUE tap
+// fd. Net effect: after any cubelet restart, NO paused sandbox could resume.
+//
+// network-agent persists its state and hands out the original fd via its tap
+// socket, so it is the authoritative source; we simply re-request every known
+// sandbox's fd and re-register it. Failures are per-sandbox and non-fatal:
+// the lazy path in LookupTapFile covers anything missed here.
+func (l *local) RecoverTapFdPool(ctx context.Context) (recovered int, failed int) {
+	if l == nil || l.Config == nil || !l.Config.EnableNetworkAgent || l.networkAgentClient == nil {
+		return 0, 0
+	}
+	listCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	resp, err := l.networkAgentClient.ListNetworks(listCtx, &networkagentclient.ListNetworksRequest{})
+	if err != nil {
+		log.G(ctx).Warnf("tap fd pool recovery: network-agent ListNetworks failed, relying on lazy lookup: %v", err)
+		return 0, 0
+	}
+	if resp == nil {
+		return 0, 0
+	}
+	for _, st := range resp.Networks {
+		if st.SandboxID == "" || st.TapName == "" {
+			continue
+		}
+		if existing := l.loadNet(st.SandboxID); existing != nil && existing.Tap != nil && existing.Tap.File != nil {
+			continue
+		}
+		if err := l.registerTapFromNetworkAgentState(ctx, st); err != nil {
+			failed++
+			log.G(ctx).Warnf("tap fd pool recovery: sandbox_id=%s tap=%s: %v", st.SandboxID, st.TapName, err)
+			continue
+		}
+		recovered++
+	}
+	log.G(ctx).Infof("tap fd pool recovery from network-agent: recovered=%d failed=%d total=%d", recovered, failed, len(resp.Networks))
+	return recovered, failed
+}
+
+// registerTapFromNetworkAgentState requests the original tap fd for one
+// network-agent-managed sandbox and registers it in the fd pool.
+func (l *local) registerTapFromNetworkAgentState(ctx context.Context, st networkagentclient.NetworkState) error {
+	tapFDTimeout := time.Duration(l.Config.NetworkAgentTapFDTimeout)
+	if tapFDTimeout <= 0 {
+		tapFDTimeout = 2 * time.Second
+	}
+	file, ifindex, err := requestNetworkAgentTapFile(l.Config.NetworkAgentTapSocket, st.SandboxID, st.TapName, tapFDTimeout)
+	if err != nil {
+		return fmt.Errorf("request tap fd from network-agent: %w", err)
+	}
+	if ifindex <= 0 {
+		ifindex = int(st.TapIfIndex)
+	}
+	if ifindex <= 0 {
+		if link, lerr := netlink.LinkByName(st.TapName); lerr == nil {
+			ifindex = link.Attrs().Index
+		}
+	}
+	tap := &Tap{
+		Index: ifindex,
+		Name:  st.TapName,
+		IP:    net.ParseIP(st.SandboxIP),
+		File:  file,
+	}
+	mappings := make([]PortMapping, 0, len(st.PortMappings))
+	for _, pm := range st.PortMappings {
+		mappings = append(mappings, PortMapping{HostPort: uint16(pm.HostPort), ContainerPort: uint16(pm.ContainerPort)})
+	}
+	tap.SetPortMappings(mappings)
+	if old := l.loadNet(st.SandboxID); old != nil {
+		l.delNet(old)
+		if old.Tap != nil && old.Tap.File != nil && old.Tap.File != file {
+			_ = old.Tap.File.Close()
+		}
+	}
+	l.storeNet(&MvmNet{ID: st.SandboxID, Tap: tap})
+	log.G(ctx).Infof("re-registered network-agent tap in fd pool: sandbox_id=%s tap_name=%s ifindex=%d fd=%d sandbox_ip=%s",
+		st.SandboxID, tap.Name, tap.Index, file.Fd(), st.SandboxIP)
+	return nil
+}
+
+// LookupTapFile resolves the tap fd served over cubetap.sock. The in-memory
+// pool is the fast path. On a miss (typically: cubelet restarted after the
+// sandbox was created, and RecoverTapFdPool did not cover it) it asks
+// network-agent for the original fd and caches it, so a Cloud Hypervisor
+// vm.restore never has to fall back to TUNSETIFF-by-name (which EBUSYs while
+// network-agent holds the fd).
+//
+// Returns (file, ok, idMismatch). idMismatch is true when the tap exists in
+// the pool but belongs to a different sandbox; the caller must reject that
+// rather than hand a foreign tap to a VM.
+func (l *local) LookupTapFile(name, sandboxID string) (*os.File, bool, bool) {
+	if v, exist := Name2MvmNet.Load(name); exist {
+		m := v.(*MvmNet)
+		if m.ID != sandboxID {
+			return nil, false, true
+		}
+		if m.Tap != nil && m.Tap.File != nil {
+			return m.Tap.File, true, false
+		}
+	}
+	if l == nil || l.Config == nil || !l.Config.EnableNetworkAgent || sandboxID == "" || name == "" {
+		return nil, false, false
+	}
+	ctx := context.Background()
+	st := networkagentclient.NetworkState{SandboxID: sandboxID, TapName: name}
+	if l.networkAgentClient != nil {
+		getCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+		if resp, err := l.networkAgentClient.GetNetwork(getCtx, &networkagentclient.GetNetworkRequest{SandboxID: sandboxID, NetworkHandle: sandboxID}); err == nil && resp != nil {
+			if len(resp.Interfaces) > 0 && resp.Interfaces[0].Name != "" && resp.Interfaces[0].Name != name {
+				cancel()
+				log.G(ctx).Warnf("tap fd lazy lookup: tap name mismatch for sandbox_id=%s: requested=%s network-agent=%s", sandboxID, name, resp.Interfaces[0].Name)
+				return nil, false, true
+			}
+			if ip, ok := resp.PersistMetadata["sandbox_ip"]; ok {
+				st.SandboxIP = ip
+			}
+			for _, pm := range resp.PortMappings {
+				st.PortMappings = append(st.PortMappings, pm)
+			}
+		}
+		cancel()
+	}
+	if err := l.registerTapFromNetworkAgentState(ctx, st); err != nil {
+		log.G(ctx).Warnf("tap fd lazy lookup from network-agent failed: sandbox_id=%s tap=%s err=%v", sandboxID, name, err)
+		return nil, false, false
+	}
+	if m := l.loadNet(sandboxID); m != nil && m.Tap != nil && m.Tap.File != nil {
+		return m.Tap.File, true, false
+	}
+	return nil, false, false
+}
+
+// LookupTapFile is the package-level entry used by the cubetap.sock server. It
+// routes through the initialised plugin so a pool miss can be repaired from
+// network-agent; before plugin init it degrades to the bare map lookup.
+func LookupTapFile(name, sandboxID string) (*os.File, bool, bool) {
+	if dnm != nil && dnm.tapPlugin != nil {
+		return dnm.tapPlugin.LookupTapFile(name, sandboxID)
+	}
+	if v, exist := Name2MvmNet.Load(name); exist {
+		m := v.(*MvmNet)
+		if m.ID != sandboxID {
+			return nil, false, true
+		}
+		if m.Tap != nil && m.Tap.File != nil {
+			return m.Tap.File, true, false
+		}
+	}
+	return nil, false, false
+}
+
+// RecoverTapFdPool is the package-level entry called once at cubelet startup
+// (after the network plugin is initialised and network-agent is healthy).
+func RecoverTapFdPool(ctx context.Context) (int, int) {
+	if dnm == nil || dnm.tapPlugin == nil {
+		return 0, 0
+	}
+	return dnm.tapPlugin.RecoverTapFdPool(ctx)
+}
+
 func (l *local) unregisterNetworkAgentTapForPool(ctx context.Context, sandboxID string) {
 	mvmNet := l.loadNet(sandboxID)
 	if mvmNet == nil {

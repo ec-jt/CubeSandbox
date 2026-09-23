@@ -496,6 +496,14 @@ func App() *cli.App {
 			serve(ctx, ol, serverTmp.ServeOperation)
 		}
 
+		// Rebuild the tap fd pool from network-agent BEFORE serving cubetap.sock.
+		// The pool is in-memory only; after a restart every existing sandbox
+		// (running or paused) would otherwise miss here and Cloud Hypervisor's
+		// vm.restore would fall back to TUNSETIFF-by-name -> EBUSY -> no resume.
+		if recovered, failed := network.RecoverTapFdPool(ctx); recovered > 0 || failed > 0 {
+			log.G(ctx).Infof("tap fd pool recovered from network-agent: recovered=%d failed=%d", recovered, failed)
+		}
+
 		ul, err := sys.GetLocalListener(config.CubeTap.Address, config.CubeTap.UID, config.CubeTap.GID)
 		if err != nil {
 			return fmt.Errorf("failed to get listener for cubetap sockPath: %w", err)
