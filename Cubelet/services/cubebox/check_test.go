@@ -6,6 +6,7 @@ package cubebox
 
 import (
 	"context"
+	"fmt"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -304,11 +305,30 @@ func TestCheckParamExposedPorts(t *testing.T) {
 		assert.Contains(t, err.Error(), "invalid exposed port")
 	})
 
-	t.Run("rejects more than 4 ports", func(t *testing.T) {
+	t.Run("accepts the dc-danus runtime port set", func(t *testing.T) {
+		// envd + code interpreter + Rust sandbox server (REST, Cap'n Proto) +
+		// code-server: 5 baked ports, rejected by the old hard limit of 4.
 		err := checkParam(ctx, &cubebox.RunCubeSandboxRequest{
-			ExposedPorts: []int64{49983, 80, 443, 8080, 9000},
+			ExposedPorts: []int64{49983, 49999, 17300, 17301, 9000},
 		})
+		assert.NoError(t, err)
+	})
+
+	t.Run("accepts exactly maxStaticExposedPorts", func(t *testing.T) {
+		ports := make([]int64, 0, maxStaticExposedPorts)
+		for i := 0; i < maxStaticExposedPorts; i++ {
+			ports = append(ports, int64(9000+i))
+		}
+		assert.NoError(t, checkParam(ctx, &cubebox.RunCubeSandboxRequest{ExposedPorts: ports}))
+	})
+
+	t.Run("rejects more than maxStaticExposedPorts", func(t *testing.T) {
+		ports := make([]int64, 0, maxStaticExposedPorts+1)
+		for i := 0; i <= maxStaticExposedPorts; i++ {
+			ports = append(ports, int64(9000+i))
+		}
+		err := checkParam(ctx, &cubebox.RunCubeSandboxRequest{ExposedPorts: ports})
 		assert.Error(t, err)
-		assert.Contains(t, err.Error(), "at most 4")
+		assert.Contains(t, err.Error(), fmt.Sprintf("at most %d", maxStaticExposedPorts))
 	})
 }
