@@ -8,6 +8,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -218,15 +219,45 @@ func TestNormalizeTemplateImageRequestAllowsCIDRAllowOutWithoutDenyAll(t *testin
 }
 
 func TestNormalizeTemplateImageRequestRejectsTooManyCustomExposedPorts(t *testing.T) {
+	// maxCustomTemplateExposedPorts custom ports (plus the reserved envd port)
+	// must be accepted; one more must be rejected.
+	ok := make([]int32, 0, maxCustomTemplateExposedPorts+1)
+	for i := 0; i < maxCustomTemplateExposedPorts; i++ {
+		ok = append(ok, int32(9000+i))
+	}
+	ok = append(ok, 49983)
+	if _, err := normalizeTemplateImageRequest(&types.CreateTemplateFromImageReq{
+		Request:           &types.Request{RequestID: "req-1"},
+		SourceImageRef:    "docker.io/library/nginx:latest",
+		WritableLayerSize: "20Gi",
+		ExposedPorts:      ok,
+	}); err != nil {
+		t.Fatalf("%d custom ports + reserved envd port must be accepted: %v", maxCustomTemplateExposedPorts, err)
+	}
 
+	tooMany := append(ok[:maxCustomTemplateExposedPorts:maxCustomTemplateExposedPorts], int32(9000+maxCustomTemplateExposedPorts))
 	_, err := normalizeTemplateImageRequest(&types.CreateTemplateFromImageReq{
 		Request:           &types.Request{RequestID: "req-1"},
 		SourceImageRef:    "docker.io/library/nginx:latest",
 		WritableLayerSize: "20Gi",
-		ExposedPorts:      []int32{9000, 9001, 9002, 9003},
+		ExposedPorts:      tooMany,
 	})
-	if err == nil || !strings.Contains(err.Error(), "at most 3 custom exposed ports") {
+	if err == nil || !strings.Contains(err.Error(), fmt.Sprintf("at most %d custom exposed ports", maxCustomTemplateExposedPorts)) {
 		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestNormalizeTemplateImageRequestAcceptsDcDanusRuntimePorts(t *testing.T) {
+	// The production dc-danus template bakes envd, code interpreter, Rust
+	// sandbox server (REST + Cap'n Proto) and code-server. This used to fail
+	// with the old hard limit of 3.
+	if _, err := normalizeTemplateImageRequest(&types.CreateTemplateFromImageReq{
+		Request:           &types.Request{RequestID: "req-1"},
+		SourceImageRef:    "10.0.1.20:5000/dc-danus-cube-full:v1",
+		WritableLayerSize: "20Gi",
+		ExposedPorts:      []int32{49983, 49999, 17300, 17301, 9000},
+	}); err != nil {
+		t.Fatalf("dc-danus runtime port set must be accepted: %v", err)
 	}
 }
 
@@ -248,14 +279,20 @@ func TestCountCustomTemplateExposedPortsTreats49983AsReserved(t *testing.T) {
 }
 
 func TestNormalizeTemplateImageRequestTreatsOnlyCubeletDefaultsAsReserved(t *testing.T) {
-
+	// Every port other than 49983 counts against the custom limit: 80 is not
+	// reserved, so maxCustomTemplateExposedPorts non-reserved ports plus 80
+	// must overflow.
+	ports := []int32{80}
+	for i := 0; i < maxCustomTemplateExposedPorts; i++ {
+		ports = append(ports, int32(9000+i))
+	}
 	_, err := normalizeTemplateImageRequest(&types.CreateTemplateFromImageReq{
 		Request:           &types.Request{RequestID: "req-1"},
 		SourceImageRef:    "docker.io/library/nginx:latest",
 		WritableLayerSize: "20Gi",
-		ExposedPorts:      []int32{80, 9000, 9001, 9002},
+		ExposedPorts:      ports,
 	})
-	if err == nil || !strings.Contains(err.Error(), "at most 3 custom exposed ports") {
+	if err == nil || !strings.Contains(err.Error(), fmt.Sprintf("at most %d custom exposed ports", maxCustomTemplateExposedPorts)) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 }
