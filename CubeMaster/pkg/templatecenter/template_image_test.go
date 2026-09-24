@@ -8,7 +8,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -218,31 +217,40 @@ func TestNormalizeTemplateImageRequestAllowsCIDRAllowOutWithoutDenyAll(t *testin
 	}
 }
 
-func TestNormalizeTemplateImageRequestRejectsTooManyCustomExposedPorts(t *testing.T) {
-	// maxCustomTemplateExposedPorts custom ports (plus the reserved envd port)
-	// must be accepted; one more must be rejected.
-	ok := make([]int32, 0, maxCustomTemplateExposedPorts+1)
-	for i := 0; i < maxCustomTemplateExposedPorts; i++ {
-		ok = append(ok, int32(9000+i))
+func TestNormalizeTemplateImageRequestHasNoCustomExposedPortCountLimit(t *testing.T) {
+	// Template-level exposed ports are operator-chosen; there is no count cap.
+	// 64 custom ports plus the reserved envd port must be accepted, sorted and
+	// de-duplicated.
+	ports := make([]int32, 0, 66)
+	for i := 0; i < 64; i++ {
+		ports = append(ports, int32(9000+i))
 	}
-	ok = append(ok, 49983)
-	if _, err := normalizeTemplateImageRequest(&types.CreateTemplateFromImageReq{
+	ports = append(ports, 49983, 9000) // duplicate 9000 must collapse
+	got, err := normalizeTemplateImageRequest(&types.CreateTemplateFromImageReq{
 		Request:           &types.Request{RequestID: "req-1"},
 		SourceImageRef:    "docker.io/library/nginx:latest",
 		WritableLayerSize: "20Gi",
-		ExposedPorts:      ok,
-	}); err != nil {
-		t.Fatalf("%d custom ports + reserved envd port must be accepted: %v", maxCustomTemplateExposedPorts, err)
-	}
-
-	tooMany := append(ok[:maxCustomTemplateExposedPorts:maxCustomTemplateExposedPorts], int32(9000+maxCustomTemplateExposedPorts))
-	_, err := normalizeTemplateImageRequest(&types.CreateTemplateFromImageReq{
-		Request:           &types.Request{RequestID: "req-1"},
-		SourceImageRef:    "docker.io/library/nginx:latest",
-		WritableLayerSize: "20Gi",
-		ExposedPorts:      tooMany,
+		ExposedPorts:      ports,
 	})
-	if err == nil || !strings.Contains(err.Error(), fmt.Sprintf("at most %d custom exposed ports", maxCustomTemplateExposedPorts)) {
+	if err != nil {
+		t.Fatalf("64 custom ports + reserved envd port must be accepted: %v", err)
+	}
+	if len(got.ExposedPorts) != 65 {
+		t.Fatalf("expected 65 unique ports, got %d", len(got.ExposedPorts))
+	}
+	for i := 1; i < len(got.ExposedPorts); i++ {
+		if got.ExposedPorts[i-1] >= got.ExposedPorts[i] {
+			t.Fatalf("exposed ports must be sorted and unique: %v", got.ExposedPorts)
+		}
+	}
+	// Per-port range validation is still enforced.
+	_, err = normalizeTemplateImageRequest(&types.CreateTemplateFromImageReq{
+		Request:           &types.Request{RequestID: "req-1"},
+		SourceImageRef:    "docker.io/library/nginx:latest",
+		WritableLayerSize: "20Gi",
+		ExposedPorts:      []int32{80, 70000},
+	})
+	if err == nil || !strings.Contains(err.Error(), "invalid exposed port 70000") {
 		t.Fatalf("unexpected error: %v", err)
 	}
 }
@@ -279,21 +287,20 @@ func TestCountCustomTemplateExposedPortsTreats49983AsReserved(t *testing.T) {
 }
 
 func TestNormalizeTemplateImageRequestTreatsOnlyCubeletDefaultsAsReserved(t *testing.T) {
-	// Every port other than 49983 counts against the custom limit: 80 is not
-	// reserved, so maxCustomTemplateExposedPorts non-reserved ports plus 80
-	// must overflow.
-	ports := []int32{80}
-	for i := 0; i < maxCustomTemplateExposedPorts; i++ {
-		ports = append(ports, int32(9000+i))
-	}
-	_, err := normalizeTemplateImageRequest(&types.CreateTemplateFromImageReq{
+	// Only 49983 is a cubelet default; every other port (including 80) is a
+	// custom port. The count is informational only and never rejects.
+	ports := []int32{80, 443, 49983, 8080}
+	got, err := normalizeTemplateImageRequest(&types.CreateTemplateFromImageReq{
 		Request:           &types.Request{RequestID: "req-1"},
 		SourceImageRef:    "docker.io/library/nginx:latest",
 		WritableLayerSize: "20Gi",
 		ExposedPorts:      ports,
 	})
-	if err == nil || !strings.Contains(err.Error(), fmt.Sprintf("at most %d custom exposed ports", maxCustomTemplateExposedPorts)) {
+	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
+	}
+	if count := countCustomTemplateExposedPorts(got.ExposedPorts); count != 3 {
+		t.Fatalf("countCustomTemplateExposedPorts(%v)=%d, want 3", got.ExposedPorts, count)
 	}
 }
 

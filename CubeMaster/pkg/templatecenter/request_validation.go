@@ -248,21 +248,19 @@ func normalizeTemplateExposedPorts(ports []int32) ([]int32, error) {
 	sort.Slice(normalized, func(i, j int) bool {
 		return normalized[i] < normalized[j]
 	})
-	if n := countCustomTemplateExposedPorts(normalized); n > maxCustomTemplateExposedPorts {
-		return nil, fmt.Errorf("at most %d custom exposed ports are supported (got %d)", maxCustomTemplateExposedPorts, n)
-	}
+	// No count limit on template-level exposed ports. The ports baked into a
+	// template are chosen by the operator (image author), not by sandbox
+	// users, so a numeric cap only ever broke legitimate runtime images (the
+	// dc-danus template alone needs envd, code interpreter, Rust sandbox
+	// server REST + Cap'n Proto and code-server). Per-port validation and
+	// de-duplication above still apply. Cubelet accepts any count too
+	// (see Cubelet/services/cubebox/check.go).
 	return normalized, nil
 }
 
-// maxCustomTemplateExposedPorts bounds the ports baked into a TEMPLATE by the
-// operator (beyond the reserved envd port). This is an operator-side limit:
-// the dc-danus runtime template needs the code interpreter (49999), the Rust
-// sandbox server REST + Cap'n Proto (17300/17301) and code-server (9000)
-// reachable on every sandbox without a per-sandbox expose round trip.
-// The per-sandbox DYNAMIC port limit that guards against user abuse is
-// enforced separately on the expose path and is unaffected by this value.
-const maxCustomTemplateExposedPorts = 8
-
+// countCustomTemplateExposedPorts reports how many of the given ports are not
+// cubelet defaults (envd 49983). Informational only - it no longer gates the
+// request.
 func countCustomTemplateExposedPorts(ports []int32) int {
 	reserved := defaultTemplateExposedPorts()
 	count := 0

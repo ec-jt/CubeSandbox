@@ -112,7 +112,13 @@ func (s *service) Update(ctx context.Context, req *cubebox.UpdateCubeSandboxRequ
 	}
 }
 
-const hardExposedPortLimit = 100
+// Dynamic exposed-port quotas are DISABLED for now. The per-plan
+// cube.master.port_limit annotation is still accepted (and parsed when
+// present) for forward compatibility, but it no longer gates ExposePort and
+// there is no hard ceiling either - quota enforcement broke too many
+// legitimate flows (multi-service dev servers, HMR sidecars, previews).
+// Reserved platform ports and 1-65535 range validation remain enforced.
+// Re-enable by restoring the quota check in UpdateWithExposePort.
 
 var reservedUserServicePorts = map[int32]struct{}{
 	17300: {}, // Rust sandbox HTTP/WebSocket API
@@ -149,40 +155,14 @@ func (s *service) UpdateWithExposePort(ctx context.Context, req *cubebox.UpdateC
 	// Dynamic ports have no predefined numeric range. Callers explicitly mark
 	// platform-owned infrastructure mappings; absent classification preserves
 	// backward compatibility by treating a dynamic exposure as a user port.
+	// The user/infrastructure classification is still recorded in the network
+	// metadata (DynamicPortSet) so a future quota can be re-enabled without a
+	// data migration, but nothing is rejected on count today.
 	quotaCounted := portClass != "infrastructure"
-	var limit64 int64
-	if quotaCounted {
-		limit64, err = strconv.ParseInt(req.Annotations["cube.master.port_limit"], 10, 32)
-		if err != nil || limit64 < 1 || limit64 > hardExposedPortLimit {
-			rsp.Ret.RetCode = errorcode.ErrorCode_InvalidParamFormat
-			rsp.Ret.RetMsg = fmt.Sprintf("port_limit must be between 1 and %d", hardExposedPortLimit)
-			return rsp, nil
+	if raw := req.Annotations["cube.master.port_limit"]; raw != "" {
+		if limit64, perr := strconv.ParseInt(raw, 10, 32); perr != nil || limit64 < 0 {
+			log.G(ctx).Warnf("ignoring malformed cube.master.port_limit=%q for sandbox %s (quotas disabled)", raw, req.SandboxID)
 		}
-	}
-	current, err := networkplugin.GetExposedPorts(ctx, req.SandboxID)
-	if err != nil {
-		rsp.Ret.RetCode = errorcode.ErrorCode_CreateNetworkFailed
-		rsp.Ret.RetMsg = err.Error()
-		return rsp, nil
-	}
-	metadata, err := networkplugin.GetNetworkMetadata(ctx, req.SandboxID)
-	if err != nil {
-		rsp.Ret.RetCode = errorcode.ErrorCode_CreateNetworkFailed
-		rsp.Ret.RetMsg = err.Error()
-		return rsp, nil
-	}
-	dynamicPorts := networkplugin.DynamicPortSet(metadata)
-	alreadyExposed := false
-	for _, mapping := range current {
-		if mapping.ContainerPort == port {
-			alreadyExposed = true
-			break
-		}
-	}
-	if quotaCounted && !alreadyExposed && (len(dynamicPorts) >= int(limit64) || len(dynamicPorts) >= hardExposedPortLimit) {
-		rsp.Ret.RetCode = errorcode.ErrorCode_InvalidParamFormat
-		rsp.Ret.RetMsg = fmt.Sprintf("exposed port quota exceeded: limit=%d", limit64)
-		return rsp, nil
 	}
 	portMappings, err := networkplugin.ExposePort(ctx, req.SandboxID, req.RequestID, port, quotaCounted)
 	if err != nil {

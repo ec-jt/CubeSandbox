@@ -49,14 +49,15 @@ func checkParam(ctx context.Context, realReq *cubebox.RunCubeSandboxRequest) err
 		}
 	}
 
+	// Only per-port range validation. There is intentionally NO count limit on
+	// the ports baked into a CREATE request: they come from the template
+	// (operator-chosen), not from sandbox users, and a numeric cap only ever
+	// rejected legitimate runtime images. Dynamic ports opened later go through
+	// UpdateWithExposePort (update.go), which is also uncapped for now.
 	for _, p := range realReq.GetExposedPorts() {
 		if p <= 0 || p > 65535 {
 			return ret.Errorf(errorcode.ErrorCode_InvalidParamFormat, "invalid exposed port %d", p)
 		}
-	}
-	if n := len(realReq.GetExposedPorts()); n > maxStaticExposedPorts {
-		return ret.Errorf(errorcode.ErrorCode_InvalidParamFormat,
-			"exposed ports should be at most %d (got %d)", maxStaticExposedPorts, n)
 	}
 
 	if err != nil {
@@ -65,14 +66,6 @@ func checkParam(ctx context.Context, realReq *cubebox.RunCubeSandboxRequest) err
 		return nil
 	}
 }
-
-// maxStaticExposedPorts bounds the ports baked into a sandbox CREATE request
-// (template-level ports: envd 49983 + up to 8 operator-chosen runtime ports,
-// matching cubemaster's maxCustomTemplateExposedPorts). Ports a USER opens
-// later go through UpdateWithExposePort and are governed separately by the
-// per-request port_limit / hardExposedPortLimit in update.go - that is the
-// abuse guard and is unaffected by this constant.
-const maxStaticExposedPorts = 9
 
 func checkContainerName(name string, nameSet *sets.String) error {
 	if name == "" {

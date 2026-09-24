@@ -314,21 +314,19 @@ func TestCheckParamExposedPorts(t *testing.T) {
 		assert.NoError(t, err)
 	})
 
-	t.Run("accepts exactly maxStaticExposedPorts", func(t *testing.T) {
-		ports := make([]int64, 0, maxStaticExposedPorts)
-		for i := 0; i < maxStaticExposedPorts; i++ {
+	t.Run("has no exposed port count limit", func(t *testing.T) {
+		// Template-level ports are operator-chosen; any count is accepted as
+		// long as every port is in range.
+		ports := make([]int64, 0, 64)
+		for i := 0; i < 64; i++ {
 			ports = append(ports, int64(9000+i))
 		}
 		assert.NoError(t, checkParam(ctx, &cubebox.RunCubeSandboxRequest{ExposedPorts: ports}))
-	})
 
-	t.Run("rejects more than maxStaticExposedPorts", func(t *testing.T) {
-		ports := make([]int64, 0, maxStaticExposedPorts+1)
-		for i := 0; i <= maxStaticExposedPorts; i++ {
-			ports = append(ports, int64(9000+i))
-		}
-		err := checkParam(ctx, &cubebox.RunCubeSandboxRequest{ExposedPorts: ports})
+		// A single out-of-range port anywhere in a large list still rejects.
+		bad := append(append([]int64{}, ports...), 65536)
+		err := checkParam(ctx, &cubebox.RunCubeSandboxRequest{ExposedPorts: bad})
 		assert.Error(t, err)
-		assert.Contains(t, err.Error(), fmt.Sprintf("at most %d", maxStaticExposedPorts))
+		assert.Contains(t, err.Error(), fmt.Sprintf("invalid exposed port %d", 65536))
 	})
 }
