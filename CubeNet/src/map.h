@@ -57,6 +57,38 @@ struct {
 	__uint(pinning, LIBBPF_PIN_BY_NAME);
 } local_port_mapping SEC(".maps");
 
+/* Per-flow reply path, isolated by TAP/generation and peer tuple.
+ * Use a new map name: the deployed host-port-only map has a different ABI.
+ * LRU bounds stale entries without changing userspace port ownership checks.
+ */
+struct cross_egress_key {
+ __u32 vm_ifindex;
+ __u32 generation;
+ __u32 peer_ip;
+ __u16 peer_port;
+ __u16 guest_port;
+ __u16 host_port;
+ __u16 pad;
+};
+
+struct egress_desc {
+	__u32 ifindex;
+	__u32 ip;
+	__u32 smac_p1;
+	__u16 smac_p2;
+	__u32 dmac_p1;
+	__u16 dmac_p2;
+	__u16 pad;
+};
+
+struct {
+ __uint(type, BPF_MAP_TYPE_LRU_HASH);
+ __uint(max_entries, MAX_PORTS);
+ __type(key, struct cross_egress_key);
+ __type(value, struct egress_desc);
+ __uint(pinning, LIBBPF_PIN_BY_NAME);
+} cross_egress_v2 SEC(".maps");
+
 /* Egress session table
  *
  * key:   5-tuple for egress packet

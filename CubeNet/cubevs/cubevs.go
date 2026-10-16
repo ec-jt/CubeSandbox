@@ -36,6 +36,14 @@ type Params struct {
 	NodeIP      net.IP
 	NodeIPMask  net.IPMask
 	NodeMacAddr net.HardwareAddr
+	// IP and MAC address used for replies through the cross-node interface.
+	CrossNodeIP      net.IP
+	CrossNodeMacAddr net.HardwareAddr
+	// CrossNodeIngressIfindex is an optional additional node-facing NIC (e.g. a
+	// vSwitch interface) on which the from_world port-mapping redirect should
+	// also be attached on ingress. This enables cross-node sandbox ingress when
+	// inter-node traffic arrives on a non-primary interface. 0 disables.
+	CrossNodeIngressIfindex uint32
 	// MAC address of the Node gateway (next hop)
 	NodeGatewayMacAddr net.HardwareAddr
 	// L7 skb->mark values stamped by the dataplane and matched by the iptables
@@ -223,6 +231,7 @@ const (
 	MapNameMVMIPToIfindex       = "mvmip_to_ifindex"
 	MapNameRemotePortMapping    = "remote_port_mapping"
 	MapNameLocalPortMapping     = "local_port_mapping"
+	MapNameHostPortEgress       = "host_port_egress"
 	// MapNameAllowOut is the cube-v0.2.0 legacy migration source.
 	MapNameAllowOut      = "allow_out"
 	MapNameAllowOutV2    = "allow_out_v2" // legacy 16-byte policy value
@@ -249,8 +258,13 @@ const (
 	globalNameNodeIP               = "nodenic_ip"
 	globalNameNodeNetmask          = "nodenic_netmask"
 	globalNameNodeIfindex          = "nodenic_ifindex"
+	globalNameCubeRouterIfindex    = "cube_router_ifindex"
 	globalNameNodeMacaddrP1        = "nodenic_macaddr_p1"
 	globalNameNodeMacaddrP2        = "nodenic_macaddr_p2"
+	globalNameCrossNodeIP          = "cross_node_ip"
+	globalNameCrossNodeIfindex     = "cross_node_ifindex"
+	globalNameCrossNodeMacaddrP1   = "cross_node_macaddr_p1"
+	globalNameCrossNodeMacaddrP2   = "cross_node_macaddr_p2"
 	globalNameNodeGatewayMacaddrP1 = "nodegw_macaddr_p1"
 	globalNameNodeGatewayMacaddrP2 = "nodegw_macaddr_p2"
 	globalNameCubeL7MarkHTTP       = "cube_l7_mark_http"

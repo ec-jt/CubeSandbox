@@ -1032,8 +1032,28 @@ int from_cube(struct __sk_buff *skb)
 		mvm_port.listen_port = l4->source;
 		host_port = bpf_map_lookup_elem(&local_port_mapping, &mvm_port);
 		if (host_port) {
+			struct egress_desc *desc;
+
 			if (l4->syn && !l4->ack)
 				return TC_ACT_SHOT;
+            struct cross_egress_key ekey = {
+                .vm_ifindex = ifindex,
+                .generation = current_gen(ifindex),
+                .peer_ip = l3->daddr,
+                .peer_port = l4->dest,
+                .guest_port = l4->source,
+                .host_port = *host_port,
+            };
+            desc = bpf_map_lookup_elem(&cross_egress_v2, &ekey);
+
+			if (desc) {
+				err = snat_tcp_desc(skb, l2, l3, l4, l4->source,
+						    *host_port, desc);
+				if (err)
+					return TC_ACT_SHOT;
+
+				return bpf_redirect(desc->ifindex, 0);
+			}
 
 			/* A port_mapping session whose gen differs from the VM's current
 			 * mvm_meta->version is stale (the sandbox was rolled back); reset

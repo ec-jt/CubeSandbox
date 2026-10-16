@@ -24,18 +24,19 @@ const (
 type Config struct {
 	// Host and sandbox network identity. EthName must be provided by Cubelet; the
 	// rest are defaults for the mvm-facing gateway and inner interface.
-	EthName        string
-	ObjectDir      string
-	CIDR           string
-	MVMInnerIP     string
-	MVMMacAddr     string
-	MvmGwDestIP    string
-	MvmGwMacAddr   string
-	MvmMask        int
-	MvmMtu         int
-	TapInitNum     int
-	StateDir       string
-	HostPortBindIP string
+	EthName          string
+	CrossNodeEthName string
+	ObjectDir        string
+	CIDR             string
+	MVMInnerIP       string
+	MVMMacAddr       string
+	MvmGwDestIP      string
+	MvmGwMacAddr     string
+	MvmMask          int
+	MvmMtu           int
+	TapInitNum       int
+	StateDir         string
+	HostPortBindIP   string
 
 	// CubeEgressAdminURL points at the colocated CubeEgress admin
 	// listener (loopback, e.g. http://127.0.0.1:9091). Defaults to

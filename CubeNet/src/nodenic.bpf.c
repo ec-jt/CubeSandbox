@@ -54,6 +54,8 @@ static __always_inline void create_port_mapping_session(__be32 peer_ip, __be16 p
 static int tcp_nat_proxy(struct __sk_buff *skb, struct ethhdr *l2, struct iphdr *l3, struct tcphdr *l4,
 			 struct mvm_port *mvm_port)
 {
+	struct egress_desc desc = {};
+	union macaddr *macaddr;
 	__u32 old_daddr, new_daddr, tcp_csum_off;
 	struct nat_session *sess;
 	struct session_key pkey = {};
@@ -98,6 +100,31 @@ static int tcp_nat_proxy(struct __sk_buff *skb, struct ethhdr *l2, struct iphdr 
 	ip_hlen <<= 2;
 	tcp_csum_off = TCP_CSUM_OFF(ip_hlen);
 
+ // Learn only traffic addressed to the explicitly configured cross-node IP.
+ // The kernel may run the VLAN hook on the primary NIC before decapsulation.
+ struct cross_egress_key ekey = {
+  .vm_ifindex = mvm_port->ifindex,
+  .generation = current_gen(mvm_port->ifindex),
+  .peer_ip = l3->saddr,
+  .peer_port = l4->source,
+  .guest_port = mvm_port->listen_port,
+  .host_port = old_dport,
+ };
+ if (cross_node_ifindex && old_daddr == cross_node_ip &&
+     (skb->ifindex == cross_node_ifindex || skb->vlan_present)) {
+  desc.ifindex = cross_node_ifindex;
+  desc.ip = cross_node_ip;
+  desc.smac_p1 = cross_node_macaddr_p1;
+  desc.smac_p2 = cross_node_macaddr_p2;
+  macaddr = (union macaddr *)l2->h_source;
+  desc.dmac_p1 = macaddr->p1;
+  desc.dmac_p2 = macaddr->p2;
+  if (bpf_map_update_elem(&cross_egress_v2, &ekey, &desc, BPF_ANY))
+   return TC_ACT_SHOT;
+ } else {
+  bpf_map_delete_elem(&cross_egress_v2, &ekey);
+ }
+
 	/* update L2 first: csum/store helpers may invalidate packet pointers */
 	set_mac_pair(l2, cubegw0_macaddr_p1, cubegw0_macaddr_p2,
 		     mvm_macaddr_p1, mvm_macaddr_p2);
@@ -127,6 +154,20 @@ static int tcp_nat_proxy(struct __sk_buff *skb, struct ethhdr *l2, struct iphdr 
 	err = bpf_skb_store_bytes(skb, IP_DADDR_OFF, &new_daddr, sizeof(new_daddr), 0);
 	if (err)
 		return TC_ACT_OK;
+
+	/* Cross-node ingress on an 802.1Q sub-interface (e.g. vlan4000) leaves the
+	 * VLAN tag in skb->vlan_tci metadata (skb_vlan_untag pulled it from the
+	 * data at the TC ingress hook). The kernel re-inserts that tag into the
+	 * frame written to the sandbox TAP fd, and the guest NIC silently drops
+	 * the tagged frame — the cross-node request never reaches the sandbox.
+	 * Pop the tag (clears the metadata tag; no-op when untagged) before the
+	 * redirect so the frame delivered to the guest is clean.
+	 */
+	if (skb->vlan_present) {
+		err = bpf_skb_vlan_pop(skb);
+		if (err)
+			return TC_ACT_OK;
+	}
 
 	return bpf_redirect(mvm_port->ifindex, 0);
 }
@@ -459,11 +500,11 @@ static __always_inline int do_tcp_nat(struct __sk_buff *skb)
 	if (!__pull_headers(skb, &l2, &l3, &l4))
 		return TC_ACT_OK;
 
-	/* Port mapping is exposed only on the configured primary NIC. The same
-	 * from_world program also runs on cube-router egress, where port mapping
-	 * must be skipped and only reverse NAT sessions are relevant.
-	 */
-	if (skb->ifindex == nodenic_ifindex) {
+ /* Restrict host-port ingress to explicitly configured node-facing NICs.
+  * The cube-router egress hook must not interpret outbound ports as host ports.
+  */
+	if (skb->ifindex == nodenic_ifindex ||
+	    (cross_node_ifindex && skb->ifindex == cross_node_ifindex)) {
 		dport = l4->dest;
 		mvm_port = bpf_map_lookup_elem(&remote_port_mapping, &dport);
 		if (mvm_port)

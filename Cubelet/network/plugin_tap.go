@@ -37,16 +37,17 @@ const (
 )
 
 type Config struct {
-	EthName      string `toml:"eth_name"`
-	TapInitNum   int    `toml:"tap_init_num"`
-	CIDR         string `toml:"cidr"`
-	ObjectDir    string `toml:"object_dir"`
-	MVMInnerIP   string `toml:"mvm_inner_ip"`
-	MVMMacAddr   string `toml:"mvm_mac_addr"`
-	MvmGwDestIP  string `toml:"mvm_gw_dest_ip"`
-	MvmGwMacAddr string `toml:"mvm_gw_mac_addr"`
-	MvmMask      int    `toml:"mvm_mask"`
-	MvmMtu       int    `toml:"mvm_mtu"`
+	EthName          string `toml:"eth_name"`
+	CrossNodeEthName string `toml:"cross_node_eth_name"`
+	TapInitNum       int    `toml:"tap_init_num"`
+	CIDR             string `toml:"cidr"`
+	ObjectDir        string `toml:"object_dir"`
+	MVMInnerIP       string `toml:"mvm_inner_ip"`
+	MVMMacAddr       string `toml:"mvm_mac_addr"`
+	MvmGwDestIP      string `toml:"mvm_gw_dest_ip"`
+	MvmGwMacAddr     string `toml:"mvm_gw_mac_addr"`
+	MvmMask          int    `toml:"mvm_mask"`
+	MvmMtu           int    `toml:"mvm_mtu"`
 
 	CheckIntervalTime      tomlext.Duration `toml:"check_interval_in_sec"`
 	ReportStatIntervalTime tomlext.Duration `toml:"report_stat_interval_in_sec"`
@@ -133,6 +134,7 @@ func (l *local) Init(ctx context.Context, _ *workflow.InitInfo) error {
 func networkRuntimeConfigFromPluginConfig(config *Config) networkruntime.Config {
 	cfg := networkruntime.DefaultConfig()
 	cfg.EthName = config.EthName
+	cfg.CrossNodeEthName = config.CrossNodeEthName
 	cfg.ObjectDir = config.ObjectDir
 	cfg.CIDR = config.CIDR
 	cfg.MVMInnerIP = config.MVMInnerIP

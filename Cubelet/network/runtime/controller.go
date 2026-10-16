@@ -293,6 +293,9 @@ func initCubeVS(cfg Config, device *systemnet.HostDevice, cubeDev *systemnet.Cub
 		NodeMacAddr:         device.Mac,
 		NodeGatewayMacAddr:  device.GatewayMac,
 	}
+	if err := configureCrossNode(cfg, &params); err != nil {
+		return nil, err
+	}
 	if err := loadL7MarksConfig(&params); err != nil {
 		return nil, err
 	}
