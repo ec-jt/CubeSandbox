@@ -91,6 +91,11 @@ func Update(ctx context.Context, req *types.UpdateRequest) (rsp *types.Res) {
 			return nil
 		}
 
+		if legacy, handled := tryLegacyPauseUpdate(ctx, req, hostIP); handled {
+			*rsp = *legacy
+			return nil
+		}
+
 		switch req.Action {
 		case "pause":
 			*rsp = *pauseSandbox(ctx, req, hostIP)
