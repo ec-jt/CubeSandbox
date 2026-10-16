@@ -10,7 +10,30 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/base/rediskey"
 )
+
+func TestOwnerBoundToAcquisitionAndSandbox(t *testing.T) {
+	r := newFakeRedis()
+	ctx := context.Background()
+	if _, _, ok := Owner(ctx, "sb-port"); ok {
+		t.Fatal("owner outside acquisition")
+	}
+	err := withLock(ctx, r, rediskey.LockSandbox("sb-port"), "token", Options{TTL: time.Minute, RetryInterval: time.Millisecond}, func(ctx context.Context) error {
+		key, token, ok := Owner(context.WithoutCancel(ctx), "sb-port")
+		if !ok || key != rediskey.LockSandbox("sb-port") || token != "token" {
+			t.Fatal("owner missing from callback")
+		}
+		if _, _, ok := Owner(ctx, "other"); ok {
+			t.Fatal("cross-sandbox owner accepted")
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+}
 
 type fakeRedis struct {
 	mu    sync.Mutex

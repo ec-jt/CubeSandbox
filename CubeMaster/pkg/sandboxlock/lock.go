@@ -117,7 +117,21 @@ func withLock(ctx context.Context, r doer, key, token string, opts Options, fn f
 			log.G(ctx).Warnf("sandboxlock: unlock %s failed: %v", key, err)
 		}
 	}()
-	return fn(ctx)
+	return fn(context.WithValue(ctx, ownerContextKey{}, owner{key: key, token: token}))
+}
+
+type ownerContextKey struct{}
+type owner struct{ key, token string }
+
+// Owner identifies this acquisition for atomic Redis writes under WithLock.
+// Possessing a token is not proof of ownership: the write must compare it to
+// Redis in the same script as the mutation. This does not fence Cubelet RPCs.
+func Owner(ctx context.Context, sandboxID string) (key, token string, ok bool) {
+	o, ok := ctx.Value(ownerContextKey{}).(owner)
+	if !ok || o.key != rediskey.LockSandbox(sandboxID) || o.token == "" {
+		return "", "", false
+	}
+	return o.key, o.token, true
 }
 
 func unlock(r doer, key, token string) error {

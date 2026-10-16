@@ -822,10 +822,14 @@ var FastestJsoniter = jsoniter.Config{
 }.Froze()
 
 type UpdateRequest struct {
-	RequestID    string `json:"requestID"`
-	SandboxID    string `json:"sandbox_id"`
-	InstanceType string `json:"instance_type"`
-	Action       string `json:"action"`
+	RequestID     string `json:"requestID"`
+	SandboxID     string `json:"sandbox_id"`
+	InstanceType  string `json:"instance_type"`
+	Action        string `json:"action"`
+	ContainerPort int    `json:"container_port,omitempty"`
+	PortClass     string `json:"port_class,omitempty"`
+	// PortLimit is wire compatibility only; numeric exposed-port quotas are disabled.
+	PortLimit int `json:"port_limit,omitempty"`
 	// Timeout is the optional idle TTL for resume. nil or 0 keeps the stored
 	// timeout; -1 (NeverTimeout) disables expiry; N>0 opens an N-second
 	// window from now. Values below -1 are rejected. Immediate expiry is

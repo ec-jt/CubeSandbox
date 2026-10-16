@@ -44,10 +44,16 @@ func Update(ctx context.Context, req *types.UpdateRequest) (rsp *types.Res) {
 		rsp.Ret.RetMsg = "should provide InstanceType,SandboxID,Action"
 		return
 	}
-	if req.Action != "pause" && req.Action != "resume" {
+	if req.Action != "pause" && req.Action != "resume" && !isPortAction(req.Action) {
 		rsp.Ret.RetCode = int(errorcode.ErrorCode_MasterParamsError)
-		rsp.Ret.RetMsg = "action should be pause or resume"
+		rsp.Ret.RetMsg = "action should be pause, resume, exposePort, or closePort"
 		return
+	}
+	if isPortAction(req.Action) {
+		if err := validatePortUpdate(req); err != nil {
+			rsp.Ret = &types.Ret{RetCode: int(errorcode.ErrorCode_MasterParamsError), RetMsg: err.Error()}
+			return
+		}
 	}
 	if req.Action == "resume" && req.Timeout != nil && *req.Timeout < types.NeverTimeout {
 		rsp.Ret.RetCode = int(errorcode.ErrorCode_MasterParamsError)
@@ -73,6 +79,12 @@ func Update(ctx context.Context, req *types.UpdateRequest) (rsp *types.Res) {
 		// Client/HTTP cancel must not abort bookkeeping or release the lock
 		// while SAVE/Create/Destroy is still in flight on Cubelet.
 		ctx = context.WithoutCancel(ctx)
+		// Port updates resolve the shared proxy owner, not potentially stale local
+		// inventory or pause bindings. Never enter the opt-in legacy pause bridge.
+		if isPortAction(req.Action) {
+			*rsp = *updateSandboxPorts(ctx, req, defaultPortUpdateDeps())
+			return nil
+		}
 		var hostIP string
 		if v := localcache.GetSandboxCache(req.SandboxID); v != nil {
 			hostIP = v.HostIP
