@@ -23,6 +23,9 @@ var (
 
 type Store struct {
 	indexer cache.Indexer
+	// Order snapshot capture and DB write together, so a background Sync cannot
+	// overwrite a newer port view with an older copy after a successful update.
+	syncLocks *utils.ResourceLocks
 
 	db multimeta.MetadataDBAPI
 }
@@ -106,8 +109,9 @@ func cubeboxKeyFunc(obj any) (string, error) {
 
 func NewStore(db multimeta.MetadataDBAPI) *Store {
 	return &Store{
-		db:      db,
-		indexer: cache.NewIndexer(cubeboxKeyFunc, indexers),
+		db:        db,
+		indexer:   cache.NewIndexer(cubeboxKeyFunc, indexers),
+		syncLocks: utils.NewResourceLocks(),
 	}
 }
 
@@ -239,6 +243,8 @@ func (s *Store) Sync(id string) error {
 		}
 	}
 
+	unlock := s.syncLocks.Lock(sb.ID)
+	defer unlock()
 	sbCopy := s.createSafeCopy(sb)
 
 	bs, err := jsoniter.Marshal(sbCopy)

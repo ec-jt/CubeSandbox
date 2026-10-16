@@ -22,6 +22,7 @@ import (
 	"github.com/containerd/plugin"
 	"github.com/containerd/plugin/registry"
 	jsoniter "github.com/json-iterator/go"
+	networkruntime "github.com/tencentcloud/CubeSandbox/Cubelet/network/runtime"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/metadata"
 	"k8s.io/utils/clock"
@@ -198,6 +199,7 @@ type service struct {
 	cubebox.UnimplementedCubeboxMgrServer
 	numaNodeIndex         uint32
 	sandboxLifecycleLocks *utils.ResourceLocks
+	dynamicPortNetwork    networkruntime.DynamicPortRuntime
 
 	otherRuntime *ociRuntime
 }
@@ -986,7 +988,7 @@ func toGRPCCubeBox(box *cubeboxstore.CubeBox, opt *cubebox.ListCubeSandboxOption
 	cb := &cubebox.CubeSandbox{
 		Id:           box.ID,
 		Namespace:    box.Namespace,
-		PortMappings: box.PortMappings,
+		PortMappings: box.LivePortMappings(),
 		CreatedAt:    box.CreatedAt,
 		Labels:       maps.Clone(box.Labels),
 		NumaNode:     box.NumaNode,

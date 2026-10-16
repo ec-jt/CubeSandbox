@@ -356,6 +356,8 @@ const (
 	UpdateActionPause        = "pause"
 	UpdateActionResume       = "resume"
 	UpdateActionNetwork      = "network"
+	UpdateActionExposePort   = "exposePort"
+	UpdateActionClosePort    = "closePort"
 	PreStopTypePause         = "pause"
 	PreStopTypeDestroy       = "destroy"
 )

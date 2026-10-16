@@ -414,6 +414,11 @@ func UpdateSandboxNetworkPolicy(ctx context.Context, sandboxID string, cfg *cube
 	if sandboxID == "" {
 		return fmt.Errorf("sandbox id is empty")
 	}
+	unlock, err := networkOperationLocks.LockContext(ctx, sandboxID)
+	if err != nil {
+		return err
+	}
+	defer unlock()
 	return dnm.tapPlugin.networkRuntime.UpdateNetworkPolicy(ctx, &networkruntime.UpdateNetworkPolicyRequest{
 		SandboxID:         sandboxID,
 		CubeNetworkConfig: mapRunRequestCubeNetworkConfig(cfg),

@@ -112,6 +112,8 @@ func (s *service) Update(ctx context.Context, req *cubebox.UpdateCubeSandboxRequ
 		return s.updateWithPauseCow(ctx, req, sb)
 	case constants.UpdateActionNetwork:
 		return s.updateNetworkPolicy(ctx, req, sb, rsp)
+	case constants.UpdateActionExposePort, constants.UpdateActionClosePort:
+		return s.updatePort(ctx, req, sb, action == constants.UpdateActionExposePort)
 	case constants.UpdateActionResume:
 		// Resume is Master Create(same sandboxID from pause snap), not Update(resume).
 		rsp.Ret.RetMsg = "pause resume is owned by CubeMaster Create; Update(resume) is not supported"

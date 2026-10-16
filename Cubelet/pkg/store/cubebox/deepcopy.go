@@ -6,6 +6,7 @@ package cubebox
 
 import (
 	"maps"
+	"slices"
 
 	"google.golang.org/protobuf/proto"
 
@@ -36,14 +37,11 @@ func (cb *CubeBox) DeepCopy() *CubeBox {
 		HostMetricsBaselineMissingAtAssignment: cb.HostMetricsBaselineMissingAtAssignment,
 	}
 
-	if cb.PortMappings != nil {
-		copied.PortMappings = make([]*cubebox.PortMapping, len(cb.PortMappings))
-		for i, pm := range cb.PortMappings {
-			if pm != nil {
-				copied.PortMappings[i] = proto.Clone(pm).(*cubebox.PortMapping)
-			}
-		}
-	}
+	cb.livePortsLock.RLock()
+	copied.PortMappings = clonePortMappings(cb.PortMappings)
+	copied.DynamicPorts = slices.Clone(cb.DynamicPorts)
+	copied.DynamicInfraPorts = slices.Clone(cb.DynamicInfraPorts)
+	cb.livePortsLock.RUnlock()
 
 	copied.NetworkType = cb.NetworkType
 	copied.RuntimeHandler = cb.RuntimeHandler

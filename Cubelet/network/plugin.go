@@ -137,6 +137,11 @@ func (m *delegateNetworkManager) initDB() error {
 }
 
 func (m *delegateNetworkManager) Create(ctx context.Context, opts *workflow.CreateContext) (err error) {
+	unlock, err := networkOperationLocks.LockContext(ctx, opts.SandboxID)
+	if err != nil {
+		return err
+	}
+	defer unlock()
 	defer func() {
 		if err != nil {
 			log.G(ctx).Errorf("Create,fail:%v", err.Error())
@@ -179,6 +184,11 @@ func (m *delegateNetworkManager) Create(ctx context.Context, opts *workflow.Crea
 }
 
 func (m *delegateNetworkManager) Destroy(ctx context.Context, opts *workflow.DestroyContext) (err error) {
+	unlock, err := networkOperationLocks.LockContext(ctx, opts.SandboxID)
+	if err != nil {
+		return err
+	}
+	defer unlock()
 	defer func() {
 		if err != nil {
 			log.G(ctx).Errorf("Destroy,fail:%v", err.Error())

@@ -111,9 +111,12 @@ type CubeBox struct {
 	Namespace string `json:"namespace,omitempty"`
 	AppID     string `json:"app_id,omitempty"`
 
-	IP           string
-	PortMappings []*cubebox.PortMapping
-	CGroupPath   string
+	IP                string
+	PortMappings      []*cubebox.PortMapping
+	DynamicPorts      []int32      `json:"dynamic_ports,omitempty"`
+	DynamicInfraPorts []int32      `json:"dynamic_infra_ports,omitempty"`
+	livePortsLock     sync.RWMutex `json:"-"`
+	CGroupPath        string
 
 	FirstContainerName string `json:"first_container_name,omitempty"`
 	Containers         map[string]*Container
