@@ -490,8 +490,11 @@ func (s *NetworkController) EnsureNetwork(ctx context.Context, req *EnsureNetwor
 	)
 	s.mu.Lock()
 	if existing, ok := s.states[req.SandboxID]; ok {
-		resp = existing.ensureResponse()
 		s.mu.Unlock()
+		if err := s.settlePendingPort(existing); err != nil {
+			return nil, err
+		}
+		resp = existing.ensureResponse()
 		idempotent = true
 		return resp, nil
 	}
@@ -554,6 +557,9 @@ func (s *NetworkController) UpdateNetworkPolicy(ctx context.Context, req *Update
 	s.mu.Unlock()
 	if !ok {
 		return fmt.Errorf("%w: sandbox %q", ErrNetworkNotActive, req.SandboxID)
+	}
+	if err := s.settlePendingPort(state); err != nil {
+		return err
 	}
 
 	CubeLog.WithContext(ctx).Infof(
@@ -924,6 +930,9 @@ func (s *NetworkController) ReleaseNetwork(ctx context.Context, req *ReleaseNetw
 		return &ReleaseNetworkResponse{Released: true, PersistMetadata: req.PersistMetadata}, nil
 	}
 
+	if err := s.settlePendingPort(state); err != nil {
+		return &ReleaseNetworkResponse{Released: false}, err
+	}
 	if err := s.releaseState(ctx, state); err != nil {
 		return &ReleaseNetworkResponse{
 			// Once success is gone, the delete intent either remains durable or
@@ -1029,7 +1038,7 @@ func (s *NetworkController) ListTaps(ctx context.Context, req *ListTapsRequest) 
 	statesByTapName := map[string]*managedState{}
 	s.mu.Lock()
 	for _, state := range s.states {
-		statesByTapName[state.TapName] = state
+		statesByTapName[state.TapName] = &managedState{persistedState: *clonePersistedState(&state.persistedState)}
 	}
 	s.mu.Unlock()
 

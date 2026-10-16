@@ -638,6 +638,16 @@ func (s *NetworkController) recoverActiveTap(tap *tapDevice, record *StateRecord
 	if err := s.restoreRecoveredCubeVSMetadata(managed); err != nil {
 		return fmt.Errorf("restore CubeVS metadata for active sandbox %s: %w", managed.SandboxID, err)
 	}
+	// Claim the union before removing a provisional expose or completing close.
+	// Never replay a pending mapping via the ordinary success restore path.
+	if managed.PendingPort != nil {
+		if err := s.ports.AssignOwner(managed.SandboxID, managed.PortMappings); err != nil {
+			return err
+		}
+		if err := s.settlePendingPort(managed); err != nil {
+			return fmt.Errorf("recover dynamic port for sandbox %s: %w", managed.SandboxID, err)
+		}
+	}
 	if err := s.claimRecoveredSuccessResources(managed); err != nil {
 		return fmt.Errorf("claim resources for active sandbox %s: %w", managed.SandboxID, err)
 	}
@@ -936,6 +946,10 @@ func clonePersistedState(in *persistedState) *persistedState {
 	out.Routes = append([]Route(nil), in.Routes...)
 	out.ARPNeighbors = append([]ARPNeighbor(nil), in.ARPNeighbors...)
 	out.PortMappings = append([]PortMapping(nil), in.PortMappings...)
+	if in.PendingPort != nil {
+		mapping := *in.PendingPort
+		out.PendingPort = &mapping
+	}
 	out.CubeNetworkConfig = cloneCubeNetworkConfig(in.CubeNetworkConfig)
 	out.PersistMetadata = cloneStringMap(in.PersistMetadata)
 	return &out

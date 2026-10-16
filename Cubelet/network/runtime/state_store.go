@@ -22,15 +22,19 @@ import (
 // intentionally contains enough information to clean or restore host resources
 // after a process crash without trusting in-memory maps.
 type persistedState struct {
-	SandboxID         string             `json:"sandboxID"`
-	NetworkHandle     string             `json:"networkHandle"`
-	TapName           string             `json:"tapName"`
-	TapIfIndex        int                `json:"tapIfIndex"`
-	SandboxIP         string             `json:"sandboxIP"`
-	Interfaces        []Interface        `json:"interfaces"`
-	Routes            []Route            `json:"routes"`
-	ARPNeighbors      []ARPNeighbor      `json:"arpNeighbors"`
-	PortMappings      []PortMapping      `json:"portMappings"`
+	SandboxID     string        `json:"sandboxID"`
+	NetworkHandle string        `json:"networkHandle"`
+	TapName       string        `json:"tapName"`
+	TapIfIndex    int           `json:"tapIfIndex"`
+	SandboxIP     string        `json:"sandboxIP"`
+	Interfaces    []Interface   `json:"interfaces"`
+	Routes        []Route       `json:"routes"`
+	ARPNeighbors  []ARPNeighbor `json:"arpNeighbors"`
+	PortMappings  []PortMapping `json:"portMappings"`
+	// PendingPort is a write-ahead removal intent. For expose, it protects the
+	// provisional tuple until the final success rewrite; recovery aborts an
+	// uncommitted expose. For close, recovery completes the removal.
+	PendingPort       *PortMapping       `json:"pendingPort,omitempty"`
 	CubeNetworkConfig *CubeNetworkConfig `json:"-"`
 	// DNSAllowOutCIDRs are the resolver /32s already folded into
 	// CubeNetworkConfig.AllowOut so domain rules can be resolved at all. They
@@ -54,6 +58,7 @@ type persistedStateOnDisk struct {
 	Routes              []Route            `json:"routes"`
 	ARPNeighbors        []ARPNeighbor      `json:"arpNeighbors"`
 	PortMappings        []PortMapping      `json:"portMappings"`
+	PendingPort         *PortMapping       `json:"pendingPort,omitempty"`
 	CubeNetworkConfig   *CubeNetworkConfig `json:"cubeNetworkConfig,omitempty"`
 	LegacyCubeVSContext *CubeNetworkConfig `json:"cubevsContext,omitempty"`
 	DNSAllowOutCIDRs    []string           `json:"dnsAllowOutCIDRs,omitempty"`
@@ -74,6 +79,7 @@ func (s *persistedState) MarshalJSON() ([]byte, error) {
 		Routes:              s.Routes,
 		ARPNeighbors:        s.ARPNeighbors,
 		PortMappings:        s.PortMappings,
+		PendingPort:         s.PendingPort,
 		CubeNetworkConfig:   s.CubeNetworkConfig,
 		LegacyCubeVSContext: s.CubeNetworkConfig,
 		DNSAllowOutCIDRs:    s.DNSAllowOutCIDRs,
@@ -98,6 +104,7 @@ func (s *persistedState) UnmarshalJSON(data []byte) error {
 	s.Routes = disk.Routes
 	s.ARPNeighbors = disk.ARPNeighbors
 	s.PortMappings = disk.PortMappings
+	s.PendingPort = disk.PendingPort
 	if disk.CubeNetworkConfig != nil {
 		s.CubeNetworkConfig = disk.CubeNetworkConfig
 	} else {
@@ -154,6 +161,8 @@ type stateStore struct {
 	// no durability effect: tmpfs survives the process crashes this protocol
 	// guards against, and a host crash loses tmpfs contents anyway.
 	noSync bool
+	// rewriteHook injects pre/post-rename failures in unprivileged tests.
+	rewriteHook func(string) error
 }
 
 // tmpfsMagic is the statfs f_type for tmpfs (include/linux/magic.h).
@@ -282,12 +291,22 @@ func (s *stateStore) RewriteSuccess(state *persistedState) error {
 		return err
 	}
 	scratch := p + ".new"
+	if s.rewriteHook != nil {
+		if err := s.rewriteHook("before_rename"); err != nil {
+			return err
+		}
+	}
 	if err := s.writeStateFile(scratch, data, 0o600); err != nil {
 		return err
 	}
 	if err := os.Rename(scratch, p); err != nil {
 		_ = os.Remove(scratch)
 		return err
+	}
+	if s.rewriteHook != nil {
+		if err := s.rewriteHook("after_rename"); err != nil {
+			return err
+		}
 	}
 	return s.maybeSyncDir(filepath.Dir(p))
 }
