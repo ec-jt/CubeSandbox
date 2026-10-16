@@ -71,6 +71,21 @@ func TestApplyPauseBindingsSkipsUnfinishedPause(t *testing.T) {
 	require.Empty(t, got)
 }
 
+func TestApplyPauseBindingsPreservesLegacyScannedRowWithoutBinding(t *testing.T) {
+	legacy := &types.SandboxBriefData{
+		SandboxID: "sb-legacy", Status: 5, HostID: "legacy-node",
+		HostIP: "10.0.1.1", TemplateID: "tpl-original", PauseAt: 1234,
+	}
+	got := applyPauseBindings([]*types.SandboxBriefData{legacy}, nil, false, true)
+	require.Len(t, got, 1)
+	require.Same(t, legacy, got[0])
+	require.Equal(t, int32(5), got[0].Status)
+	require.Equal(t, "tpl-original", got[0].TemplateID)
+	require.Equal(t, int64(1234), got[0].PauseAt)
+	require.Empty(t, got[0].PauseSnapshotID)
+	require.Empty(t, got[0].RemoteStatus)
+}
+
 func TestApplyPauseBindingsSurfacesDeleteFailedLeftover(t *testing.T) {
 	got := applyPauseBindings(nil, []*pausesnap.Record{{
 		SandboxID:    "sb-stuck",

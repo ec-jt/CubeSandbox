@@ -7,10 +7,30 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"os"
 	"strings"
 )
 
 const MaxManifestBytes = 1 << 20
+
+// LoadConfigured returns an empty cohort when disabled. A configured manifest
+// that cannot be read or validated is an error, never an implicit opt-out.
+func LoadConfigured() (map[string]string, error) {
+	path := os.Getenv("CUBE_LEGACY_PAUSE_MANIFEST")
+	if path == "" {
+		return nil, nil
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, fmt.Errorf("legacy manifest unavailable")
+	}
+	defer f.Close()
+	cohort, err := Parse(f)
+	if err != nil {
+		return nil, fmt.Errorf("invalid legacy manifest")
+	}
+	return cohort, nil
+}
 
 type Entry struct {
 	SandboxID string `json:"sandbox_id"`

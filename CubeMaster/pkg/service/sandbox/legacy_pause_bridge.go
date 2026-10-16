@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"os"
 	"strings"
 	"time"
 
@@ -32,19 +31,10 @@ var (
 // synthetic native bindings or falls back after a native resume failure.
 // Original nodes MUST retain their old Cubelet/shim protocol during coexistence.
 func tryLegacyPauseUpdate(ctx context.Context, req *types.UpdateRequest, hostIP string) (*types.Res, bool) {
-	path := os.Getenv("CUBE_LEGACY_PAUSE_MANIFEST")
-	if path == "" {
-		return nil, false
-	}
 	fail := func(message string) (*types.Res, bool) {
 		return &types.Res{Ret: &types.Ret{RetCode: int(errorcode.ErrorCode_MasterParamsError), RetMsg: message}}, true
 	}
-	f, err := os.Open(path)
-	if err != nil {
-		return fail("legacy manifest unavailable; refusing lifecycle update")
-	}
-	cohort, err := legacyresume.Parse(f)
-	f.Close()
+	cohort, err := legacyresume.LoadConfigured()
 	if err != nil {
 		return fail("invalid legacy manifest; refusing lifecycle update")
 	}

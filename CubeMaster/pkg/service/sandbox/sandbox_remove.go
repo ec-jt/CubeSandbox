@@ -17,6 +17,7 @@ import (
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/base/utils"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/cubelet"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/errorcode"
+	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/legacydelete"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/localcache"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/pausesnap"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/sandboxlock"
@@ -194,7 +195,10 @@ func callCubelet(ctx context.Context, callEp string, req *cubebox.DestroyCubeSan
 		ctx = context.WithoutCancel(ctx)
 		hostIP := strings.Split(callEp, ":")[0]
 		_, nodeOK := localcache.GetNodesByIp(hostIP)
-		handled, err := pausesnap.TryDeletePaused(ctx, req.GetRequestID(), req.GetSandboxID(), hostIP)
+		handled, err := legacydelete.TryDestroy(ctx, hostIP, req)
+		if !handled && err == nil {
+			handled, err = pausesnap.TryDeletePaused(ctx, req.GetRequestID(), req.GetSandboxID(), hostIP)
+		}
 		if err != nil {
 			log.G(ctx).Errorf("delete paused sandbox fail:%+v", err)
 			return err

@@ -26,6 +26,7 @@ import (
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/cubelet"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/errorcode"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/instancecache"
+	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/legacydelete"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/localcache"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/pausesnap"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/sandboxlock"
@@ -245,7 +246,10 @@ func (h *DestroySandboxTaskHandler) HandleTask(ctx context.Context, t *Task) err
 		ctx = context.WithoutCancel(ctx)
 		hostIP := strings.Split(t.CallEp, ":")[0]
 		_, nodeOK := localcache.GetNodesByIp(hostIP)
-		handled, err := pausesnap.TryDeletePaused(ctx, req.GetRequestID(), req.GetSandboxID(), hostIP)
+		handled, err := legacydelete.TryDestroy(ctx, hostIP, req)
+		if !handled && err == nil {
+			handled, err = pausesnap.TryDeletePaused(ctx, req.GetRequestID(), req.GetSandboxID(), hostIP)
+		}
 		if err != nil {
 			log.G(ctx).Errorf("delete paused sandbox fail:%+v", err)
 			return ret.Errorf(errorcode.ErrorCode_MasterRateLimitedError, "%s", err.Error())
