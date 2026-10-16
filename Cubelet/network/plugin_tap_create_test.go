@@ -8,6 +8,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"github.com/stretchr/testify/require"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -837,5 +838,36 @@ func TestIsIPv6DNSServer(t *testing.T) {
 	}
 	if isIPv6DNSServer("not-an-ip") {
 		t.Fatal("did not expect invalid DNS server to be detected as IPv6")
+	}
+}
+
+func TestTapCreatePortablePortsTrustAndAllocationMetadata(t *testing.T) {
+	for _, trusted := range []bool{false, true} {
+		fake := &fakeNetworkRuntime{}
+		l := &local{Config: &Config{MVMMacAddr: "20:90:6f:fc:fc:fc", MvmMtu: 1500, MvmGwDestIP: "169.254.68.5", MVMInnerIP: "169.254.68.6", MvmMask: 30}, networkRuntime: fake}
+		request := &cubebox.RunCubeSandboxRequest{InstanceType: "cubebox", ExposedPorts: []int64{80, 17300}, Annotations: map[string]string{networkruntime.DynamicPortsMetadataKey: "[80,17300]"}}
+		ctx := context.Background()
+		if trusted {
+			var err error
+			ctx, err = networkruntime.WithRestoredPorts(ctx, &networkruntime.PortablePorts{Version: 1, Ports: []networkruntime.PortablePort{{ContainerPort: 80, Class: "static"}, {ContainerPort: 3000, Class: "user"}, {ContainerPort: 4000, Class: "infrastructure"}}})
+			require.NoError(t, err)
+		}
+		opts := &workflow.CreateContext{ReqInfo: request, BaseWorkflowInfo: workflow.BaseWorkflowInfo{SandboxID: "sandbox-1"}}
+		require.NoError(t, l.Create(ctx, opts))
+		desired := fake.lastEnsureRequest
+		for _, port := range desired.PortMappings {
+			require.Zero(t, port.HostPort)
+		}
+		if trusted {
+			require.Equal(t, "[3000]", desired.PersistMetadata[networkruntime.DynamicPortsMetadataKey])
+			require.Equal(t, "[4000]", desired.PersistMetadata[networkruntime.DynamicInfraPortsMetadataKey])
+			require.Len(t, desired.PortMappings, 3)
+		} else {
+			require.Empty(t, desired.PersistMetadata[networkruntime.DynamicPortsMetadataKey])
+			require.Len(t, desired.PortMappings, 2)
+		}
+		var metadata map[string]json.RawMessage
+		require.NoError(t, json.Unmarshal(opts.NetworkInfo.GetPersistMetadata(), &metadata))
+		require.Contains(t, metadata, "runtime_network")
 	}
 }

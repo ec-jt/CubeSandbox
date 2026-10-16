@@ -260,6 +260,12 @@ func (s *service) updateWithPauseCow(
 		return rsp, nil
 	}
 	stepLog = stepLog.WithFields(CubeLog.Fields{"backend": backend})
+	ports, err := s.captureSnapshotPorts(ctx, sb)
+	if err != nil {
+		rsp.Ret.RetCode = errorcode.ErrorCode_CreateNetworkFailed
+		rsp.Ret.RetMsg = fmt.Sprintf("capture snapshot ports: %v", err)
+		return rsp, nil
+	}
 	prevLiveSnap := stampedPauseSnapshotID(sb)
 	stampLaunchMemoryAncestorOnce(sb, resolveLaunchAncestorSnapshotID(sb))
 	stampPauseSnapshotID(sb, snapID)
@@ -356,6 +362,9 @@ func (s *service) updateWithPauseCow(
 	// Capture recreate payload before PauseToSnapshot. Shim recreate_dir wipes
 	// the destination, so sandbox_spec.json is written after the shim returns.
 	pauseSpec := buildPauseSandboxSpec(sb, req.RequestID)
+	if ports != nil {
+		pauseSpec.ExposedPorts = ports.ExposedPorts()
+	}
 
 	ns := sb.Namespace
 	if ns == "" {
@@ -443,6 +452,9 @@ func (s *service) updateWithPauseCow(
 			fmt.Sprintf("failed to create pause rootfs snapshot: %v", err))
 	}
 
+	if err := writeSnapshotPorts(layout.MetaWork, ports); err != nil {
+		return failPause(errorcode.ErrorCode_Unknown, fmt.Sprintf("write snapshot ports: %v", err))
+	}
 	if err := writePauseSandboxSpec(layout.MetaWork, pauseSpec); err != nil {
 		return failPause(errorcode.ErrorCode_Unknown, fmt.Sprintf("failed to write pause sandbox_spec: %v", err))
 	}

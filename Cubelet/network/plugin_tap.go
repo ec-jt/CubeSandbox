@@ -197,6 +197,11 @@ func (l *local) Create(ctx context.Context, opts *workflow.CreateContext) (err e
 	// and by then the resolver list is not recoverable from anywhere else.
 	ensureReq := l.buildEnsureNetworkRequestFromIntent(opts.SandboxID, request.GetRequestID(), request.ExposedPorts, req, cubeNetworkConfig,
 		dnsServersToAllowOutCIDRs(ctx, resolvedDNSServers))
+	if ports := networkruntime.RestoredPorts(ctx); ports != nil {
+		if err := ports.ApplyTo(ensureReq); err != nil {
+			return err
+		}
+	}
 	log.G(ctx).Infof("tap create ensure request: sandbox_id=%s interfaces=%d routes=%d arps=%d port_mappings=%d resolved_dns_servers=%v dns_allow_out_cidrs=%v cube_network_config=%s persist_metadata=%s",
 		ensureReq.SandboxID, len(ensureReq.Interfaces), len(ensureReq.Routes), len(ensureReq.ARPNeighbors),
 		len(ensureReq.PortMappings), resolvedDNSServers, dnsAllowOutCIDRs, formatNetworkRuntimeCubeNetworkConfig(ensureReq.CubeNetworkConfig), utils.InterfaceToString(ensureReq.PersistMetadata))
@@ -224,6 +229,7 @@ func (l *local) Create(ctx context.Context, opts *workflow.CreateContext) (err e
 	if err != nil {
 		return ret.Errorf(errorcode.ErrorCode_CreateNetworkFailed, "build shim req from network runtime response failed: %+v", err)
 	}
+	shimReq.RuntimeNetwork = ensureResp
 	logShimNetwork(ctx, opts.SandboxID, shimReq)
 	applyShimQoS(req, shimReq)
 	opts.NetworkInfo = shimReq

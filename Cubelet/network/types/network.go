@@ -11,6 +11,7 @@ import (
 
 	"github.com/containerd/containerd/v2/pkg/oci"
 	jsoniter "github.com/json-iterator/go"
+	networkruntime "github.com/tencentcloud/CubeSandbox/Cubelet/network/runtime"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/pkg/constants"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/pkg/log"
 )
@@ -65,19 +66,22 @@ type ARP struct {
 }
 
 type ShimNetReqPersistMetadata struct {
-	SandboxIP string `json:"sandbox_ip"`
+	RuntimeNetwork *networkruntime.EnsureNetworkResponse `json:"runtime_network,omitempty"`
+	SandboxIP      string                                `json:"sandbox_ip"`
 }
 
 type ShimNetReq struct {
-	Interfaces   []*Interface  `json:"interfaces"`
-	Routes       []Route       `json:"routes"`
-	ARPs         []ARP         `json:"arps"`
-	PortMappings []PortMapping `json:"port_mappings"`
+	RuntimeNetwork *networkruntime.EnsureNetworkResponse `json:"-"`
+	Interfaces     []*Interface                          `json:"interfaces"`
+	Routes         []Route                               `json:"routes"`
+	ARPs           []ARP                                 `json:"arps"`
+	PortMappings   []PortMapping                         `json:"port_mappings"`
 }
 
 func (r *ShimNetReq) GetPersistMetadata() []byte {
 	md := ShimNetReqPersistMetadata{
-		SandboxIP: r.SandboxIP(),
+		SandboxIP:      r.SandboxIP(),
+		RuntimeNetwork: r.RuntimeNetwork,
 	}
 	b, e := json.Marshal(md)
 	if e != nil {

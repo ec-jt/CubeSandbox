@@ -187,3 +187,41 @@ func TestPortPluginConcurrentUpdatesRetainAllMappings(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, readPortAllocation(t, recovered).PortMappings, 17)
 }
+
+func (r *portPluginRuntime) ReconcileNetworkPorts(_ context.Context, _ string) (*networkruntime.EnsureNetworkResponse, error) {
+	r.calls++
+	return r.response, r.err
+}
+
+func TestPortSnapshotCaptureRepairsStaleAllocation(t *testing.T) {
+	m, runtime, db := newPortPlugin(t)
+	response, err := m.captureSnapshotPorts(context.Background(), "ports")
+	require.NoError(t, err)
+	require.Equal(t, runtime.response, response)
+	recovered, err := networkstore.RecoverFromDB(db)
+	require.NoError(t, err)
+	require.Equal(t, *runtime.response, readPortAllocation(t, recovered))
+	require.False(t, runtime.ensureCalled)
+	require.NoError(t, db.Close())
+	_, err = m.captureSnapshotPorts(context.Background(), "ports")
+	require.ErrorContains(t, err, "persist dynamic port allocation")
+}
+
+func TestPortSnapshotCaptureMissingAndFailedRuntime(t *testing.T) {
+	m, runtime, db := newPortPlugin(t)
+	runtime.err = errors.New("pending cleanup failed")
+	_, err := m.captureSnapshotPorts(context.Background(), "ports")
+	require.ErrorIs(t, err, runtime.err)
+	recovered, err := networkstore.RecoverFromDB(db)
+	require.NoError(t, err)
+	require.Empty(t, readPortAllocation(t, recovered).PortMappings)
+	m.allocationStore.Delete("ports")
+	runtime.err = networkruntime.ErrNetworkNotActive
+	response, err := m.captureSnapshotPorts(context.Background(), "ports")
+	require.NoError(t, err)
+	require.Nil(t, response)
+	runtime.err = nil
+	_, err = m.captureSnapshotPorts(context.Background(), "ports")
+	require.ErrorContains(t, err, "no network allocation")
+	require.False(t, runtime.ensureCalled)
+}

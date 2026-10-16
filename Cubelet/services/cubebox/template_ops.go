@@ -100,6 +100,13 @@ func (s *service) CommitSandbox(ctx context.Context, req *cubebox.CommitSandboxR
 		return rsp, nil
 	}
 
+	ports, err := s.captureSnapshotPorts(ctx, cb)
+	if err != nil {
+		rsp.Ret.RetCode = errorcode.ErrorCode_CreateNetworkFailed
+		rsp.Ret.RetMsg = fmt.Sprintf("capture snapshot ports: %v", err)
+		return rsp, nil
+	}
+
 	spec, err := s.getCubeboxSnapshotSpec(ctx, rsp.SandboxID)
 	if err != nil {
 		rsp.Ret.RetCode = errorcode.ErrorCode_Unknown
@@ -216,6 +223,12 @@ func (s *service) CommitSandbox(ctx context.Context, req *cubebox.CommitSandboxR
 	// binding routes the next commit through the fallback-to-full branch
 	// in prepareCommitMemoryArtifact, which is self-contained and safe.
 	setRuntimeSnapshotBindingLabels(cb, rsp.TemplateID, time.Now().UTC())
+	if err := writeSnapshotPorts(layout.MetaWork, ports); err != nil {
+		cleanupArtifacts()
+		rsp.Ret.RetCode = errorcode.ErrorCode_Unknown
+		rsp.Ret.RetMsg = fmt.Sprintf("write snapshot ports: %v", err)
+		return rsp, nil
+	}
 	// Do not write memory.dev — restore uses catalog vol name + ResolveDevPath.
 	if err := deactivateCowSnapshotObjectsOn(ctx, stepLog, backend, memoryObject, rootfsObject); err != nil {
 		cleanupArtifacts()

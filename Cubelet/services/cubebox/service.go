@@ -281,6 +281,13 @@ func (s *service) Create(ctx context.Context, req *cubebox.RunCubeSandboxRequest
 		return rsp, nil
 	}
 	SetRunCubeSandboxRequestDefaultValue(req)
+	var portsErr error
+	ctx, portsErr = restoreSnapshotPorts(ctx, req)
+	if portsErr != nil {
+		rsp.Ret.RetMsg = portsErr.Error()
+		rsp.Ret.RetCode = errorcode.ErrorCode_InvalidParamFormat
+		return rsp, nil
+	}
 
 	start := time.Now()
 	createInfo := &workflow.CreateContext{

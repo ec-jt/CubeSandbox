@@ -29,6 +29,7 @@ import (
 	jsoniter "github.com/json-iterator/go"
 	imagespec "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/opencontainers/runtime-spec/specs-go"
+	networktypes "github.com/tencentcloud/CubeSandbox/Cubelet/network/types"
 	"k8s.io/apimachinery/pkg/api/resource"
 	runtime "k8s.io/cri-api/pkg/apis/runtime/v1"
 
@@ -245,6 +246,11 @@ func (l *local) createContainers(ctx context.Context, flowOpts *workflow.CreateC
 		RuntimeHandler:    realReq.GetRuntimeHandler(),
 		ExposedPorts:      append([]int64(nil), realReq.GetExposedPorts()...),
 		CubeNetworkConfig: cloneCubeNetworkConfig(realReq.GetCubeNetworkConfig()),
+	}
+	if net, ok := flowOpts.NetworkInfo.(*networktypes.ShimNetReq); ok && net.RuntimeNetwork != nil {
+		if _, err := setNetworkPortState(sandBox, net.RuntimeNetwork); err != nil {
+			return err
+		}
 	}
 	if sandBox.Metadata.Labels == nil {
 		sandBox.Metadata.Labels = make(map[string]string)
