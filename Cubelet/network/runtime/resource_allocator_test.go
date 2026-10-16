@@ -6,6 +6,87 @@ package runtime
 
 import "testing"
 
+func TestPortBinderReserveRollbackPreservesExistingOwnership(t *testing.T) {
+	tests := []struct {
+		name string
+		tail []PortMapping
+	}{
+		{"invalid mapping", []PortMapping{{HostPort: 20082, ContainerPort: 0}}},
+		{"duplicate mapping", []PortMapping{{HostPort: 20080, ContainerPort: 82}}},
+		{"foreign owner", []PortMapping{{HostPort: 20083, ContainerPort: 83}}},
+		{"outside managed range", []PortMapping{{HostPort: 1, ContainerPort: 84}}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			binder := newTestPortBinder()
+			if _, err := binder.Reserve("sandbox", []PortMapping{{HostPort: 20080, ContainerPort: 80}}, ""); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := binder.Reserve("other", []PortMapping{{HostPort: 20083, ContainerPort: 83}}, ""); err != nil {
+				t.Fatal(err)
+			}
+			request := []PortMapping{
+				{HostPort: 20080, ContainerPort: 80},
+				{HostPort: 20081, ContainerPort: 81},
+				{ContainerPort: 85},
+			}
+			if _, err := binder.Reserve("sandbox", append(request, tt.tail...), ""); err == nil {
+				t.Fatal("expected reservation failure")
+			}
+			if len(binder.assigned) != 2 || binder.assigned[20080] != "sandbox" || binder.assigned[20083] != "other" {
+				t.Fatalf("rollback changed existing ownership or leaked new ports: %#v", binder.assigned)
+			}
+			if len(binder.owners["sandbox"]) != 1 || len(binder.owners["other"]) != 1 {
+				t.Fatalf("owner index differs from reservations: %#v", binder.owners)
+			}
+			if _, err := binder.Reserve("other", []PortMapping{{HostPort: 20080, ContainerPort: 80}}, ""); err == nil {
+				t.Fatal("another sandbox acquired the existing port")
+			}
+		})
+	}
+}
+
+func TestPortBinderReleasePortPreservesUnrelatedOwnership(t *testing.T) {
+	binder := newTestPortBinder()
+	if _, err := binder.Reserve("sandbox", []PortMapping{
+		{HostPort: 20080, ContainerPort: 80}, {HostPort: 20081, ContainerPort: 81},
+	}, ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := binder.ReleasePort("other", 20080); err == nil {
+		t.Fatal("foreign-owner release accepted")
+	}
+	if err := binder.ReleasePort("", 20080); err == nil {
+		t.Fatal("empty-owner release accepted")
+	}
+	if err := binder.ReleasePort("sandbox", 0); err == nil {
+		t.Fatal("zero-port release accepted")
+	}
+	for i := 0; i < 2; i++ {
+		if err := binder.ReleasePort("sandbox", 20081); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if len(binder.assigned) != 1 || binder.assigned[20080] != "sandbox" || len(binder.owners["sandbox"]) != 1 {
+		t.Fatalf("unrelated port was released: assigned=%#v owners=%#v", binder.assigned, binder.owners)
+	}
+	if _, err := binder.Reserve("other", []PortMapping{{HostPort: 20081, ContainerPort: 81}}, ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := binder.ReleasePort("sandbox", 20081); err == nil {
+		t.Fatal("stale release accepted after reassignment")
+	}
+	if binder.assigned[20081] != "other" {
+		t.Fatal("stale release removed the new owner")
+	}
+	if err := binder.ReleasePort("sandbox", 20080); err != nil {
+		t.Fatal(err)
+	}
+	if _, exists := binder.owners["sandbox"]; exists {
+		t.Fatal("empty owner index was not removed")
+	}
+}
+
 func TestPortBinderReserveRejectsInvalidPortsWithoutLeakingOwnership(t *testing.T) {
 	tests := []struct {
 		name    string

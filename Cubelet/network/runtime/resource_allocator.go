@@ -297,13 +297,18 @@ func (b *PortBinder) Reserve(owner string, requestedMappings []PortMapping, defa
 			return nil, fmt.Errorf("host port %d appears more than once in one reservation request", port)
 		}
 		if !automatic {
+			_, alreadyOwned := b.assigned[port]
 			if err := b.ownLocked(owner, port); err != nil {
 				b.releaseOwnedLocked(owner, ownedNow)
 				return nil, err
 			}
+			if !alreadyOwned {
+				ownedNow = append(ownedNow, port)
+			}
+		} else {
+			ownedNow = append(ownedNow, port)
 		}
 		seenHostPorts[port] = struct{}{}
-		ownedNow = append(ownedNow, port)
 		actualMappings = append(actualMappings, PortMapping{
 			Protocol:      nonEmpty(mapping.Protocol, "tcp"),
 			HostIP:        nonEmpty(mapping.HostIP, defaultHostIP),
@@ -312,6 +317,23 @@ func (b *PortBinder) Reserve(owner string, requestedMappings []PortMapping, defa
 		})
 	}
 	return actualMappings, nil
+}
+
+// ReleasePort releases only the named owner's reservation. Callers must remove
+// the exact datapath mapping and persist its removal before making the port
+// reusable. Missing reservations are idempotent; another owner's port is never
+// released. This does not remove any datapath mapping itself.
+func (b *PortBinder) ReleasePort(owner string, port uint16) error {
+	if owner == "" || port == 0 {
+		return fmt.Errorf("port release requires an owner and nonzero port")
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if assignedOwner, taken := b.assigned[port]; taken && assignedOwner != owner {
+		return fmt.Errorf("host port %d is assigned to another owner", port)
+	}
+	b.releaseOwnedLocked(owner, []uint16{port})
+	return nil
 }
 
 // ReleaseOwnership releases all ports owned by a sandbox after its runtime
