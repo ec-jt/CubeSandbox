@@ -21,6 +21,25 @@ use crate::{
     state::AppState,
 };
 
+pub async fn expose_sandbox_port(
+    State(state): State<AppState>,
+    Path((sandbox_id, port)): Path<(String, u16)>,
+    body: Result<Json<crate::models::ExposePortRequest>, axum::extract::rejection::JsonRejection>,
+) -> AppResult<impl IntoResponse> {
+    let Json(body) = body.map_err(|e| AppError::BadRequest(e.body_text()))?;
+    Ok(Json(state.services.sandboxes.expose_port(
+        &sandbox_id, port, body.port_limit, body.port_class.as_deref(),
+    ).await?))
+}
+
+pub async fn close_sandbox_port(
+    State(state): State<AppState>,
+    Path((sandbox_id, port)): Path<(String, u16)>,
+) -> AppResult<impl IntoResponse> {
+    state.services.sandboxes.close_port(&sandbox_id, port).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 // ─── GET /sandboxes ───────────────────────────────────────────────────────────
 
 #[utoipa::path(

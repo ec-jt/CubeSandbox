@@ -25,6 +25,13 @@ use crate::{
 
 const DEFAULT_ROUTE_TIMEOUT: Duration = Duration::from_secs(30);
 
+// Master has a 30s port-update budget; allow transport and auth overhead.
+const PORT_ROUTE_TIMEOUT: Duration = Duration::from_secs(40);
+
+#[cfg(test)]
+#[path = "port_tests.rs"]
+mod port_tests;
+
 /// Pause / Resume / Connect share Master↔Cubelet Pause budget
 /// (`pauseCubeletRPCTimeout` = 120s).
 const PAUSE_RESUME_ROUTE_TIMEOUT: Duration = Duration::from_secs(120);
@@ -64,7 +71,22 @@ pub fn build_router(state: AppState) -> Router {
         .merge(standard_router)
         .merge(pause_resume_router)
         .merge(snapshot_long_router)
+        .merge(apply_http_layers(
+            build_port_routes(&state, auth_configured),
+            PORT_ROUTE_TIMEOUT,
+        ))
         .with_state(state)
+}
+
+fn build_port_routes(state: &AppState, auth_configured: bool) -> Router<AppState> {
+    with_auth_and_rate_limit(
+        Router::new().route(
+            "/sandboxes/:sandboxID/ports/:containerPort",
+            post(sandboxes::expose_sandbox_port).delete(sandboxes::close_sandbox_port),
+        ),
+        state,
+        auth_configured,
+    )
 }
 
 fn build_e2b_router(state: &AppState, auth_configured: bool) -> Router<AppState> {

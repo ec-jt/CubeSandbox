@@ -30,6 +30,24 @@ impl ApiError {
 pub type SandboxMetadata = HashMap<String, String>;
 pub type EnvVars = HashMap<String, String>;
 
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct ExposePortRequest {
+    /// Legacy wire field only. Numeric exposure quotas are not enforced.
+    #[serde(rename = "portLimit", default)]
+    pub port_limit: Option<i64>,
+    /// Classification, not an authorization grant. Defaults to user.
+    #[serde(rename = "portClass", default)]
+    pub port_class: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct ExposedPort {
+    #[serde(rename = "containerPort")]
+    pub container_port: u16,
+    #[serde(rename = "publicURL")]
+    pub public_url: String,
+}
+
 /// State of the sandbox (running | paused)
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, ToSchema)]
 #[serde(rename_all = "lowercase")]

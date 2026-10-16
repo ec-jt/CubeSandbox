@@ -167,6 +167,66 @@ class Sandbox:
         """
         return f"{port}-{self.sandbox_id}.{self.domain}"
 
+    @staticmethod
+    def _validate_dynamic_port(port: int) -> None:
+        if isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65535:
+            raise ValueError("port must be an integer between 1 and 65535")
+        if port in (17300, 17301, 49983, 49999):
+            raise ValueError("port is reserved for the platform")
+
+    def expose_port(
+        self,
+        port: int,
+        *,
+        port_limit: int = 100,
+        infrastructure: bool = False,
+    ) -> str:
+        """Expose a TCP service port and return its public URL.
+
+        ``port_limit`` is retained for wire/call compatibility only. Numeric
+        exposure quotas are disabled; 100 is not an enforced cap.
+        ``infrastructure`` selects classification, not extra privileges.
+        Reserved platform ports are rejected for both classes. Repeating a
+        request is idempotent. Transport failures propagate without retries;
+        they do not prove whether the remote operation completed.
+        """
+        self._validate_dynamic_port(port)
+        if isinstance(port_limit, bool) or not isinstance(port_limit, int):
+            raise ValueError("port_limit must be an integer compatibility value")
+        if not -(2**63) <= port_limit < 2**63:
+            raise ValueError("port_limit must fit a signed 64-bit integer")
+        if not isinstance(infrastructure, bool):
+            raise ValueError("infrastructure must be a boolean")
+        resp = self._session.post(
+            f"{self._config.api_url}/sandboxes/{self.sandbox_id}/ports/{port}",
+            json={"portLimit": port_limit,
+                  "portClass": "infrastructure" if infrastructure else "user"},
+            timeout=(5, 45),
+            allow_redirects=False,
+        )
+        _check_response(resp)
+        if resp.status_code != 200:
+            raise ApiError("Unexpected port exposure response status", resp.status_code)
+        body = resp.json()
+        if not isinstance(body, dict) or not isinstance(body.get("publicURL"), str) or not body["publicURL"]:
+            raise ApiError("Invalid port exposure response: missing publicURL", resp.status_code)
+        return body["publicURL"]
+
+    def close_port(self, port: int) -> None:
+        """Remove a dynamic mapping; closing a static mapping is a successful no-op.
+
+        Transport errors propagate without automatic retries or a success claim.
+        """
+        self._validate_dynamic_port(port)
+        resp = self._session.delete(
+            f"{self._config.api_url}/sandboxes/{self.sandbox_id}/ports/{port}",
+            timeout=(5, 45),
+            allow_redirects=False,
+        )
+        _check_response(resp)
+        if resp.status_code != 204:
+            raise ApiError("Unexpected port close response: expected HTTP 204", resp.status_code)
+
     @property
     def commands(self) -> "Commands":
         return self._commands

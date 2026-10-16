@@ -70,6 +70,39 @@ pub struct SandboxService {
 }
 
 impl SandboxService {
+    pub async fn expose_port(
+        &self,
+        sandbox_id: &str,
+        port: u16,
+        port_limit: Option<i64>,
+        port_class: Option<&str>,
+    ) -> AppResult<crate::models::ExposedPort> {
+        validate_dynamic_port(port)?;
+        if !matches!(port_class, None | Some("user") | Some("infrastructure")) {
+            return Err(AppError::BadRequest("portClass must be user or infrastructure".into()));
+        }
+        self.cubemaster.update_sandbox_port(&crate::cubemaster::SandboxPortUpdateRequest {
+            update: self.build_update_request(sandbox_id, "exposePort", None),
+            container_port: port,
+            port_class: Some(port_class.unwrap_or("user").to_owned()),
+            port_limit,
+        }).await.map_err(|e| map_update_cubemaster_err(e, sandbox_id))?;
+        Ok(crate::models::ExposedPort {
+            container_port: port,
+            public_url: format!("https://{}-{}.{}", port, sandbox_id, self.sandbox_domain),
+        })
+    }
+
+    pub async fn close_port(&self, sandbox_id: &str, port: u16) -> AppResult<()> {
+        validate_dynamic_port(port)?;
+        self.cubemaster.update_sandbox_port(&crate::cubemaster::SandboxPortUpdateRequest {
+            update: self.build_update_request(sandbox_id, "closePort", None),
+            container_port: port,
+            port_class: None,
+            port_limit: None,
+        }).await.map_err(|e| map_update_cubemaster_err(e, sandbox_id))
+    }
+
     pub fn new(
         cubemaster: CubeMasterClient,
         instance_type: String,
@@ -726,6 +759,15 @@ fn validate_unique_volume_mount_names(mounts: &[SandboxVolumeMount]) -> AppResul
 
 fn internal_error(error: impl std::fmt::Display) -> AppError {
     AppError::Internal(anyhow::anyhow!(error.to_string()))
+}
+
+fn validate_dynamic_port(port: u16) -> AppResult<()> {
+    if port == 0 || matches!(port, 17300 | 17301 | 49983 | 49999) {
+        return Err(AppError::BadRequest(
+            "port must be in 1..65535 and not reserved (17300, 17301, 49983, 49999)".into(),
+        ));
+    }
+    Ok(())
 }
 
 // parse_response converts every non-success ret_code into CubeMasterError::Api before

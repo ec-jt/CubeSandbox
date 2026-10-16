@@ -46,6 +46,28 @@ pub struct CubeMasterClient {
 }
 
 impl CubeMasterClient {
+    /// One bounded attempt. An uncertain result must never become success.
+    pub async fn update_sandbox_port(
+        &self,
+        req: &SandboxPortUpdateRequest,
+    ) -> Result<(), CubeMasterError> {
+        let response = self.inner
+            .post(format!("{}/cube/sandbox/update", self.base_url))
+            .timeout(std::time::Duration::from_secs(35))
+            .json(req)
+            .send().await.map_err(CubeMasterError::Http)?
+            .error_for_status().map_err(CubeMasterError::Http)?;
+        let response: SandboxUpdateResponse = parse_response(response).await?;
+        // Unlike legacy operations, this contract requires explicit success 200.
+        if response.ret.ret_code != 200 {
+            return Err(CubeMasterError::Api {
+                ret_code: response.ret.ret_code,
+                ret_msg: response.ret.ret_msg,
+            });
+        }
+        Ok(())
+    }
+
     /// Create a client pointing at `base_url` (e.g. `"http://10.0.0.1:8080"`).
     pub fn new(base_url: impl Into<String>, http_client: reqwest::Client) -> Self {
         Self {
@@ -1474,6 +1496,18 @@ pub struct SandboxUpdateRequest {
 #[derive(Debug, Deserialize)]
 pub struct SandboxUpdateResponse {
     pub ret: RetCode,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SandboxPortUpdateRequest {
+    #[serde(flatten)]
+    pub update: SandboxUpdateRequest,
+    pub container_port: u16,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub port_class: Option<String>,
+    // Compatibility only; not a quota or an authorization decision.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub port_limit: Option<i64>,
 }
 
 // ─── Update sandbox network policy ────────────────────────────────────────
