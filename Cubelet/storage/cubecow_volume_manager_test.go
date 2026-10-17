@@ -213,6 +213,27 @@ func (f *fakeCowEngine) GetVolumeInfo(name string) (*cubecow.Volume, error) {
 	return f.volumeInfos[name], nil
 }
 
+// Match the native typed index: ListVolumes excludes snapshots even though
+// GetVolumeInfo projects both kinds to the same Go struct.
+func (f *fakeCowEngine) ListVolumes(uint64, string) (*cubecow.ListVolumesResult, error) {
+	snapshots := map[string]bool{}
+	for _, entries := range f.listSnapshots {
+		for _, entry := range entries {
+			snapshots[entry.Name] = true
+		}
+	}
+	result := &cubecow.ListVolumesResult{}
+	for name, info := range f.volumeInfos {
+		if info != nil && !snapshots[name] {
+			v := *info
+			v.Name = name
+			result.Volumes = append(result.Volumes, v)
+		}
+	}
+	result.TotalCount = uint64(len(result.Volumes))
+	return result, nil
+}
+
 func (f *fakeCowEngine) ListSnapshots(volumeName string, pageSize uint64, pageToken string) (*cubecow.ListSnapshotsResult, error) {
 	_ = pageSize
 	_ = pageToken

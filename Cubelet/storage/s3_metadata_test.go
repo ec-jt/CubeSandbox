@@ -44,6 +44,7 @@ func stubS3MetadataMounts(t *testing.T) {
 	origFormat := formatS3MetadataBaseDevice
 	origMount := mountS3MetadataDevice
 	origUmount := unmountS3MetadataPath
+	origFinalizeUmount := unmountS3FinalizePath
 	origIsMounted := s3MetadataIsMounted
 	origKV := testS3MetadataKV
 	kv := &memS3MetadataKV{}
@@ -59,6 +60,9 @@ func stubS3MetadataMounts(t *testing.T) {
 		delete(mounted, mountPath)
 		return nil
 	}
+	unmountS3FinalizePath = func(mountPath string) error {
+		return unmountS3MetadataPath(mountPath)
+	}
 	s3MetadataIsMounted = func(mountPath string) bool {
 		_, ok := mounted[mountPath]
 		return ok
@@ -67,6 +71,7 @@ func stubS3MetadataMounts(t *testing.T) {
 		formatS3MetadataBaseDevice = origFormat
 		mountS3MetadataDevice = origMount
 		unmountS3MetadataPath = origUmount
+		unmountS3FinalizePath = origFinalizeUmount
 		s3MetadataIsMounted = origIsMounted
 		testS3MetadataKV = origKV
 		s3MetadataMu.Lock()
@@ -303,6 +308,9 @@ func TestUploadStatusExportStatusFailedIsFailed(t *testing.T) {
 func TestUploadSkipsMetadataBaseAndUploadsDerived(t *testing.T) {
 	stubS3MetadataMounts(t)
 	engine := &fakeCowEngine{
+		listSnapshots: map[string][]cubecow.Snapshot{
+			"build-rootfs": {{Name: "tpl-snap-1-rootfs", OriginVolume: "build-rootfs"}},
+		},
 		volumeInfos: map[string]*cubecow.Volume{
 			"tpl-snap-1-rootfs":            {SizeBytes: 1 << 20},
 			"tpl-snap-1-memory":            {SizeBytes: 64 << 20},
@@ -313,6 +321,7 @@ func TestUploadSkipsMetadataBaseAndUploadsDerived(t *testing.T) {
 	useTestCowStorage(t, engine)
 	home := t.TempDir()
 	require.NoError(t, EnsureSnapshotPackage(cow.BackendS3, home))
+	require.NoError(t, mountS3MetadataDevice("/dev/metadata", filepath.Join(home, SnapshotMetadataDir)))
 	require.NoError(t, WriteSnapshotCatalogFor(cow.BackendS3, &SnapshotCatalogEntry{
 		SnapshotID:   "snap-1",
 		SnapshotPath: home,
