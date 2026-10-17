@@ -574,3 +574,48 @@ of `make check` / `make check-rules`.
   stale binary**: do the `make` it tells you to. Note the top-level default
   target now builds the binary too; `make shared` builds only the libraries and
   does not update `s3lvol_tgt`.
+
+## Application shutdown regression (offline, explicit opt-in)
+
+Patch 0007 adds `test_shutdown_signal_lifecycle` to SPDK's application unit
+test. After applying the numbered patches, run only that test:
+
+```sh
+make -C deps/spdk/test/unit/lib/event/app.c
+deps/spdk/test/unit/lib/event/app.c/app_ut -t test_shutdown_signal_lifecycle
+```
+
+The real-process companion requires Linux, Python 3.8+, Docker, uid 1000, a
+locally available immutable runtime image, and a target that can load in that
+image. It does not build, pull images, mount devices, access S3, or use the
+network. From the CubeS3lvol directory:
+
+```sh
+python3 test/tools/test_app_shutdown.py --target /absolute/path/to/s3lvol_tgt \
+  --image sha256:117f3a0a896ba61b324847b76f8cc45c9dd5a1c87cc31cb0efb1d4c7f146efd3 \
+  --memory 256 --output deps/shutdown-error-new
+python3 test/tools/test_app_shutdown.py --target /absolute/path/to/s3lvol_tgt \
+  --image sha256:117f3a0a896ba61b324847b76f8cc45c9dd5a1c87cc31cb0efb1d4c7f146efd3 \
+  --memory 512 --output deps/shutdown-normal-new
+```
+
+Each output directory must be new. The 256 MiB case requires the known bdev
+zero-buffer allocation failure, sends SIGTERM immediately after the failed
+initialization RPC, and requires exit 255, not 139 or a timeout. The 512 MiB
+case requires readiness, RCOW methods, AIO create/examine/delete, and exit 0.
+The unit test deterministically covers late signals; process-level signal
+timing alone is not deterministic. Different dependency memory requirements
+can invalidate the 256 MiB failure precondition; the test fails rather than
+treating an unrelated startup failure as a pass.
+
+Isolation: uid 1000, all capabilities dropped, no-new-privileges, read-only
+root, no network, four CPUs, 4 GiB RAM with no extra swap, 128 PIDs, no cores,
+100-second target timeout with a five-second kill grace. The private runtime
+directory uses one 32 MiB test backing file plus DPDK's no-huge memory backing
+and socket/lock metadata. Each writable tmpfs is limited to 64 MiB. Do not
+cap RLIMIT_FSIZE below the target memory budget: DPDK backs that allocation
+with a file; the 4 GiB cgroup memory limit still applies.
+The test records commands, image/binary hashes, container states, RPCs, and
+logs. It removes only its own container and known runtime files, verifies
+their absence, and preserves unexpected contents for inspection. Inspect the
+recorded kernel: a local 7.0 run does not validate a deployment's 6.8 kernel.

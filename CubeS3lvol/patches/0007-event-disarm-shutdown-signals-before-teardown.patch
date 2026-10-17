@@ -1,0 +1,176 @@
+Subject: [PATCH 7/7] event: disarm shutdown signals before application teardown
+
+Base: d64c4fa89233397460e2e4ff55a1c69b8e498598, after patches 0001-0006.
+
+A subsystem initialization failure calls app_stop without first setting the
+shutdown-signal latch. After teardown destroys the app thread, a first
+SIGINT/SIGTERM still calls spdk_app_start_shutdown and dereferences that
+missing thread in spdk_thread_send_critical_msg. This reproduces when a
+controller stops the process after framework_start_init fails, including
+during the DPDK exit destructor after spdk_app_fini has returned.
+
+Set the existing latch before programmatic stop tears down subsystems and
+at entry to spdk_app_fini for early start failures. Use volatile sig_atomic_t
+for the state shared with the signal handler. Keep every cleanup call and
+the original error code. app_setup_signal_handlers still resets the latch
+when a new application starts. Do not replace user-installed handlers.
+
+Add a focused application unit test for first-signal dispatch, coalescing,
+normal/error stop, early-failure fini, and signals during/after teardown.
+SPDX-License-Identifier: BSD-3-Clause
+---
+diff --git a/lib/event/app.c b/lib/event/app.c
+index 7ee57db..eac2eac 100644
+--- a/lib/event/app.c
++++ b/lib/event/app.c
+@@ -60,7 +60,7 @@ static struct spdk_app g_spdk_app;
+ static spdk_msg_fn g_start_fn = NULL;
+ static void *g_start_arg = NULL;
+ static bool g_delay_subsystem_init = false;
+-static bool g_shutdown_sig_received = false;
++static volatile sig_atomic_t g_shutdown_sig_received = false;
+ static char *g_executable_name;
+ static struct spdk_app_opts g_default_opts;
+ static int g_core_locks[SPDK_CONFIG_MAX_LCORES];
+@@ -1072,6 +1072,8 @@ spdk_app_start(struct spdk_app_opts *opts_user, spdk_msg_fn start_fn,
+ void
+ spdk_app_fini(void)
+ {
++	/* Also cover an early spdk_app_start() failure that did not call app_stop(). */
++	g_shutdown_sig_received = true;
+ 	spdk_trace_cleanup();
+ 	spdk_reactors_fini();
+ 	spdk_env_fini();
+@@ -1124,6 +1126,11 @@ app_stop(void *arg1)
+ 		return;
+ 	}
+ 
++	/* A programmatic stop (including init failure) may precede the first signal.
++	 * Disarm the handler before teardown can destroy the app thread.  Keep it
++	 * disarmed through process destructors, which can still receive SIGTERM.
++	 */
++	g_shutdown_sig_received = true;
+ 	free(g_spdk_app.json_data);
+ 
+ 	g_spdk_app.stopped = true;
+diff --git a/test/unit/lib/event/app.c/Makefile b/test/unit/lib/event/app.c/Makefile
+index e52334d..8bcf1e3 100644
+--- a/test/unit/lib/event/app.c/Makefile
++++ b/test/unit/lib/event/app.c/Makefile
+@@ -7,6 +7,8 @@ SPDK_ROOT_DIR := $(abspath $(CURDIR)/../../../../..)
+ 
+ CFLAGS += -Wno-address-of-packed-member
+ 
++SPDK_MOCK_SYMBOLS += spdk_thread_send_critical_msg
++
+ SPDK_LIB_LIST = conf trace jsonrpc json
+ TEST_FILE = app_ut.c
+ 
+diff --git a/test/unit/lib/event/app.c/app_ut.c b/test/unit/lib/event/app.c/app_ut.c
+index 36aee1a..b034ed0 100644
+--- a/test/unit/lib/event/app.c/app_ut.c
++++ b/test/unit/lib/event/app.c/app_ut.c
+@@ -11,11 +11,38 @@
+ 
+ #define test_argc 6
+ 
++static unsigned int g_critical_msgs;
++static unsigned int g_subsystem_finis;
++static unsigned int g_reactor_finis;
++
++int __wrap_spdk_thread_send_critical_msg(struct spdk_thread *thread, spdk_msg_fn fn);
++int
++__wrap_spdk_thread_send_critical_msg(struct spdk_thread *thread, spdk_msg_fn fn)
++{
++	CU_ASSERT(fn == app_start_shutdown);
++	g_critical_msgs++;
++	return 0;
++}
++
++void
++spdk_subsystem_fini(spdk_msg_fn cb_fn, void *cb_arg)
++{
++	g_subsystem_finis++;
++	/* A signal during subsystem teardown must not enqueue new shutdown work. */
++	__shutdown_signal(SIGTERM);
++}
++
++void
++spdk_reactors_fini(void)
++{
++	g_reactor_finis++;
++	__shutdown_signal(SIGINT);
++}
++
+ DEFINE_STUB_V(spdk_event_call, (struct spdk_event *event));
+ DEFINE_STUB(spdk_event_allocate, struct spdk_event *, (uint32_t core, spdk_event_fn fn, void *arg1,
+ 		void *arg2), NULL);
+ DEFINE_STUB_V(spdk_subsystem_init, (spdk_subsystem_init_fn cb_fn, void *cb_arg));
+-DEFINE_STUB_V(spdk_subsystem_fini, (spdk_msg_fn cb_fn, void *cb_arg));
+ DEFINE_STUB_V(spdk_rpc_register_method, (const char *method, spdk_rpc_method_handler func,
+ 		uint32_t state_mask));
+ DEFINE_STUB_V(spdk_rpc_register_alias_deprecated, (const char *method, const char *alias));
+@@ -33,7 +60,6 @@ DEFINE_STUB_V(spdk_subsystem_load_config, (void *json, ssize_t json_size,
+ DEFINE_STUB_V(spdk_reactors_start, (void));
+ DEFINE_STUB_V(spdk_reactors_stop, (void *arg1));
+ DEFINE_STUB(spdk_reactors_init, int, (size_t msg_mempool_size), 0);
+-DEFINE_STUB_V(spdk_reactors_fini, (void));
+ bool g_scheduling_in_progress;
+ 
+ SPDK_LOG_REGISTER_COMPONENT(app_rpc);
+@@ -158,6 +184,47 @@ test_spdk_app_parse_args(void)
+ 	clean_opts(&opts);
+ }
+ 
++static void
++test_shutdown_signal_lifecycle(void)
++{
++	int status[] = {0, -1};
++	size_t i;
++
++	/* The first live signal still dispatches; further signals coalesce. */
++	g_shutdown_sig_received = false;
++	g_critical_msgs = 0;
++	__shutdown_signal(SIGINT);
++	__shutdown_signal(SIGTERM);
++	CU_ASSERT_EQUAL(g_critical_msgs, 1);
++
++	for (i = 0; i < SPDK_COUNTOF(status); i++) {
++		memset(&g_spdk_app, 0, sizeof(g_spdk_app));
++		g_shutdown_sig_received = false;
++		g_critical_msgs = g_subsystem_finis = g_reactor_finis = 0;
++
++		/* No signal has arrived before normal stop or initialization failure. */
++		app_stop((void *)(intptr_t)status[i]);
++		CU_ASSERT(g_spdk_app.stopped);
++		CU_ASSERT_EQUAL(g_spdk_app.rc, status[i]);
++		CU_ASSERT_EQUAL(g_subsystem_finis, 1);
++		__shutdown_signal(SIGTERM);
++		spdk_app_fini();
++		__shutdown_signal(SIGINT);
++		CU_ASSERT_EQUAL(g_critical_msgs, 0);
++		CU_ASSERT_EQUAL(g_reactor_finis, 1);
++		CU_ASSERT_EQUAL(g_spdk_app.rc, status[i]);
++	}
++
++	/* Early start failures may reach fini without app_stop(). */
++	g_shutdown_sig_received = false;
++	g_critical_msgs = g_reactor_finis = 0;
++	spdk_app_fini();
++	__shutdown_signal(SIGTERM);
++	CU_ASSERT_EQUAL(g_critical_msgs, 0);
++	CU_ASSERT_EQUAL(g_reactor_finis, 1);
++	memset(&g_spdk_app, 0, sizeof(g_spdk_app));
++}
++
+ int
+ main(int argc, char **argv)
+ {
+@@ -169,6 +236,7 @@ main(int argc, char **argv)
+ 	suite = CU_add_suite("app_suite", NULL, NULL);
+ 
+ 	CU_ADD_TEST(suite, test_spdk_app_parse_args);
++	CU_ADD_TEST(suite, test_shutdown_signal_lifecycle);
+ 
+ 	num_failures = spdk_ut_run_tests(argc, argv, NULL);
+ 	CU_cleanup_registry();

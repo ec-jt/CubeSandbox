@@ -47,11 +47,11 @@ patch here must satisfy:
 3. **It can be proposed upstream on its own.** If a patch is not suitable for
    upstream, that is usually a sign the design went astray.
 
-0004 is the **only patch that modifies an existing function for a behaviour
-change on an existing path**; 0006 also edits an existing function, but only
+0004 modifies an existing function for a behaviour
+change on an existing path; 0006 also edits an existing function, but only
 removes an exclusion that is idle until a device installs `copy` (see that
-section). Read both sections before adding a third such patch, and make sure
-the reason is of the same kind.
+section). 0007 fixes a shutdown-signal lifetime error without changing I/O
+semantics or skipping cleanup. Read these exceptions before adding another.
 
 ## 0001-blob-add-spdk_blob_get_io_unit_lba.patch
 
@@ -201,7 +201,7 @@ reallocated at any time.)
 Changes the `fsync()` in `bdev_aio_flush()` to `fdatasync()`. One line of code,
 plus a comment.
 
-**This is the only patch that violates rule 1 above**, so the reason has to be
+**This is an exception to rule 1 above**, so the reason has to be
 solid.
 
 **Why change it.** Measured (ext4 over a write-through virtio disk, 4 KiB
@@ -282,3 +282,34 @@ always GET+writes an esnap cluster, which is the slow decouple path.
 Ordinary blobs retain the original device-copy behaviour. Ordinary CoW on an
 esnap clone remains GET+write. s3lvol raises the blob-local gate around each
 `spdk_blob_materialize_cluster()` and clears it from the completion callback.
+
+## 0007-event-disarm-shutdown-signals-before-teardown.patch
+
+Pinned baseline: `d64c4fa89233397460e2e4ff55a1c69b8e498598`, after 0001-0006.
+The existing numbered-patch loop applies and checks this patch last.
+`setup_dep.sh` includes its contents in `spdk_patches_hash()` and therefore
+invalidates the SPDK recipe stamp. Do not retain an old stamp after rebuilding.
+
+A programmatic stop, including bdev initialization failure, did not set the
+shutdown-signal latch. A first SIGTERM after the app thread was destroyed still
+called `spdk_thread_send_critical_msg(NULL, ...)`. The reproduced stack was
+`__shutdown_signal -> spdk_app_start_shutdown -> spdk_thread_send_critical_msg`,
+interrupting the DPDK exit destructor after `spdk_app_fini()` returned. It was
+not an S3lvol module finalizer failure. Waiting for natural exit hid the race.
+
+Set the existing latch before subsystem teardown and at entry to app fini
+(which also covers early app-start returns). Use `volatile sig_atomic_t` for
+the state accessed by the signal handler. Keep every cleanup call and the
+original error status. A new app start resets the latch as before. No user
+signal disposition is replaced. The patch includes a focused SPDK application
+unit test; the bounded real-process regression is documented in `test/README.md`.
+
+Only `libspdk_event.a` and the application link need rebuilding for this patch:
+
+```sh
+make -C deps/spdk/lib/event "$(pwd)/deps/spdk/build/lib/libspdk_event.a"
+make -C deps/spdk/test/unit/lib/event/app.c
+deps/spdk/test/unit/lib/event/app.c/app_ut -t test_shutdown_signal_lifecycle
+# Force a fresh application link to a new artifact path; preserve prior artifacts.
+make -C app/s3lvol_tgt APP="$(pwd)/s3lvol_tgt.updated"
+```
