@@ -140,6 +140,38 @@ func TestSnapshotPortsPauseAndCommitRestoreSelection(t *testing.T) {
 	}
 }
 
+func TestSnapshotPortsTemplatePublicationRetainsCreateIntent(t *testing.T) {
+	for _, inherited := range []*networkruntime.PortablePorts{
+		{Version: 1, Ports: []networkruntime.PortablePort{}},
+		{Version: 1, Ports: []networkruntime.PortablePort{{ContainerPort: 3000, Class: "user"}}},
+	} {
+		dir := t.TempDir()
+		require.NoError(t, writeSnapshotPorts(dir, inherited))
+		// Same publication step used by AppSnapshot, not by pause or commit.
+		require.NoError(t, writeSnapshotPorts(dir, nil))
+		require.NoError(t, writeSnapshotPorts(dir, nil)) // Idempotent on a clean build.
+		id := "tpl-port-policy"
+		require.NoError(t, storage.WriteSnapshotCatalogFor("xfs", &storage.SnapshotCatalogEntry{SnapshotID: id, SnapshotPath: dir, MetaDir: dir, Kind: storage.CatalogKindTemplate}))
+		req := &cubebox.RunCubeSandboxRequest{InstanceType: "cubebox", NetworkType: "tap", ExposedPorts: []int64{17300, 8080}, Annotations: map[string]string{constants.MasterAnnotationStorageBackend: "xfs", constants.MasterAnnotationRuntimeSnapshotID: id}}
+		ctx, err := restoreSnapshotPorts(context.Background(), req)
+		storage.DeleteSnapshotCatalogFor("xfs", id)
+		require.NoError(t, err)
+		require.Nil(t, networkruntime.RestoredPorts(ctx))
+		require.Equal(t, []int64{17300, 8080}, req.ExposedPorts)
+	}
+}
+
+func TestSnapshotPortsTemplatePublicationRejectsRemovalFailure(t *testing.T) {
+	dir := t.TempDir()
+	// A nonempty directory at the record path cannot be silently ignored.
+	blocked := filepath.Join(dir, snapshotPortsFileName)
+	require.NoError(t, os.Mkdir(blocked, 0700))
+	require.NoError(t, os.WriteFile(filepath.Join(blocked, "keep"), []byte("data"), 0600))
+	require.Error(t, writeSnapshotPorts(dir, nil))
+	_, err := os.Stat(filepath.Join(blocked, "keep"))
+	require.NoError(t, err)
+}
+
 func TestSnapshotPortsRequestAnnotationsCannotGrantCapability(t *testing.T) {
 	req := &cubebox.RunCubeSandboxRequest{InstanceType: "cubebox", NetworkType: "tap", ExposedPorts: []int64{17300}, Annotations: map[string]string{
 		networkruntime.DynamicPortsMetadataKey: "[17300]", networkruntime.DynamicInfraPortsMetadataKey: "[80]", snapshotPortsFileName: `{"version":1,"ports":[{"container_port":17300,"class":"user"}]}`,

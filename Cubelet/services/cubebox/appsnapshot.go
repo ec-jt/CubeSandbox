@@ -362,6 +362,17 @@ func (s *service) AppSnapshot(ctx context.Context, req *cubebox.AppSnapshotReque
 	}
 	temporaryCubeboxDestroyed = true
 
+	// Templates are reusable build artifacts, not session checkpoints. Their
+	// future Create requests select exposed ports. Do not freeze build-sandbox
+	// dynamic classifications (or an inherited authoritative empty record).
+	if err := writeSnapshotPorts(layout.MetaWork, nil); err != nil {
+		cleanupSnapshotObjects()
+		layout.discardTmpDir()
+		rsp.Ret.RetCode = errorcode.ErrorCode_Unknown
+		rsp.Ret.RetMsg = fmt.Sprintf("failed to clear template session port state: %v", err)
+		return rsp, nil
+	}
+
 	if err := deactivateCowSnapshotObjectsOn(ctx, stepLog, backend, memoryObject, rootfsObject); err != nil {
 		cleanupSnapshotObjects()
 		layout.discardTmpDir()
