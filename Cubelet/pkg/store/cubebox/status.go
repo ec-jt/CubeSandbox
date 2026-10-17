@@ -30,6 +30,9 @@ type Status struct {
 
 	Unknown bool `json:"-"`
 
+	// PublicationPending survives restart and must never advertise a usable VM.
+	PublicationPending bool `json:"publication_pending,omitempty"`
+
 	Removing               bool `json:"-"`
 	PostStop               bool `json:"-"`
 	LifeTimeMetricReported bool `json:"-"`
@@ -46,7 +49,7 @@ type Status struct {
 }
 
 func (s Status) State() cubebox.ContainerState {
-	if s.Unknown {
+	if s.PublicationPending || s.Unknown {
 		return cubebox.ContainerState_CONTAINER_UNKNOWN
 	}
 	// Pause / pause-to-snapshot must never surface as EXITED: CoW Pause exits
@@ -99,11 +102,17 @@ func (s *StatusStorage) Update(u UpdateFunc) error {
 }
 
 func (s *StatusStorage) IsTerminated() bool {
+	if s.Get().PublicationPending {
+		return false
+	}
 	state := s.Get().State()
 	return state == cubebox.ContainerState_CONTAINER_UNKNOWN || state == cubebox.ContainerState_CONTAINER_EXITED
 }
 
 func (s *StatusStorage) IsPaused() bool {
+	if st := s.Get(); st.PublicationPending {
+		return st.PausingAt != 0 || st.PausedAt != 0
+	}
 	state := s.Get().State()
 	return state == cubebox.ContainerState_CONTAINER_PAUSING || state == cubebox.ContainerState_CONTAINER_PAUSED
 }

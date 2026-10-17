@@ -80,6 +80,12 @@ func RecoverPod(ctx context.Context, client *containerd.Client, cb *cubeboxstore
 	if cb.Version == "" {
 		cb.Version = cb.GetVersion()
 	}
+	if cb.GetPublicationHold() != nil {
+		// The runtime may have captured and reset dirty tracking before restart.
+		// Do not probe/reclassify it or permit automatic lifecycle recovery.
+		cb.SetPublicationHold(cb.GetPublicationHold())
+		return nil
+	}
 	// Paused tombstones have no live containerd/shim task; keep store as-is for List.
 	if cb.GetStatus() != nil && cb.GetStatus().IsPaused() {
 		if cb.SandboxID == "" {
@@ -134,6 +140,9 @@ func RecoverPod(ctx context.Context, client *containerd.Client, cb *cubeboxstore
 }
 
 func RecoverContainer(ctx context.Context, client *containerd.Client, cb *cubeboxstore.CubeBox, ctr *cubeboxstore.Container) (*cubeboxstore.Container, error) {
+	if cb.GetPublicationHold() != nil {
+		return ctr, nil
+	}
 	ctx, cancel := context.WithTimeout(ctx, loadContainerTimeout)
 	defer cancel()
 

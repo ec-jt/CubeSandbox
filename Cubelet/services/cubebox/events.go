@@ -223,7 +223,7 @@ func (em *eventMonitor) handleEvent(ctx context.Context, any interface{}) error 
 		cb.Lock()
 		defer cb.Unlock()
 
-		if cb.UserMarkDeletedTime != nil {
+		if cb.UserMarkDeletedTime != nil || cb.GetPublicationHold() != nil {
 			return nil
 		}
 
@@ -274,7 +274,7 @@ func (em *eventMonitor) handleEvent(ctx context.Context, any interface{}) error 
 		cb.Lock()
 		defer cb.Unlock()
 		// Do not backfill paused semantics once it has entered a terminal state.
-		if cb.UserMarkDeletedTime != nil {
+		if cb.UserMarkDeletedTime != nil || cb.GetPublicationHold() != nil {
 			return nil
 		}
 		if cntr != nil && cntr.Status != nil && cntr.Status.IsTerminated() {
@@ -310,7 +310,7 @@ func (em *eventMonitor) handleEvent(ctx context.Context, any interface{}) error 
 		}
 		cb.Lock()
 		defer cb.Unlock()
-		if cb.UserMarkDeletedTime != nil {
+		if cb.UserMarkDeletedTime != nil || cb.GetPublicationHold() != nil {
 			return nil
 		}
 		if cntr != nil && cntr.Status != nil && cntr.Status.IsTerminated() {

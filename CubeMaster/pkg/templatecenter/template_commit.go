@@ -265,33 +265,13 @@ func runTemplateCommitJob(ctx context.Context, jobID, sandboxID, nodeID, nodeIP 
 		"snapshot_path": snapshotPath,
 	})
 
-	definitionCreated := false
 	cleanupOnFailure := func(cause error) {
 		if cause == nil {
 			cause = errors.New("template commit job failed: unknown cause")
 		}
-		// v4+: master no longer passes physical SnapshotPath/Objects to
-		// cubelet on cleanup. Cubelet resolves them from its local snapshot
-		// catalog written during CommitSandbox (with deterministic fallback).
-		// We always attempt cleanup (even before cubelet reports a snapshot
-		// path) because partial-failure rollback may need to remove a half-
-		// written entry. The bounded RPC timeout protects the goroutine from
-		// a hung cubelet.
-		cleanupCtx, cleanupCancel := context.WithTimeout(ctx, cleanupTemplateRPCTimeout)
-		_, cleanupErr := cubelet.CleanupTemplate(cleanupCtx, cubelet.GetCubeletAddr(nodeIP), &cubeboxv1.CleanupTemplateRequest{
-			RequestID:  uuid.NewString(),
-			TemplateID: templateID,
-			Backend:    pinnedCleanupBackend(storageBackendFromCreate(createReq)),
-		})
-		cleanupCancel()
-		if cleanupErr != nil {
-			cause = errors.Join(cause, cleanupErr)
-		}
-		if definitionCreated {
-			if cleanupErr := cleanupTemplateMetadata(ctx, templateID); cleanupErr != nil {
-				cause = errors.Join(cause, cleanupErr)
-			}
-		}
+		// Cubelet capture succeeded. Preserve its package, definition and replica
+		// locators: the live VM may already use it as its dirty-tracking base.
+		// Registration failure is not permission to roll back physical storage.
 		logger.Errorf("template commit job rolling back to FAILED: %v", cause)
 		_ = updateTemplateImageJob(ctx, jobID, map[string]any{
 			"status":          JobStatusFailed,
@@ -307,7 +287,6 @@ func runTemplateCommitJob(ctx context.Context, jobID, sandboxID, nodeID, nodeIP 
 		cleanupOnFailure(err)
 		return
 	}
-	definitionCreated = true
 	if cacheErr := setTemplateRequestCache(templateID, storedReq); cacheErr != nil {
 		logger.Warnf("set template request cache fail:%v", cacheErr)
 	}

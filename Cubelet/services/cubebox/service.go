@@ -242,6 +242,22 @@ func (s *service) Create(ctx context.Context, req *cubebox.RunCubeSandboxRequest
 		ExtInfo:   map[string][]byte{},
 	}
 
+	for _, box := range s.listCubeboxes() {
+		if box.ID == strings.TrimSpace(req.GetAnnotations()[constants.MasterAnnotationDesiredSandboxID]) {
+			if err := box.PublicationError(); err != nil {
+				rsp.Ret.RetCode = errorcode.ErrorCode_PreConditionFailed
+				rsp.Ret.RetMsg = err.Error()
+				return rsp, nil
+			}
+		}
+	}
+	for _, key := range []string{constants.MasterAnnotationPauseSnapshotID, constants.MasterAnnotationRuntimeSnapshotID, constants.MasterAnnotationAppSnapshotTemplateID} {
+		if err := s.snapshotPackageIncompleteError(strings.TrimSpace(req.GetAnnotations()[key])); err != nil {
+			rsp.Ret.RetCode = errorcode.ErrorCode_PreConditionFailed
+			rsp.Ret.RetMsg = err.Error()
+			return rsp, nil
+		}
+	}
 	if b := strings.TrimSpace(req.GetBackend()); b != "" {
 		if req.Annotations == nil {
 			req.Annotations = map[string]string{}
@@ -632,6 +648,13 @@ func (s *service) Destroy(ctx context.Context, req *cubebox.DestroyCubeSandboxRe
 		}
 	}
 	ctx = namespaces.WithNamespace(ctx, ns)
+	if getErr == nil {
+		if err := sb.PublicationError(); err != nil {
+			rsp.Ret.RetCode = errorcode.ErrorCode_PreConditionFailed
+			rsp.Ret.RetMsg = err.Error()
+			return rsp, nil
+		}
+	}
 
 	if req.GetAnnotations() != nil {
 		if set := req.GetAnnotations()["cube.debug.shim_create_fail"]; set == "true" {
@@ -717,6 +740,14 @@ func (s *service) Destroy(ctx context.Context, req *cubebox.DestroyCubeSandboxRe
 				rsp.Ret.RetMsg = "success"
 				rsp.Ret.RetCode = errorcode.ErrorCode_Success
 			}
+			return rsp, nil
+		}
+	}
+
+	if getErr == nil {
+		if err := sb.PublicationError(); err != nil {
+			rsp.Ret.RetCode = errorcode.ErrorCode_PreConditionFailed
+			rsp.Ret.RetMsg = err.Error()
 			return rsp, nil
 		}
 	}
@@ -1012,6 +1043,9 @@ func toGRPCCubeBox(box *cubeboxstore.CubeBox, opt *cubebox.ListCubeSandboxOption
 
 	for _, c := range box.AllContainers() {
 		cc := toGRPCContainer(c)
+		if err := box.PublicationError(); err != nil {
+			cc.State = cubebox.ContainerState_CONTAINER_UNKNOWN
+		}
 		if c.IsPod {
 			for key, v := range cb.Labels {
 				cc.Labels[key] = v
@@ -1083,6 +1117,9 @@ func scanDeadContainer(ctx context.Context, dc []*cubeboxstore.CubeBox, client *
 		stepLog := log.G(ctx).WithFields(CubeLog.Fields{
 			string(CubeLog.KeyInstanceId): cb.ID,
 		})
+		if cb.GetPublicationHold() != nil {
+			continue
+		}
 		if cb.FirstContainer() == nil {
 			continue
 		}

@@ -10,6 +10,7 @@ import (
 	"fmt"
 
 	"github.com/tencentcloud/CubeSandbox/Cubelet/pkg/cdp"
+	cubeboxstore "github.com/tencentcloud/CubeSandbox/Cubelet/pkg/store/cubebox"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/pkg/utils"
 )
 
@@ -54,6 +55,11 @@ func (u *userDeleteCubeboxChecker) PreDelete(ctx context.Context, opt *cdp.Delet
 			return nil
 		}
 		return err
+	}
+	if !cubeboxstore.PublicationCleanupAllowed(ctx) {
+		if err := cb.PublicationError(); err != nil {
+			return err
+		}
 	}
 	if cb.UserMarkDeletedTime != nil {
 		return nil

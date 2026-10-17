@@ -69,6 +69,11 @@ func (l *local) Destroy(ctx context.Context, opts *workflow.DestroyContext) (err
 		return err
 	}
 
+	if !cubeboxstore.PublicationCleanupAllowed(ctx) {
+		if err := sb.PublicationError(); err != nil {
+			return err
+		}
+	}
 	sb.Lock()
 	defer sb.Unlock()
 

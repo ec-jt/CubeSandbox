@@ -219,6 +219,9 @@ func init() {
 
 			cbriManager.SetCubeRuntimeImplementation(l)
 			afterRecover := func(tmpCtx context.Context, cb *cubeboxstore.CubeBox) error {
+				if cb.GetPublicationHold() != nil {
+					return nil
+				}
 				return storageRecoverer.RecoverSandboxStorage(tmpCtx, cb.ID)
 			}
 
@@ -438,6 +441,9 @@ func (l *local) CleanUp(ctx context.Context, opts *workflow.CleanContext) error 
 		return err
 	}
 
+	if err := info.PublicationError(); err != nil {
+		return err
+	}
 	ns := info.Namespace
 	if ns == "" {
 		ns = namespaces.Default

@@ -13,7 +13,6 @@ import (
 	"path/filepath"
 	"runtime/debug"
 	"strings"
-	"time"
 
 	"github.com/tencentcloud/CubeSandbox/Cubelet/pkg/constants"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/pkg/log"
@@ -91,6 +90,11 @@ func (s *service) CommitSandbox(ctx context.Context, req *cubebox.CommitSandboxR
 	if err != nil {
 		rsp.Ret.RetCode = errorcode.ErrorCode_PreConditionFailed
 		rsp.Ret.RetMsg = fmt.Sprintf("sandbox is not found: %v", err)
+		return rsp, nil
+	}
+	if err := s.snapshotPackageRetentionError(rsp.TemplateID); err != nil {
+		rsp.Ret.RetCode = errorcode.ErrorCode_PreConditionFailed
+		rsp.Ret.RetMsg = err.Error()
 		return rsp, nil
 	}
 	rootVolumeName, err := validateCommitSandboxTarget(cb)
@@ -184,6 +188,9 @@ func (s *service) CommitSandbox(ctx context.Context, req *cubebox.CommitSandboxR
 	}
 
 	cleanupArtifacts := func() {
+		if cb.GetPublicationHold() != nil {
+			return
+		}
 		layout.releaseMetadata(ctx)
 		cleanupCowSnapshotObjectsOn(ctx, stepLog, backend, memoryObject, rootfsObject)
 		layout.discardTmpDir()
@@ -205,24 +212,27 @@ func (s *service) CommitSandbox(ctx context.Context, req *cubebox.CommitSandboxR
 	// when degrading because no base could be resolved. AppSnapshot keeps
 	// using the default full type via its own call site.
 	stepLog = stepLog.WithFields(CubeLog.Fields{"snapshotType": snapshotTypeForCmd})
-	if err := s.executeCubeRuntimeSnapshot(ctx, rsp.SandboxID, spec, layout.MetaWork, memoryObject.DevPath, snapshotTypeForCmd); err != nil {
-		cleanupArtifacts()
+	syncPublication := func() error { return s.cubeboxMgr.cubeboxManger.SyncByID(ctx, cb.ID) }
+	if err := beginSnapshotPublication(cb, layout, "commit", syncPublication); err != nil {
 		rsp.Ret.RetCode = errorcode.ErrorCode_Unknown
-		rsp.Ret.RetMsg = fmt.Sprintf("failed to execute cube-runtime snapshot: %v", err)
+		rsp.Ret.RetMsg = err.Error()
 		return rsp, nil
 	}
-	// cube-runtime returned success, which means the hypervisor has
-	// committed the delta to the memory file *and*, on the soft-dirty path,
-	// already issued clear_soft_dirty() to start the next tracking window.
-	// From this point on, the next CommitSandbox on the same VM must use
-	// rsp.TemplateID as its base (anything older would lose the bytes the
-	// guest just wrote into this snapshot). We stamp the in-memory binding
-	// immediately so a follow-up commit picks it up; SyncByID at the end of
-	// the success path persists it (mirroring the rollback flow). If a
-	// later step fails and cleanupArtifacts deletes memoryObject, the stale
-	// binding routes the next commit through the fallback-to-full branch
-	// in prepareCommitMemoryArtifact, which is self-contained and safe.
-	setRuntimeSnapshotBindingLabels(cb, rsp.TemplateID, time.Now().UTC())
+	defer func() {
+		if cb.GetPublicationHold() != nil && rsp.Ret.RetCode != errorcode.ErrorCode_Success {
+			rsp.Ret.RetMsg += "; " + cb.PublicationError().Error()
+		}
+	}()
+	if err := s.executeCubeRuntimeSnapshot(ctx, rsp.SandboxID, spec, layout.MetaWork, memoryObject.DevPath, snapshotTypeForCmd); err != nil {
+		rsp.Ret.RetCode = errorcode.ErrorCode_Unknown
+		rsp.Ret.RetMsg = fmt.Sprintf("failed or ambiguous runtime capture: %v", err)
+		return rsp, nil
+	}
+	if err := persistCapturedLineage(cb, rsp.TemplateID, syncPublication); err != nil {
+		rsp.Ret.RetCode = errorcode.ErrorCode_Unknown
+		rsp.Ret.RetMsg = err.Error()
+		return rsp, nil
+	}
 	if err := writeSnapshotPorts(layout.MetaWork, ports); err != nil {
 		cleanupArtifacts()
 		rsp.Ret.RetCode = errorcode.ErrorCode_Unknown
@@ -237,12 +247,7 @@ func (s *service) CommitSandbox(ctx context.Context, req *cubebox.CommitSandboxR
 		return rsp, nil
 	}
 	if layout.usesTmpRename() {
-		// NOCC:Path Traversal()
-		if err := os.RemoveAll(snapshotPath); err != nil {
-			stepLog.Warnf("failed to remove existing snapshot path: %v", err)
-		}
 		if err := os.Rename(tmpSnapshotPath, snapshotPath); err != nil {
-			_ = os.RemoveAll(tmpSnapshotPath) // NOCC:Path Traversal()
 			cleanupArtifacts()
 			rsp.Ret.RetCode = errorcode.ErrorCode_Unknown
 			rsp.Ret.RetMsg = fmt.Sprintf("failed to move snapshot: %v", err)
@@ -251,9 +256,6 @@ func (s *service) CommitSandbox(ctx context.Context, req *cubebox.CommitSandboxR
 	}
 	if err := storage.EnsureShimSpecDirLink(layout.Home, specDir); err != nil {
 		cleanupArtifacts()
-		if layout.usesTmpRename() {
-			_ = os.RemoveAll(snapshotPath) // NOCC:Path Traversal()
-		}
 		rsp.Ret.RetCode = errorcode.ErrorCode_Unknown
 		rsp.Ret.RetMsg = fmt.Sprintf("failed to expose shim spec dir: %v", err)
 		return rsp, nil
@@ -281,7 +283,7 @@ func (s *service) CommitSandbox(ctx context.Context, req *cubebox.CommitSandboxR
 	// guest after every snapshot; legacy templates without the annotation keep
 	// the previous best-effort behavior of returning an empty version.
 	rsp.EnvdVersion = envdVersionFromCubeBox(cb)
-	if err := storage.WriteSnapshotCatalogFor(backend, &storage.SnapshotCatalogEntry{
+	remoteUUIDs, err := publishSnapshotPackage(ctx, backend, &storage.SnapshotCatalogEntry{
 		SnapshotID:        rsp.TemplateID,
 		InstanceType:      "cubebox",
 		SpecDir:           specDir,
@@ -297,26 +299,18 @@ func (s *service) CommitSandbox(ctx context.Context, req *cubebox.CommitSandboxR
 		ComponentVersions: cloneStringMap(cb.ComponentVersions),
 		Kind:              storage.CatalogKindRuntimeSnapshot,
 		Backend:           backend,
-	}); err != nil {
-		// Catalog write failures do not invalidate the snapshot: master will
-		// still receive the physical references in the response and rollback
-		// path keeps the legacy fallback. Log loudly so operators notice
-		// drift between master and cubelet local view.
-		stepLog.Warnf("failed to persist snapshot catalog for %s: %v", rsp.TemplateID, err)
+	})
+	if err != nil {
+		rsp.Ret.RetCode = errorcode.ErrorCode_Unknown
+		rsp.Ret.RetMsg = err.Error()
+		return rsp, nil
 	}
-	// S3: seal memory／metadata work volumes to RO snapshots, then Upload.
-	if err := storage.FinalizeS3PackageSnapshots(ctx, backend, rsp.TemplateID); err != nil {
-		stepLog.Warnf("failed to seal s3 package snapshots for %s: %v", rsp.TemplateID, err)
+	if err := completeSnapshotPublication(cb, syncPublication); err != nil {
+		rsp.Ret.RetCode = errorcode.ErrorCode_Unknown
+		rsp.Ret.RetMsg = err.Error()
+		return rsp, nil
 	}
-	if raw := uploadRemoteUUIDsIfS3(ctx, backend, rsp.TemplateID); raw != "" {
-		rsp.RemoteUuids = raw
-	}
-	// Persist the runtime-snapshot binding update we did in-memory after
-	// cube-runtime returned. Mirrors the rollback flow's SyncByID call so
-	// that a process restart recovers the new commit lineage and so any
-	// downstream component reading the cubebox metadata sees the same
-	// ancestor as resolveBaseSnapshotID will return on the next commit.
-	s.cubeboxMgr.cubeboxManger.SyncByID(ctx, cb.ID)
+	rsp.RemoteUuids = remoteUUIDs
 	stepLog.Infof("CommitSandbox completed successfully: snapshotPath=%s", snapshotPath)
 	return rsp, nil
 }
@@ -335,6 +329,9 @@ func validatePauseSandboxTarget(cb *cubeboxstore.CubeBox) (string, error) {
 func validateSnapshotSandboxTarget(cb *cubeboxstore.CubeBox, validateHostDeps bool) (string, error) {
 	if cb == nil {
 		return "", errors.New("sandbox is not found")
+	}
+	if err := cb.PublicationError(); err != nil {
+		return "", err
 	}
 	if cb.GetStatus() == nil || cb.GetStatus().Get().State() != cubebox.ContainerState_CONTAINER_RUNNING {
 		return "", fmt.Errorf("sandbox %s is not running", cb.ID)
@@ -648,6 +645,11 @@ func (s *service) cleanupTemplate(ctx context.Context, req *cubebox.CleanupTempl
 	if err := pathutil.ValidateSafeID(rsp.TemplateID); err != nil {
 		rsp.Ret.RetCode = errorcode.ErrorCode_InvalidParamFormat
 		rsp.Ret.RetMsg = fmt.Sprintf("invalid templateID: %v", err)
+		return rsp, nil
+	}
+	if err := s.snapshotPackageRetentionError(rsp.TemplateID); err != nil {
+		rsp.Ret.RetCode = errorcode.ErrorCode_PreConditionFailed
+		rsp.Ret.RetMsg = err.Error()
 		return rsp, nil
 	}
 	// snapshot_path is deprecated as of v4: cubelet resolves it from local

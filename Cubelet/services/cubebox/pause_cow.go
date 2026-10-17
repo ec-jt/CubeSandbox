@@ -247,6 +247,11 @@ func (s *service) updateWithPauseCow(
 		"sandboxID": req.SandboxID,
 	})
 
+	if err := sb.PublicationError(); err != nil {
+		rsp.Ret.RetCode = errorcode.ErrorCode_PreConditionFailed
+		rsp.Ret.RetMsg = err.Error()
+		return rsp, nil
+	}
 	snapID, err := resolvePauseSnapshotID(req)
 	if err != nil {
 		rsp.Ret.RetCode = errorcode.ErrorCode_InvalidParamFormat
@@ -269,7 +274,11 @@ func (s *service) updateWithPauseCow(
 	prevLiveSnap := stampedPauseSnapshotID(sb)
 	stampLaunchMemoryAncestorOnce(sb, resolveLaunchAncestorSnapshotID(sb))
 	stampPauseSnapshotID(sb, snapID)
-	_ = s.cubeboxMgr.cubeboxManger.SyncByID(ctx, sb.ID)
+	if err := s.cubeboxMgr.cubeboxManger.SyncByID(ctx, sb.ID); err != nil {
+		rsp.Ret.RetCode = errorcode.ErrorCode_Unknown
+		rsp.Ret.RetMsg = fmt.Sprintf("persist pause identity: %v", err)
+		return rsp, nil
+	}
 
 	// Pause allows host-mount / host_dir / plugin_volume (same host path is
 	// re-bound on Resume). User snapshot CommitSandbox still rejects those
@@ -342,6 +351,9 @@ func (s *service) updateWithPauseCow(
 
 	var rootfsObject *storage.CowSnapshotObject
 	cleanupArtifacts := func() {
+		if sb.GetPublicationHold() != nil {
+			return
+		}
 		layout.releaseMetadata(ctx)
 		cleanupCowSnapshotObjectsOn(ctx, stepLog, backend, memoryObject, rootfsObject)
 		layout.discardTmpDir()
@@ -388,6 +400,9 @@ func (s *service) updateWithPauseCow(
 		_ = s.cubeboxMgr.cubeboxManger.SyncByID(workCtx, sb.ID)
 		rsp.Ret.RetCode = code
 		rsp.Ret.RetMsg = msg
+		if holdErr := sb.PublicationError(); holdErr != nil {
+			rsp.Ret.RetMsg += "; " + holdErr.Error()
+		}
 		return rsp, nil
 	}
 
@@ -422,6 +437,10 @@ func (s *service) updateWithPauseCow(
 		return failPause(errorcode.ErrorCode_Unknown, fmt.Sprintf("marshal pause snapshot config: %v", err))
 	}
 
+	syncPublication := func() error { return s.cubeboxMgr.cubeboxManger.SyncByID(workCtx, sb.ID) }
+	if err := beginSnapshotPublication(sb, layout, "pause", syncPublication); err != nil {
+		return failPause(errorcode.ErrorCode_Unknown, err.Error())
+	}
 	stepLog.Infof("PauseToSnapshot destination=%s memory_vol=%s snapID=%s snapshot_type=%s",
 		layout.MetaWork, memURL, snapID, pauseCfg.SnapshotType)
 	// Shim returns Update OK and stays alive (Paused). Any error is Pause
@@ -431,17 +450,15 @@ func (s *service) updateWithPauseCow(
 		shimUpdateActionAnnotation:        shimUpdatePauseToSnapshotAction,
 		shimUpdatePauseSnapshotAnnotation: string(cfgJSON),
 	})); err != nil {
-		cleanupArtifacts()
-		markLocalPauseFailed(sb, err)
-		_ = s.cubeboxMgr.cubeboxManger.SyncByID(workCtx, sb.ID)
-		rsp.Ret.RetCode = errorcode.ErrorCode_TaskPauseFailed
-		rsp.Ret.RetMsg = err.Error()
-		return rsp, nil
+		return failPause(errorcode.ErrorCode_TaskPauseFailed, fmt.Sprintf("failed or ambiguous runtime capture: %v", err))
+	}
+	if err := persistCapturedLineage(sb, snapID, syncPublication); err != nil {
+		return failPause(errorcode.ErrorCode_Unknown, err.Error())
 	}
 
 	// Disk after memory freeze: live rootfs volume is still present until
-	// keep_tombstone Destroy. If this fails the MicroVM is already gone —
-	// Pause fails and the sandbox is not Resume-able (delete only).
+	// keep_tombstone Destroy. On failure retain the frozen VM and artifacts;
+	// an operator must reconcile, not blindly retry or delete.
 	rootfsObject, err = storage.CommitRootfsFor(workCtx, backend, sourceRootfs, snapID)
 	if err != nil {
 		if errors.Is(err, storage.ErrCowObjectAlreadyExists) {
@@ -463,7 +480,6 @@ func (s *service) updateWithPauseCow(
 		return failPause(errorcode.ErrorCode_Unknown, fmt.Sprintf("failed to deactivate pause snapshot objects: %v", err))
 	}
 	if layout.usesTmpRename() {
-		_ = os.RemoveAll(snapshotPath) // NOCC:Path Traversal()
 		if err := os.Rename(tmpSnapshotPath, snapshotPath); err != nil {
 			return failPause(errorcode.ErrorCode_Unknown, fmt.Sprintf("failed to move pause snapshot: %v", err))
 		}
@@ -472,7 +488,7 @@ func (s *service) updateWithPauseCow(
 		return failPause(errorcode.ErrorCode_Unknown, fmt.Sprintf("failed to expose shim spec dir: %v", err))
 	}
 
-	if err := storage.WriteSnapshotCatalogFor(backend, &storage.SnapshotCatalogEntry{
+	remoteUUIDsJSON, err := publishSnapshotPackage(workCtx, backend, &storage.SnapshotCatalogEntry{
 		SnapshotID:      snapID,
 		InstanceType:    "cubebox",
 		SpecDir:         specDir,
@@ -487,20 +503,9 @@ func (s *service) updateWithPauseCow(
 		RootfsSizeBytes: rootfsObject.SizeBytes,
 		Kind:            storage.CatalogKindPauseSnapshot,
 		Backend:         backend,
-	}); err != nil {
-		// catalog.json is required for Resume / List / cross-node; do not mark
-		// PAUSED without it (sandbox_spec already fails hard above).
-		_ = storage.UnmountS3Metadata(layout.MetaDir)
-		_ = os.RemoveAll(snapshotPath) // NOCC:Path Traversal()
-		return failPause(errorcode.ErrorCode_Unknown,
-			fmt.Sprintf("failed to persist pause snapshot catalog for %s: %v", snapID, err))
-	}
-	// S3: seal memory/metadata work volumes to RO snapshots before Upload.
-	if err := storage.FinalizeS3PackageSnapshots(workCtx, backend, snapID); err != nil {
-		_ = storage.UnmountS3Metadata(layout.MetaDir)
-		_ = os.RemoveAll(snapshotPath) // NOCC:Path Traversal()
-		return failPause(errorcode.ErrorCode_Unknown,
-			fmt.Sprintf("failed to seal s3 pause package snapshots for %s: %v", snapID, err))
+	})
+	if err != nil {
+		return failPause(errorcode.ErrorCode_Unknown, err.Error())
 	}
 
 	// Mark PAUSED before keep_tombstone Destroy so the destroy path takes the
@@ -517,9 +522,9 @@ func (s *service) updateWithPauseCow(
 			})
 		}
 	}
-	_ = s.cubeboxMgr.cubeboxManger.SyncByID(workCtx, sb.ID)
-
-	remoteUUIDsJSON := uploadRemoteUUIDsIfS3(workCtx, backend, snapID)
+	if err := syncPublication(); err != nil {
+		return failPause(errorcode.ErrorCode_Unknown, fmt.Sprintf("persist paused state: %v", err))
+	}
 
 	stepLog.Infof("PauseToSnapshot completed: snapID=%s path=%s; running in-process keep_tombstone Destroy", snapID, snapshotPath)
 	extInfo, err := s.destroyLiveAfterPause(workCtx, req, sb)
@@ -541,6 +546,9 @@ func (s *service) updateWithPauseCow(
 		rsp.Ret.RetCode = errorcode.ErrorCode_Unknown
 		rsp.Ret.RetMsg = err.Error()
 		return rsp, nil
+	}
+	if err := completeSnapshotPublication(sb, syncPublication); err != nil {
+		return failPause(errorcode.ErrorCode_Unknown, err.Error())
 	}
 	if prev := replacedLivePauseSnapshotID(prevLiveSnap, snapID); prev != "" {
 		stepLog.Infof("pause replaced live snap %s with %s; CleanupTemplate previous", prev, snapID)
@@ -565,7 +573,9 @@ func (s *service) destroyLiveAfterPause(
 		now := time.Now()
 		sb.UserMarkDeletedTime = &now
 		sb.DeleteRequestID = req.RequestID
-		_ = s.cubeboxMgr.cubeboxManger.SyncByID(ctx, sb.ID)
+		if err := s.cubeboxMgr.cubeboxManger.SyncByID(ctx, sb.ID); err != nil {
+			return nil, fmt.Errorf("persist pause teardown intent: %w", err)
+		}
 	}
 
 	destroyReq := &cubebox.DestroyCubeSandboxRequest{
@@ -591,6 +601,7 @@ func (s *service) destroyLiveAfterPause(
 	// Standalone Destroy RPC still uses destroy_dead_line (60s). Pause already
 	// holds a longer WithoutCancel workCtx (snap + cleanup); do not re-cap here
 	// so concurrent keep_tombstone cleanup can finish under the Pause budget.
+	ctx = cubeboxstore.WithPublicationCleanup(ctx)
 	ferr, _ := ret.FromError(s.engine.Destroy(ctx, destroyInfo))
 	ext := map[string][]byte{}
 	if data := marshalVolumeRefEvents(destroyInfo.VolumeRefEvents); data != nil {
@@ -607,7 +618,9 @@ func (s *service) destroyLiveAfterPause(
 		sb2.UserMarkDeletedTime = nil
 		sb2.DeleteRequestID = ""
 		sb2.Unlock()
-		_ = s.cubeboxMgr.cubeboxManger.SyncByID(ctx, req.SandboxID)
+		if err := s.cubeboxMgr.cubeboxManger.SyncByID(ctx, req.SandboxID); err != nil {
+			return ext, fmt.Errorf("persist pause tombstone: %w", err)
+		}
 	}
 	return ext, nil
 }

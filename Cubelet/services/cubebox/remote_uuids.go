@@ -6,8 +6,9 @@ package cubebox
 
 import (
 	"context"
+	"fmt"
+	"strings"
 
-	"github.com/tencentcloud/CubeSandbox/Cubelet/pkg/log"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/storage"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/storage/cow"
 )
@@ -15,23 +16,26 @@ import (
 // uploadRemoteUUIDsIfS3 runs cubecow_export_snapshot (via UploadSnapshot)
 // after Pause / CommitSandbox has already sealed package disks to
 // snapshots. Templates (AppSnapshot) do not export. XFS is a no-op.
-// Export failure is logged and returns empty — the customer-facing RPC
-// still succeeds; Master records remote_status=failed without uuids
-// (same-node resume does not need them; cross-node needs ready + uuids).
-func uploadRemoteUUIDsIfS3(ctx context.Context, backend, snapshotID string) string {
+// Export acceptance is not remote readiness. The caller must propagate errors;
+// Master keeps accepted exports inprogress until status polling proves DONE.
+func uploadRemoteUUIDsIfS3(ctx context.Context, backend, snapshotID string) (string, error) {
 	normalized, err := cow.NormalizeBackend(backend)
-	if err != nil || normalized != cow.BackendS3 {
-		return ""
+	if err != nil {
+		return "", err
+	}
+	if normalized != cow.BackendS3 {
+		return "", nil
 	}
 	uuids, err := storage.UploadSnapshot(ctx, normalized, snapshotID)
 	if err != nil {
-		log.G(ctx).Warnf("s3 export snapshot %s failed (customer RPC continues): %v", snapshotID, err)
-		return ""
+		return "", err
 	}
-	raw := uuids.JSON()
-	if raw == "" {
-		log.G(ctx).Warnf("s3 export snapshot %s returned empty remote_uuids (customer RPC continues)", snapshotID)
-		return ""
+	return acceptedSnapshotUUIDs(uuids)
+}
+
+func acceptedSnapshotUUIDs(uuids *cow.RemoteUUIDs) (string, error) {
+	if uuids == nil || strings.TrimSpace(uuids.Rootfs) == "" || strings.TrimSpace(uuids.Memory) == "" || strings.TrimSpace(uuids.Metadata) == "" {
+		return "", fmt.Errorf("S3 package export did not accept all rootfs, memory, and metadata roles")
 	}
-	return raw
+	return uuids.JSON(), nil
 }

@@ -815,20 +815,13 @@ func abortSnapshotDeleteIfRefsReappeared(ctx context.Context, jobID, snapshotID 
 }
 
 func failSnapshotCreateJob(ctx context.Context, jobID, snapshotID, nodeIP, snapshotPath string, commitRsp *cubeboxv1.CommitSandboxResponse, cause error, backend string) error {
-	// v4+: master no longer sends SnapshotPath/Objects to cubelet. The
-	// catalog entry written during CommitSandbox carries everything cubelet
-	// needs to clean up; the snapshotPath / commitRsp arguments are retained
-	// in this signature solely for logging/diagnostic continuity.
+	// Capture may have reset dirty tracking before a timeout or later metadata
+	// failure. Preserve physical packages AND replica locators for operator
+	// reconciliation. A failed job is not authority to destroy a lineage base.
+	_ = nodeIP
 	_ = snapshotPath
 	_ = commitRsp
-	if strings.TrimSpace(nodeIP) != "" && strings.TrimSpace(snapshotID) != "" {
-		_, _ = cubelet.CleanupTemplate(ctx, cubelet.GetCubeletAddr(nodeIP), &cubeboxv1.CleanupTemplateRequest{
-			RequestID:  uuid.NewString(),
-			TemplateID: snapshotID,
-			Backend:    pinnedCleanupBackend(backend),
-		})
-	}
-	_ = deleteReplicasByTemplateID(ctx, snapshotID)
+	_ = backend
 	defErr := updateSnapshotFields(ctx, snapshotID, map[string]any{
 		"status":     StatusFailed,
 		"last_error": cause.Error(),

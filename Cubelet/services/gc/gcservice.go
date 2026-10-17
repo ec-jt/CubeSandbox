@@ -96,6 +96,11 @@ func (l *gcService) run(ctx context.Context) {
 				if err == nil && len(dirtyInfos) > 0 {
 					for _, v := range dirtyInfos {
 						info := v
+						// Publication recovery owns these runtime/storage resources.
+						box, getErr := l.gc.cubeboxManger.Get(ctx, info.SandboxID)
+						if getErr == nil && box != nil && box.GetPublicationHold() != nil {
+							continue
+						}
 
 						exist, unlock := l.loadOrStore(info.SandboxID)
 						if exist {

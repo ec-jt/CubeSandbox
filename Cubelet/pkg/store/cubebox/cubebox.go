@@ -153,6 +153,9 @@ type CubeBox struct {
 
 	Status *StatusStorage `json:"status,omitempty"`
 
+	// PublicationHold is persisted before runtime capture. Never supplied by clients.
+	PublicationHold *PublicationHold `json:"publication_hold,omitempty"`
+
 	RequestSource string `json:"source,omitempty"`
 	UserDeleteMark
 

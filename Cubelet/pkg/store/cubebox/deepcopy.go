@@ -37,6 +37,8 @@ func (cb *CubeBox) DeepCopy() *CubeBox {
 		HostMetricsBaselineMissingAtAssignment: cb.HostMetricsBaselineMissingAtAssignment,
 	}
 
+	copied.PublicationHold = cb.GetPublicationHold()
+
 	cb.livePortsLock.RLock()
 	copied.PortMappings = clonePortMappings(cb.PortMappings)
 	copied.DynamicPorts = slices.Clone(cb.DynamicPorts)

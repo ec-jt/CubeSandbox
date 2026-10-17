@@ -45,6 +45,9 @@ func (s *service) ListLocalSnapshots(ctx context.Context, req *cubebox.ListLocal
 			return rsp, nil
 		}
 		for _, e := range entries {
+			if s.snapshotPackageIncompleteError(e.SnapshotID) != nil {
+				continue
+			}
 			info := localSnapshotEntryToProto(e)
 			info.Backend = backend
 			rsp.Snapshots = append(rsp.Snapshots, info)
@@ -74,6 +77,11 @@ func (s *service) GetLocalSnapshot(ctx context.Context, req *cubebox.GetLocalSna
 	backend, err := resolveRequestStorageBackend(req.GetBackend())
 	if err != nil {
 		rsp.Ret.RetCode = errorcode.ErrorCode_InvalidParamFormat
+		rsp.Ret.RetMsg = err.Error()
+		return rsp, nil
+	}
+	if err := s.snapshotPackageIncompleteError(id); err != nil {
+		rsp.Ret.RetCode = errorcode.ErrorCode_PreConditionFailed
 		rsp.Ret.RetMsg = err.Error()
 		return rsp, nil
 	}

@@ -96,6 +96,11 @@ func (s *service) Update(ctx context.Context, req *cubebox.UpdateCubeSandboxRequ
 		rsp.Ret.RetCode = errorcode.ErrorCode_InvalidParamFormat
 		return rsp, nil
 	}
+	if err := sb.PublicationError(); err != nil {
+		rsp.Ret.RetCode = errorcode.ErrorCode_PreConditionFailed
+		rsp.Ret.RetMsg = err.Error()
+		return rsp, nil
+	}
 	rt.CalleeAction = action
 	switch action {
 	case constants.UpdateActionAddDevice, constants.UpdateActionRemoveDevice:
