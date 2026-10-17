@@ -413,7 +413,6 @@ func (s *service) AppSnapshot(ctx context.Context, req *cubebox.AppSnapshotReque
 
 	}
 
-	snapshotSuccess = true
 	rsp.RootfsVol = rootfsObject.Name
 	rsp.MemoryVol = memoryObject.Name
 	rsp.RootfsKind = rootfsObject.Kind
@@ -432,7 +431,7 @@ func (s *service) AppSnapshot(ctx context.Context, req *cubebox.AppSnapshotReque
 	// CleanupTemplate calls can resolve physical refs locally. The build
 	// rootfs name is deterministic on cubelet side; we record it so cleanup
 	// works even if the live volume has already been removed by other paths.
-	if err := storage.WriteSnapshotCatalogFor(backend, &storage.SnapshotCatalogEntry{
+	entry := &storage.SnapshotCatalogEntry{
 		SnapshotID:        templateID,
 		InstanceType:      "cubebox",
 		SpecDir:           specDir,
@@ -449,16 +448,17 @@ func (s *service) AppSnapshot(ctx context.Context, req *cubebox.AppSnapshotReque
 		RootfsSizeBytes:   rootfsObject.SizeBytes,
 		ComponentVersions: frozenVersions,
 		Kind:              storage.CatalogKindTemplate,
-	}); err != nil {
-		// Catalog write failures do not invalidate the snapshot: master will
-		// still receive the physical references in the response and the
-		// deterministic-name cleanup fallback keeps working. Log loudly so
-		// operators notice drift between master and cubelet local view.
-		stepLog.Warnf("failed to persist snapshot catalog for %s: %v", templateID, err)
 	}
-	if err := storage.FinalizeS3PackageSnapshots(ctx, backend, templateID); err != nil {
-		stepLog.Warnf("s3 finalize package snapshots %s failed: %v", templateID, err)
+	if err := completeTemplatePublication(rsp,
+		func() error { return storage.WriteSnapshotCatalogFor(backend, entry) },
+		func() error { return storage.FinalizeS3PackageSnapshots(ctx, backend, templateID) },
+	); err != nil {
+		// Sealing can partially succeed and change catalog object names. Retain
+		// artifacts for explicit reconciliation; do not delete using stale refs.
+		stepLog.Errorf("template %s publication failed; artifacts retained: %v", templateID, err)
+		return rsp, nil
 	}
+	snapshotSuccess = true
 
 	// Template disks stay node-local. Pause / CommitSandbox export the
 	// sandbox snapshot package, not the template.
