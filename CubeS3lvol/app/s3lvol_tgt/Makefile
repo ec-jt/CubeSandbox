@@ -86,10 +86,37 @@ SPDK_APP_LIBS = $(shell PKG_CONFIG_PATH="$(PKG_CONFIG_PATH)" \
 SPDK_ONLY_LIBS = $(call spdk_only_libs,$(SPDK_APP_LIBS))
 DPDK_STATIC_LIBS = $(call dpdk_static_libs,$(SPDK_APP_LIBS))
 
+# Optional target-only static AIO linkage for systems whose libaio SONAME
+# differs from the builder's (for example, Ubuntu 24.04's libaio.so.1t64).
+# Default builds retain pkg-config's system libraries. Opt in explicitly:
+#   make AIO_STATIC_LIB=/usr/lib/x86_64-linux-gnu/libaio.a
+# A missing or invalid archive must fail, never silently fall back to -laio.
+# Distributors must retain libaio's LGPL notices and provide relinking materials.
+AIO_STATIC_LIB ?=
+TARGET_SYS_LIBS := $(SYS_LIBS)
+ifneq ($(strip $(AIO_STATIC_LIB)),)
+ifneq ($(words $(AIO_STATIC_LIB)),1)
+$(error AIO_STATIC_LIB must name one absolute .a archive without whitespace)
+endif
+ifeq ($(filter /%,$(AIO_STATIC_LIB)),)
+$(error AIO_STATIC_LIB must be an absolute path)
+endif
+ifeq ($(filter %.a,$(AIO_STATIC_LIB)),)
+$(error AIO_STATIC_LIB must name a .a archive)
+endif
+ifeq ($(wildcard $(AIO_STATIC_LIB)),)
+$(error AIO_STATIC_LIB archive does not exist: $(AIO_STATIC_LIB))
+endif
+ifeq ($(shell $(AR) t '$(AIO_STATIC_LIB)' >/dev/null 2>&1 && echo valid),)
+$(error AIO_STATIC_LIB is not a readable archive: $(AIO_STATIC_LIB))
+endif
+TARGET_SYS_LIBS := $(filter-out -laio,$(SYS_LIBS)) $(AIO_STATIC_LIB)
+endif
+
 .PHONY: all clean
 
 all: $(APP)
-$(APP): s3lvol_tgt.c $(MODULE_DIR)/libs3lvol_bdev.a $(S3BSDEV_DIR)/libs3bsdev.a
+$(APP): s3lvol_tgt.c $(MODULE_DIR)/libs3lvol_bdev.a $(S3BSDEV_DIR)/libs3bsdev.a $(AIO_STATIC_LIB)
 	$(CC) $(COMMON_CFLAGS) s3lvol_tgt.c \
 	    -Wl,--whole-archive \
 	        $(MODULE_DIR)/libs3lvol_bdev.a \
@@ -99,7 +126,7 @@ $(APP): s3lvol_tgt.c $(MODULE_DIR)/libs3lvol_bdev.a $(S3BSDEV_DIR)/libs3bsdev.a
 	    -Wl,--no-whole-archive \
 	    $(AWS_LIBS) \
 	    $(OPENSSL_STATIC_LIBS) \
-	    $(SYS_LIBS) -pthread -lrt -luuid -lm -ldl -o $@
+	    $(TARGET_SYS_LIBS) -pthread -lrt -luuid -lm -ldl -o $@
 
 # Both marked phony so the sub-makes always run: without that, an existing .a is
 # considered up to date no matter what changed under lib/ or module/, and the app
