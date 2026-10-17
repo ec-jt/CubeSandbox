@@ -15,6 +15,7 @@ import (
 
 	containerd "github.com/containerd/containerd/v2/client"
 	"github.com/containerd/containerd/v2/pkg/namespaces"
+	networkruntime "github.com/tencentcloud/CubeSandbox/Cubelet/network/runtime"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/pkg/log"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/pkg/pathutil"
 	cubeboxstore "github.com/tencentcloud/CubeSandbox/Cubelet/pkg/store/cubebox"
@@ -140,6 +141,16 @@ func (s *service) RollbackSandbox(ctx context.Context, req *cubebox.RollbackSand
 				stepLog.Warnf("rollback: release snapshot metadata copy: %v", relErr)
 			}
 		}()
+	}
+
+	// Retain the live TAP and proxy allocations only when portable intent agrees.
+	// Check before deriving disks or dispatching VM restore, under lifecycle lock.
+	if err := validateRollbackSnapshotPorts(metaDir, func() (*networkruntime.PortablePorts, error) {
+		return s.captureSnapshotPorts(ctx, cb)
+	}); err != nil {
+		rsp.Ret.RetCode = errorcode.ErrorCode_PreConditionFailed
+		rsp.Ret.RetMsg = fmt.Sprintf("rollback port preflight: %v", err)
+		return rsp, nil
 	}
 
 	currentRootfs, err := storage.GetSandboxRootfsFor(ctx, backend, req.GetSandboxID(), rootVolumeName)
