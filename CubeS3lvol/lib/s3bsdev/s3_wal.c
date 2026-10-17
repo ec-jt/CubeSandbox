@@ -1389,6 +1389,7 @@ struct wal_replay_ctx {
 	uint64_t                 batch_id;
 
 	uint64_t            applied;
+	uint64_t            skipped;
 	uint64_t            dropped;
 
 	int                 status;
@@ -1425,8 +1426,10 @@ wal_replay_done(struct wal_replay_ctx *rctx, int status)
 	wal->stats.dropped_batches  += rctx->dropped;
 
 	SPDK_NOTICELOG("WAL replay done: %" PRIu64 " entries applied, %" PRIu64
-		       " batches dropped, head=%" PRIu64 ", seq_next=%" PRIu64 "\n",
-		       rctx->applied, rctx->dropped, wal->head, wal->seq_next);
+		       " skipped (<= ckpt seq), %" PRIu64 " batches dropped, "
+		       "head=%" PRIu64 ", seq_next=%" PRIu64 "\n",
+		       rctx->applied, rctx->skipped, rctx->dropped,
+		       wal->head, wal->seq_next);
 
 	free(rctx->batch_hdrs);
 	free(rctx->batch_payloads);
@@ -1562,6 +1565,36 @@ wal_replay_segment_read(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg
 				rctx->stop = true;
 				break;
 			}
+		}
+
+		/* Entries at or below the persisted safe sequence are already
+		 * reflected in the recovered chunk map: the flusher advances that
+		 * sequence only after the corresponding chunk-map insert (and its
+		 * journal record) is durable, and a checkpoint that replaced the
+		 * journal records the same mappings in full.
+		 *
+		 * Replaying one again cannot add information, and for
+		 * S3_WAL_UNMAP it destroys it: s3_bs_dev_wal_apply() removes the
+		 * chunk mapping the entry names -- including one the checkpoint
+		 * restored moments earlier. ckpt_head cannot express this on its
+		 * own, because truncation is segment-granular and the segment
+		 * still being appended to keeps its consumed prefix.
+		 *
+		 * The seq, not the byte position, is the watermark. Entries are
+		 * appended in seq order, so this skips a prefix of the scan and
+		 * the live suffix still crosses a batch boundary correctly. */
+		if (hdr->seq <= wal->ckpt_seq) {
+			rctx->skipped++;
+			wal_record_seg_seq(wal, seg_start, hdr->seq);
+			off_in_seg += total;
+			/* Match the writer's padding or the next header would be
+			 * read out of a batch's alignment gap. */
+			if (hdr->flags & S3_WAL_F_LAST_IN_BATCH) {
+				off_in_seg = SPDK_ALIGN_CEIL(off_in_seg,
+							     S3_WAL_BLOCK_SIZE);
+			}
+			rctx->scan_pos = seg_start + off_in_seg;
+			continue;
 		}
 
 		/* A new batch_id means the previous batch never closed. */

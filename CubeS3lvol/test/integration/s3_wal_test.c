@@ -377,6 +377,18 @@ sync_close(struct s3_wal *wal)
 }
 
 static int
+sync_super(struct s3_wal *wal, uint64_t ckpt_seq)
+{
+	struct async_ctx ctx = {0};
+
+	s3_wal_sync_super(wal, ckpt_seq, async_int_cb, &ctx);
+	if (!poll_until(&ctx.done)) {
+		return -ETIMEDOUT;
+	}
+	return ctx.status;
+}
+
+static int
 sync_replay(struct s3_wal *wal, struct replay_state *st)
 {
 	struct async_ctx ctx = {0};
@@ -420,6 +432,9 @@ main(int argc, char **argv)
 	spdk_env_opts_init(&env_opts);
 	env_opts.name     = "s3_wal_test";
 	env_opts.no_huge  = true;
+	/* The test only talks to an aio bdev; probing PCI would add host
+	 * dependencies (and, under EAL, a vfio attempt) for no coverage. */
+	env_opts.no_pci   = true;
 	env_opts.mem_size = 512;
 	if (spdk_env_init(&env_opts) < 0) {
 		fprintf(stderr, "spdk_env_init failed\n");
@@ -716,6 +731,84 @@ main(int argc, char **argv)
 			check_true("entries survived the segment rollover",
 				   st.writes == NUM_WRITES + 1 + 400 &&
 				   st.payload_bad == 0, detail);
+		}
+	}
+
+	printf("\n[10] replay skips entries at or below the persisted safe seq\n");
+	{
+		uint64_t safe_seq;
+		struct replay_state rs = {0};
+
+		/* Everything appended so far is treated as already durable, which
+		 * is exactly what the flusher's safe_seq means: its effect is in
+		 * the chunk map, so WAL replay must not apply it again. The old
+		 * behaviour replayed the whole live segment, and an UNMAP older
+		 * than the chunk-map checkpoint then deleted mappings the
+		 * checkpoint had just restored. */
+		safe_seq = s3_wal_get_next_seq(wal) - 1;
+		check_true("the persisted safe seq is non-zero", safe_seq != 0,
+			   NULL);
+
+		rc = sync_super(wal, safe_seq);
+		check("s3_wal_sync_super", rc, 0);
+
+		rc = sync_close(wal);
+		wal = NULL;
+		check("close with a persisted safe seq", rc, 0);
+
+		struct open_wal_ctx wctx = {0};
+
+		s3_wal_open(local_dev, wal_open_cb, &wctx);
+		poll_until(&wctx.done);
+		check("reopen with a persisted safe seq", wctx.status, 0);
+		if (wctx.status == 0) {
+			wal = wctx.wal;
+			rc = sync_replay(wal, &rs);
+			check("replay after a safe seq", rc, 0);
+
+			char detail[128];
+			snprintf(detail, sizeof(detail),
+				 "%" PRIu64 " writes, %" PRIu64 " zeroes, %" PRIu64
+				 " unmaps, %" PRIu64 " barriers",
+				 rs.writes, rs.zeroes, rs.unmaps, rs.barriers);
+			check_true("no covered entry was replayed",
+				   rs.writes == 0 && rs.zeroes == 0 &&
+				   rs.unmaps == 0 && rs.barriers == 0, detail);
+
+			/* A write appended after the watermark must still replay:
+			 * the filter is a watermark, not "replay nothing". */
+			uint64_t seq_before = s3_wal_get_next_seq(wal);
+
+			fill_payload(payload, 7000, S3_WAL_BLOCK_SIZE);
+			rc = sync_append_write(wal, 7000, payload);
+			check("append after the safe seq", rc, 0);
+			check_true("seq advanced past the watermark",
+				   s3_wal_get_next_seq(wal) > seq_before, NULL);
+
+			rc = sync_close(wal);
+			wal = NULL;
+			check("close after the post-watermark append", rc, 0);
+
+			struct open_wal_ctx wctx2 = {0};
+			struct replay_state rs2 = {0};
+
+			s3_wal_open(local_dev, wal_open_cb, &wctx2);
+			poll_until(&wctx2.done);
+			check("reopen after the post-watermark append",
+			      wctx2.status, 0);
+			if (wctx2.status == 0) {
+				wal = wctx2.wal;
+				rc = sync_replay(wal, &rs2);
+				check("replay post-watermark", rc, 0);
+
+				snprintf(detail, sizeof(detail),
+					 "%" PRIu64 " writes, %" PRIu64
+					 " unmaps, %" PRIu64 " bad payloads",
+					 rs2.writes, rs2.unmaps, rs2.payload_bad);
+				check_true("only the post-watermark write replayed",
+					   rs2.writes == 1 && rs2.unmaps == 0 &&
+					   rs2.payload_bad == 0, detail);
+			}
 		}
 	}
 
