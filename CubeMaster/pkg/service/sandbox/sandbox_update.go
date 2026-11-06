@@ -79,6 +79,10 @@ func Update(ctx context.Context, req *types.UpdateRequest) (rsp *types.Res) {
 		// Client/HTTP cancel must not abort bookkeeping or release the lock
 		// while SAVE/Create/Destroy is still in flight on Cubelet.
 		ctx = context.WithoutCancel(ctx)
+		// Only transition implementations publish success hooks. Generic Cubelet
+		// errors also describe lock contention, and an existing pause binding
+		// may still be CREATING or FAILED. Neither proves a terminal state.
+
 		// Port updates resolve the shared proxy owner, not potentially stale local
 		// inventory or pause bindings. Never enter the opt-in legacy pause bridge.
 		if isPortAction(req.Action) {

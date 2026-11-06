@@ -4,6 +4,7 @@
 
 pub mod types;
 pub mod utils;
+pub mod retained;
 pub type CResult<T> = Result<T, String>;
 pub const PRODUCT_CUBEBOX: &str = "cubebox";
 

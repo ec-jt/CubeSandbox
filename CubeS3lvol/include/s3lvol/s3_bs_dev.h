@@ -181,6 +181,17 @@ int s3_bs_dev_wal_apply(struct spdk_bs_dev *bs_dev,
  */
 void s3_bs_dev_drain(struct spdk_bs_dev *bs_dev, s3_bs_dev_cb cb_fn, void *cb_arg);
 
+/* Owner-thread only. Called after upper producer admission closes. Retain all
+ * superseded objects, stop automatic checkpoint production, but allow already
+ * admitted I/O and the flusher to retire. No destroy or owner release. */
+void s3_bs_dev_source_hold(struct spdk_bs_dev *bs_dev);
+/* Retain superseded objects and require descriptor publication, without
+ * stopping automatic checkpoints or unrelated writers in a shared store. */
+void s3_bs_dev_scoped_source_hold(struct spdk_bs_dev *bs_dev);
+/* Includes accepted lower I/O, parked retries, checkpoint publication and
+ * deferred delete callbacks. Does NOT substitute for upper producer tickets. */
+bool s3_bs_dev_source_busy(struct spdk_bs_dev *bs_dev);
+
 /**
  * Nudge the flusher. Only useful for tests and for shutdown paths that want to
  * start uploads without waiting for the next tick.
@@ -233,6 +244,28 @@ uint32_t s3_bs_dev_get_chunk_size(struct spdk_bs_dev *bs_dev);
  */
 void s3_bs_dev_checkpoint(struct spdk_bs_dev *bs_dev, s3_bs_dev_cb cb_fn,
 			  void *cb_arg);
+
+/**
+ * Temporarily refuse every checkpoint (automatic and explicit).
+ *
+ * Remote-only recovery needs this. It creates the bs_dev, attaches the journal
+ * (which starts the checkpoint poller) and applies the remote checkpoint before
+ * blobstore is loaded. A checkpoint that fired anywhere in that window would
+ * upload a chunk map that is still being rebuilt, advance the generation, and
+ * overwrite the checkpoint pointer and the recovery descriptor -- while the
+ * local device is STAGED. The result is a descriptor naming a checkpoint that
+ * no longer describes the data, i.e. exactly the incoherence recovery exists to
+ * repair.
+ *
+ * While suppressed, s3_bs_dev_checkpoint() reports -EAGAIN rather than
+ * success: "nothing to do" and "not allowed yet" must not be conflated. The
+ * recovery chain clears the flag only after the publication (bdev
+ * registration) has completed, and leaves it set on every failure path.
+ *
+ * \param reason  a static string, kept for the log. May be NULL.
+ */
+void s3_bs_dev_set_checkpoint_suppressed(struct spdk_bs_dev *bs_dev,
+					 bool suppressed, const char *reason);
 
 /**
  * \param local_dev  owns the super block that records checkpoint_gen /

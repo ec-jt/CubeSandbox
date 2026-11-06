@@ -54,14 +54,28 @@ struct s3_flusher {
 
 	struct spdk_poller *poller;
 
-	/* Set by destroy/drain so no new upload is started. */
+	/* Set by retire/destroy so no new upload is started. A drain timeout does
+	 * NOT set it: a drain is an observation, and the flusher keeps retrying
+	 * in the background afterwards (see s3_flusher_drain()). */
 	bool                        stopping;
 
 	s3_flusher_cb drain_cb;
 	void *drain_arg;
 
-	/* Tick at which a drain gives up on dirty data. */
+	/* Tick at which a drain reports -ETIMEDOUT to its caller. Evaluated on
+	 * every poller tick and every completion, whether or not an upload is in
+	 * flight. */
 	uint64_t drain_deadline;
+
+	/* Retirement: the only state that makes s3_flusher_destroy() safe. Fires
+	 * once nothing can call back into the flusher any more, and ONLY from the
+	 * flusher's own poller tick (never inline from kick(), an upload
+	 * completion or a super-sync completion), so the callback may destroy the
+	 * flusher and tear down its owner without any caller frame still using
+	 * either. */
+	s3_flusher_cb retire_cb;
+	void *retire_arg;
+	bool retire_requested;
 
 	/* Highest seq already reported to the WAL, so truncation is only
 	 * attempted when it would actually make progress. */
@@ -83,6 +97,7 @@ struct flush_req {
 };
 
 static void flusher_check_drain(struct s3_flusher *f);
+static void flusher_check_retire(struct s3_flusher *f);
 
 /* ==========================================================================
  * WAL truncation
@@ -272,16 +287,24 @@ flusher_poll(void *arg)
 {
 	struct s3_flusher *f = arg;
 
+	if (f->retire_requested) {
+		/* Retiring: nothing new starts, so all that is left is to notice
+		 * the last completion. The callback may destroy f (and unregister
+		 * this poller, which SPDK allows from inside it); f is not touched
+		 * after it. */
+		flusher_check_retire(f);
+		return SPDK_POLLER_BUSY;
+	}
+
 	if (f->in_flight == 0 && !s3_overlay_has_dirty(f->overlay)) {
 		flusher_check_drain(f);
 		return SPDK_POLLER_IDLE;
 	}
 
 	/* A drain blocked on an unreachable S3 only makes progress through its
-	 * deadline, so it has to be re-checked on every tick, not just when an
-	 * upload completes. */
-	flusher_check_drain(f);
-
+		* deadline, so it has to be re-checked on every tick, not just when an
+		* upload completes -- including while uploads are in flight, which with S3
+		* down is all the time (a failed upload re-queues at once). */
 	s3_flusher_kick(f);
 	return SPDK_POLLER_BUSY;
 }
@@ -290,49 +313,127 @@ flusher_poll(void *arg)
  * Drain
  * ========================================================================== */
 
+/* A drain is an OBSERVATION with a deadline, not a resource transition.
+ *
+ * Success (0) means: nothing dirty, nothing in flight, no super sync running --
+ * everything acknowledged so far is in S3 (INV2). -ETIMEDOUT means the deadline
+ * passed first. It is reported at the deadline even while uploads are still in
+ * flight: with S3 unreachable a failed upload re-queues immediately, so
+ * in_flight never reaches zero and waiting for it made the deadline
+ * unreachable (unload blocked for as long as S3 stayed down).
+ *
+ * Reporting early is safe ONLY because a timeout changes nothing about the
+ * flusher's lifetime: it is not stopped, its uploads keep their pointers into
+ * it, and it keeps retrying in the background. A caller that wants to free the
+ * flusher (or anything an upload completion reaches: the WAL, the chunk map,
+ * the bs_dev) must call s3_flusher_retire() and wait for THAT callback. */
 static void
 flusher_check_drain(struct s3_flusher *f)
 {
 	s3_flusher_cb cb_fn;
 	void *cb_arg;
-	int status = 0;
+	int status;
 
 	if (!f->drain_cb) {
 		return;
 	}
 
-	/* Uploads already running are always waited for: their completions touch
-	 * the flusher, so cutting them loose would be a use-after-free. */
-	if (f->in_flight > 0) {
-		return;
-	}
-
-	/* A super-sync completion also writes into the flusher, so it is waited for
-	 * here for exactly the same reason. It matters for two distinct bugs: the
-	 * completion would land on a freed flusher, and a later s3_wal_close()'s own
-	 * super-sync would race this one for the shared super buffer. */
-	if (f->super_sync_active) {
-		return;
-	}
-
-	if (s3_overlay_has_dirty(f->overlay)) {
-		if (spdk_get_ticks() < f->drain_deadline) {
-			return;
-		}
-		/* Out of time. Stop starting rounds and report it -- the data is
-		 * durable in the log, so the cost is a replay, not a loss. */
-		f->stopping = true;
+	if (f->in_flight == 0 && !f->super_sync_active &&
+	    !s3_overlay_has_dirty(f->overlay)) {
+		status = 0;
+	} else if (spdk_get_ticks() >= f->drain_deadline) {
 		status = -ETIMEDOUT;
-		SPDK_WARNLOG("Flusher drain timed out with dirty chunks left; "
-			     "they stay in the WAL for replay\n");
+		SPDK_WARNLOG("Flusher drain timed out (%u upload(s) in flight, "
+			     "dirty=%d, super_sync=%d); the data stays in the WAL "
+			     "and the flusher keeps retrying\n", f->in_flight,
+			     (int)s3_overlay_has_dirty(f->overlay),
+			     (int)f->super_sync_active);
+	} else {
+		return;
 	}
 
+	/* Cleared before the call so the callback fires exactly once, even if it
+	 * starts another drain or a late completion re-enters here. */
 	cb_fn  = f->drain_cb;
 	cb_arg = f->drain_arg;
 	f->drain_cb  = NULL;
 	f->drain_arg = NULL;
 
 	cb_fn(cb_arg, status);
+}
+
+/* Retirement completes once nothing can call back into the flusher: no upload
+ * in flight and no super sync running. stopping is already set, so a failed
+ * upload is not re-queued and in_flight only goes down. Called only from
+ * flusher_poll(), as its last touch of \c f: the callback may destroy it. */
+static void
+flusher_check_retire(struct s3_flusher *f)
+{
+	s3_flusher_cb cb_fn;
+	void *cb_arg;
+	int status;
+
+	if (!f->retire_requested || f->in_flight > 0 || f->super_sync_active) {
+		return;
+	}
+
+	status = s3_overlay_has_dirty(f->overlay) ? -EAGAIN : 0;
+	cb_fn  = f->retire_cb;
+	cb_arg = f->retire_arg;
+	f->retire_requested = false;
+	f->retire_cb  = NULL;
+	f->retire_arg = NULL;
+
+	if (cb_fn) {
+		cb_fn(cb_arg, status);
+	}
+}
+
+void
+s3_flusher_retire(struct s3_flusher *f, s3_flusher_cb cb_fn, void *cb_arg)
+{
+	if (!f) {
+		if (cb_fn) {
+			cb_fn(cb_arg, -EINVAL);
+		}
+		return;
+	}
+	if (f->retire_requested) {
+		/* One retirement: a second would race the first for the destroy. */
+		if (cb_fn) {
+			cb_fn(cb_arg, -EBUSY);
+		}
+		return;
+	}
+
+	f->stopping = true;
+	f->retire_requested = true;
+	f->retire_cb = cb_fn;
+	f->retire_arg = cb_arg;
+
+	/* A drain still waiting has to be answered now: no new round will start,
+	 * so it could only time out. */
+	if (f->drain_cb) {
+		s3_flusher_cb d_fn = f->drain_cb;
+		void *d_arg = f->drain_arg;
+
+		f->drain_cb = NULL;
+		f->drain_arg = NULL;
+		d_fn(d_arg, (f->in_flight == 0 && !f->super_sync_active &&
+			     !s3_overlay_has_dirty(f->overlay)) ? 0 : -ETIMEDOUT);
+	}
+
+	/* Deliberately NOT completed here, even when already idle: the retire
+	 * callback is allowed to destroy the flusher and its owner, and this
+	 * function may be on a stack that still uses them (e.g. from a drain
+	 * callback inside s3_flusher_kick()). Completion happens on the next
+	 * poller tick at the earliest -- see flusher_poll(). */
+}
+
+bool
+s3_flusher_is_retiring(const struct s3_flusher *f)
+{
+	return f && f->stopping;
 }
 
 void
@@ -342,6 +443,14 @@ s3_flusher_drain(struct s3_flusher *f, uint64_t timeout_us,
 	if (!f) {
 		if (cb_fn) {
 			cb_fn(cb_arg, -EINVAL);
+		}
+		return;
+	}
+	if (f->stopping) {
+		/* Retiring: no round will be started again, so a drain could only
+		 * report a timeout. Say so directly. */
+		if (cb_fn) {
+			cb_fn(cb_arg, -ESHUTDOWN);
 		}
 		return;
 	}
@@ -366,7 +475,8 @@ s3_flusher_drain(struct s3_flusher *f, uint64_t timeout_us,
 	f->drain_cb  = cb_fn;
 	f->drain_arg = cb_arg;
 
-	/* Push everything through rather than waiting for the poller tick. */
+	/* Push everything through rather than waiting for the poller tick. Cannot
+	 * destroy f: retire_requested is false here (stopping implies it). */
 	s3_flusher_kick(f);
 }
 
@@ -424,7 +534,8 @@ s3_flusher_destroy(struct s3_flusher *f)
 	f->stopping = true;
 
 	/* An upload completion would call back into a freed flusher. The caller
-	 * has to drain first; same reasoning as s3_chunk_map_destroy(). */
+	 * has to RETIRE first (s3_flusher_retire()); a drain is not enough, since
+	 * a timed-out drain returns with uploads still in flight. */
 	assert(f->in_flight == 0);
 	if (f->in_flight != 0) {
 		SPDK_ERRLOG("s3_flusher_destroy() called with %u uploads in "

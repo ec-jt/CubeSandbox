@@ -25,6 +25,9 @@ SRCS = s3_bs_dev.c \
        s3_checkpoint.c \
        s3_journal.c \
        s3_owner.c \
+       s3_recovery.c \
+       s3_recovery_finalize.c \
+       s3_recovery_unwind.c \
        s3_gc.c \
        s3_export.c \
        s3_export_ref.c \

@@ -1,0 +1,58 @@
+# Copyright (c) 2026 Tencent Inc.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Standalone build for s3_recovery_claim_test.c.
+#
+# Same technique as Makefile.s3_recovery_blank_scan: the scanner is compiled
+# with function/data sections and linked with --gc-sections so the unrelated
+# recovery functions in s3_recovery.c are discarded, and every SPDK bdev /
+# channel / DMA / claim symbol the claim and scan paths use is redirected with
+# --wrap to the mock in the test. No SPDK archive, bdev module or hardware is
+# required.
+#
+# Inside the offline builder container the project is at /work:
+#   make -f /work/test/integration/Makefile.s3_recovery_claim \
+#        WORK=/work TARGET=/evid/s3_recovery_claim_test
+#
+# Defaults build the working-tree scanner into /tmp.
+
+CC ?= cc
+WORK ?= /work
+
+CFLAGS ?= -I$(WORK)/include -I$(WORK)/deps/spdk/include \
+	-Wall -Wextra -Wno-unused-parameter -Werror \
+	-DDEBUG -g3 -O0 -D_GNU_SOURCE -fno-strict-aliasing \
+	-ffunction-sections -fdata-sections
+
+SCANNER_SRC ?= $(WORK)/lib/s3bsdev/s3_recovery.c
+TEST_SRC ?= $(WORK)/test/integration/s3_recovery_claim_test.c
+TARGET ?= /tmp/s3_recovery_claim_test
+OBJ := $(TARGET).scanner.o
+
+WRAPS := \
+	-Wl,--wrap=spdk_bdev_open_ext \
+	-Wl,--wrap=spdk_bdev_close \
+	-Wl,--wrap=spdk_bdev_desc_get_bdev \
+	-Wl,--wrap=spdk_bdev_get_block_size \
+	-Wl,--wrap=spdk_bdev_get_num_blocks \
+	-Wl,--wrap=spdk_bdev_get_name \
+	-Wl,--wrap=spdk_bdev_get_io_channel \
+	-Wl,--wrap=spdk_put_io_channel \
+	-Wl,--wrap=spdk_bdev_read \
+	-Wl,--wrap=spdk_bdev_free_io \
+	-Wl,--wrap=spdk_dma_zmalloc \
+	-Wl,--wrap=spdk_dma_free \
+	-Wl,--wrap=spdk_bdev_claim_opts_init \
+	-Wl,--wrap=spdk_bdev_module_claim_bdev_desc \
+	-Wl,--wrap=spdk_bdev_module_release_bdev \
+	-Wl,--wrap=spdk_strerror \
+	-Wl,--wrap=spdk_log
+
+all: $(TARGET)
+
+$(TARGET): $(SCANNER_SRC) $(TEST_SRC)
+	$(CC) $(CFLAGS) -c $(SCANNER_SRC) -o $(OBJ)
+	$(CC) $(CFLAGS) $(TEST_SRC) $(OBJ) $(WRAPS) -Wl,--gc-sections -o $(TARGET)
+
+clean:
+	rm -f $(OBJ) $(TARGET)

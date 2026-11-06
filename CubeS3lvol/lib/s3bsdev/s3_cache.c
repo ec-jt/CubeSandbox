@@ -120,8 +120,54 @@ struct s3_cache {
 	uint32_t                 fills_in_flight;
 	uint32_t                 reads_in_flight;
 
+	/* Cache frames currently on the call stack: a submission into the bdev
+	 * layer (which may complete inline) or a user read callback (which may
+	 * re-enter). While non-zero the cache is not considered quiesced, so
+	 * s3_cache_quiesce() never answers "done" to a caller that would then
+	 * free the cache under a frame still about to touch it, and the
+	 * deferred quiesce callback is only ever fired from the outermost
+	 * frame, as its very last action. */
+	uint32_t                 frames;
+
+	/* Teardown state. One way: once set, no new read or populate starts.
+	 * quiesce_cb is the single pending notification; it is cleared before
+	 * it is invoked, so it fires at most once. No allocation is involved
+	 * anywhere on this path. */
+	bool                     quiescing;
+	s3_cache_quiesce_cb      quiesce_cb;
+	void                    *quiesce_arg;
+
 	struct s3_cache_stats    stats;
 };
+
+static inline bool
+cache_idle(const struct s3_cache *cache)
+{
+	return cache->fills_in_flight == 0 && cache->reads_in_flight == 0 &&
+	       cache->frames == 0;
+}
+
+/* Fire the pending quiesce notification if the cache just became idle.
+	*
+	* MUST be the last thing its caller does with \p cache: the callback is
+	* allowed to free it. Every caller is an outermost cache frame (frames was
+	* just decremented to its entry value), and returns immediately after. */
+static void
+cache_maybe_quiesced(struct s3_cache *cache)
+{
+	s3_cache_quiesce_cb cb;
+	void *arg;
+
+	if (!cache->quiescing || !cache->quiesce_cb || !cache_idle(cache)) {
+		return;
+	}
+
+	cb = cache->quiesce_cb;
+	arg = cache->quiesce_arg;
+	cache->quiesce_cb = NULL;
+	cache->quiesce_arg = NULL;
+	cb(arg);
+}
 
 /* ==========================================================================
  * Residency bitmap
@@ -386,9 +432,22 @@ s3_cache_destroy(struct s3_cache *cache)
 
 	/* In-flight I/O holds a pointer into slots[] and a staging buffer, so
 	 * tearing down under it would be a use-after-free. Callers reach this
-	 * only after the flusher and the read path are quiesced. */
-	assert(cache->fills_in_flight == 0);
-	assert(cache->reads_in_flight == 0);
+	 * only after s3_cache_quiesce() reported idle (or its callback fired).
+	 *
+	 * Checked at runtime too, not only asserted: in a release build the
+	 * assert vanishes, and leaking the cache is strictly better than freeing
+	 * it under a completion that will write through it. */
+	assert(cache_idle(cache));
+	assert(cache->quiesce_cb == NULL);
+	if (!cache_idle(cache) || cache->quiesce_cb != NULL) {
+		SPDK_ERRLOG("s3_cache_destroy with I/O outstanding (%u fills, %u "
+			    "reads, %u frames%s); leaking the cache rather than "
+			    "freeing it under its own completions\n",
+			    cache->fills_in_flight, cache->reads_in_flight,
+			    cache->frames,
+			    cache->quiesce_cb ? ", quiesce pending" : "");
+		return;
+	}
 
 	if (cache->staging) {
 		for (uint32_t i = 0; i < S3_CACHE_STAGING_BUFS; i++) {
@@ -463,8 +522,15 @@ cache_read_done(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
 		}
 	}
 
+	/* The user callback may re-enter (reissue to S3, start teardown, ask
+	 * to quiesce). Counting it as a frame keeps quiesce from reporting
+	 * idle -- and so keeps the cache alive -- until it has returned. */
+	cache->frames++;
 	rd->cb_fn(rd->cb_arg, status);
+	cache->frames--;
 	free(rd);
+
+	cache_maybe_quiesced(cache);   /* last: may free the cache */
 }
 
 int
@@ -482,6 +548,14 @@ s3_cache_read(struct s3_cache *cache, uint64_t chunk_index,
 		return -ENOENT;
 	}
 	assert(cache->owner_thread == spdk_get_thread());
+
+	if (cache->quiescing) {
+		/* Teardown has begun: nothing new may start, not even the
+		 * device-free past-the-end answer. A miss sends the caller to S3,
+		 * which is always correct. */
+		cache->stats.misses++;
+		return -ENOENT;
+	}
 	assert(offset_in_chunk % cache->block_size == 0);
 	assert(length % cache->block_size == 0);
 	assert(offset_in_chunk + length <= cache->chunk_size);
@@ -512,7 +586,10 @@ s3_cache_read(struct s3_cache *cache, uint64_t chunk_index,
 		 * completion path. */
 		memset(buf, 0, length);
 		cache->stats.hits++;
+		cache->frames++;
 		cb_fn(cb_arg, 0);
+		cache->frames--;
+		cache_maybe_quiesced(cache);   /* last */
 		return 0;
 	}
 
@@ -559,23 +636,35 @@ s3_cache_read(struct s3_cache *cache, uint64_t chunk_index,
 	slot_lru_remove(cache, slot);
 	cache->reads_in_flight++;
 
+	/* Counted before submitting: the completion may run inline, and nothing
+	 * after the submit may assume the read is still outstanding. */
+	cache->stats.hits++;
+	cache->stats.bytes_served += readable;
+
+	cache->frames++;
 	rc = spdk_bdev_read(cache->desc, cache->ch, buf,
 			    slot_offset(cache, slot) + offset_in_chunk,
 			    read_len, cache_read_done, rd);
 	if (rc != 0) {
+		/* Not submitted, so cache_read_done will never run for rd. */
 		slot->pins--;
 		slot_lru_touch(cache, slot);
 		cache->reads_in_flight--;
 		free(rd);
 		/* Almost always -ENOMEM from the bdev_io pool. Reported as a miss
 		 * so the caller goes to S3 instead of failing the user's read. */
+		cache->stats.hits--;
+		cache->stats.bytes_served -= readable;
 		cache->stats.misses++;
+		cache->frames--;
+		cache_maybe_quiesced(cache);   /* last */
 		return -ENOENT;
 	}
+	cache->frames--;
 
-	cache->stats.hits++;
-	cache->stats.bytes_served += readable;
-
+	/* An inline completion whose user callback asked to quiesce is answered
+	 * here, from the outermost frame, and nothing below touches cache. */
+	cache_maybe_quiesced(cache);
 	return 0;
 }
 
@@ -627,6 +716,8 @@ cache_fill_done(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
 	cache->fills_in_flight--;
 
 	free(fill);
+
+	cache_maybe_quiesced(cache);   /* last: may free the cache */
 }
 
 void
@@ -646,6 +737,13 @@ s3_cache_populate(struct s3_cache *cache, uint64_t chunk_index,
 	}
 	assert(cache->owner_thread == spdk_get_thread());
 	assert(offset_in_chunk % cache->block_size == 0);
+
+	if (cache->quiescing) {
+		/* Teardown has begun: a new fill would be a new write against a
+		 * descriptor the owner is about to close. */
+		cache->stats.populates_dropped++;
+		return;
+	}
 
 	if (chunk_index >= cache->num_chunks ||
 	    object_valid_bytes > cache->chunk_size ||
@@ -774,11 +872,13 @@ s3_cache_populate(struct s3_cache *cache, uint64_t chunk_index,
 	slot_lru_remove(cache, slot);
 	cache->fills_in_flight++;
 
+	cache->frames++;
 	rc = spdk_bdev_write(cache->desc, cache->ch, staging->buf,
 			     slot_offset(cache, slot) +
 			     (uint64_t)first_block * cache->block_size,
 			     write_len, cache_fill_done, fill);
 	if (rc != 0) {
+		/* Not submitted, so cache_fill_done will never run for fill. */
 		cache->fills_in_flight--;
 		slot->fills--;
 		if (slot->fills == 0 && slot->pins == 0 &&
@@ -791,6 +891,9 @@ s3_cache_populate(struct s3_cache *cache, uint64_t chunk_index,
 		free(fill);
 		cache->stats.populates_dropped++;
 	}
+	cache->frames--;
+
+	cache_maybe_quiesced(cache);   /* last */
 }
 
 void
@@ -824,7 +927,33 @@ s3_cache_is_quiesced(const struct s3_cache *cache)
 		return true;
 	}
 
-	return cache->fills_in_flight == 0 && cache->reads_in_flight == 0;
+	return cache_idle(cache);
+}
+
+int
+s3_cache_quiesce(struct s3_cache *cache, s3_cache_quiesce_cb cb_fn,
+		 void *cb_arg)
+{
+	if (!cache || !cb_fn) {
+		return -EINVAL;
+	}
+
+	/* One way, and set before anything else: from here no read or populate
+	 * starts, so the counters can only fall. */
+	cache->quiescing = true;
+
+	if (cache->quiesce_cb) {
+		/* Someone is already waiting; their callback will fire. */
+		return -EBUSY;
+	}
+	if (cache_idle(cache)) {
+		/* Never stored, never called: the caller continues inline. */
+		return 0;
+	}
+
+	cache->quiesce_cb = cb_fn;
+	cache->quiesce_arg = cb_arg;
+	return -EINPROGRESS;
 }
 
 void

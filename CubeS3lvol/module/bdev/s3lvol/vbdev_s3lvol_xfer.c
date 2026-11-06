@@ -51,6 +51,21 @@
 #include "s3lvol/s3_client.h"
 
 #include "vbdev_s3lvol.h"
+#include "source_control_ticket.h"
+#include "export_admission_io.h"
+
+/* Serializes admission/detach with local publication and store lifetime. */
+struct admission_work {
+	struct s3lvol_lvstore *lvs;
+	TAILQ_ENTRY(admission_work) link;
+};
+static TAILQ_HEAD(, admission_work) g_admission_work = TAILQ_HEAD_INITIALIZER(g_admission_work);
+static bool admission_busy(struct s3lvol_lvstore *lvs)
+{
+	struct admission_work *w;
+	TAILQ_FOREACH(w, &g_admission_work, link) if (w->lvs == lvs) return true;
+	return false;
+}
 
 /* Imports are held in memory and in one S3 object per lvstore. The cap exists
  * because that object is read into a fixed decoder table; it is far above what
@@ -1146,6 +1161,25 @@ export_rewrite_pins_snapshot(struct s3lvol_lvstore *lvs, const char *snapshot)
 }
 
 bool
+s3lvol_export_work_busy(struct s3lvol_lvstore *lvs)
+{
+	struct export_inflight *inf;
+	struct export_rewrite *rw;
+	if (admission_busy(lvs)) return true;
+	TAILQ_FOREACH(inf, &g_inflight, link) {
+		if (inf->lvs == lvs) {
+			return true;
+		}
+	}
+	TAILQ_FOREACH(rw, &g_export_rewrites, link) {
+		if (s3lvol_export_find(lvs, rw->uuid_str)) {
+			return true;
+		}
+	}
+	return false;
+}
+
+bool
 s3lvol_export_inflight_pinning(struct s3lvol_lvstore *lvs,
 			       const char *snapshot_name)
 {
@@ -1188,6 +1222,9 @@ s3lvol_export_inflight_pinning(struct s3lvol_lvstore *lvs,
 
 struct export_ctx {
 	struct s3lvol_lvstore    *lvs;
+	bool                     release_safe;
+	char                     admission_key[S3_EXPORT_KEY_MAX];
+	uint64_t                 admission_size;
 	struct spdk_lvol         *snapshot;
 
 	struct spdk_io_channel   *channel;
@@ -1233,9 +1270,8 @@ export_report(struct export_ctx *ctx, int status)
 	 * are not redundant: that one says which step, this one says which export it
 	 * took down. */
 	if (status != 0) {
-		SPDK_ERRLOG("Export %s of snapshot '%s' failed: %s. The uuid is dead -- "
-			    "nothing was recorded under it, so asking about it reports no "
-			    "such export; re-export to try again.\n",
+		SPDK_ERRLOG("Export %s of snapshot '%s' failed: %s. Any durable reservation is retained; "
+			    "do not infer that remote dependencies are absent.\n",
 			    ctx->info.export_uuid, ctx->info.snapshot_name,
 			    spdk_strerror(-status));
 	} else {
@@ -1264,16 +1300,66 @@ export_report(struct export_ctx *ctx, int status)
 }
 
 static void
+export_admission_created(void *arg, const struct ea_doc *doc, int status)
+{
+	struct export_ctx *ctx = arg;
+	if (status) export_report(ctx, status);
+	else export_drain(ctx);
+}
+
+static void
+export_legacy_admission_checked(void *arg, int status)
+{
+	struct export_ctx *ctx = arg;
+	if (status == -ENOENT) export_drain(ctx);
+	else export_report(ctx, status ? status : -EBUSY);
+}
+
+static void
+export_reserved(void *cb_arg, int status)
+{
+	struct export_ctx *ctx = cb_arg;
+	if (status != 0) {
+		export_report(ctx, status);
+		return;
+	}
+	if (ctx->release_safe) {
+		struct ea_doc doc = {0};
+		struct spdk_uuid id, nonce;
+		struct spdk_lvol_store *store = s3lvol_lvstore_get_lvs(ctx->lvs);
+		uint64_t chunks = spdk_blob_get_num_io_units(ctx->snapshot->blob) *
+			S3LVOL_BLOCK_SIZE / spdk_bs_get_cluster_size(store->blobstore);
+		unsigned i;
+		spdk_uuid_parse(&id, ctx->info.export_uuid);
+		spdk_uuid_generate(&nonce);
+		memcpy(doc.magic, "S3EA0001", 8);
+		memcpy(doc.nonce, &nonce, 16);
+		memcpy(doc.export_id, &id, 16);
+		memcpy(doc.owner_id, &store->uuid, 16);
+		snprintf(doc.prefix, sizeof(doc.prefix), "%s", s3lvol_lvstore_get_name(ctx->lvs));
+		for (i = 0; i < 8; i++) doc.chunks_be[7-i] = chunks >> (8*i);
+		doc.state = EA_OPEN;
+		int rc = admission_start(s3lvol_lvstore_get_client(ctx->lvs), ctx->info.export_uuid,
+			EA_CLOSE, NULL, &doc, export_admission_created, ctx);
+		if (rc) export_report(ctx, rc);
+	} else {
+		snprintf(ctx->admission_key, sizeof(ctx->admission_key),
+			 "exports/admission/%s", ctx->info.export_uuid);
+		int rc = s3_head(s3lvol_lvstore_get_client(ctx->lvs), ctx->admission_key,
+			&ctx->admission_size, export_legacy_admission_checked, ctx);
+		if (rc) export_report(ctx, rc);
+	}
+}
+
+static void
 export_recorded(void *cb_arg, int status)
 {
 	struct export_ctx *ctx = cb_arg;
 
 	if (status != 0) {
-		/* The manifest is up, but this node has no durable record that it owes
-		 * the snapshot to anybody. Reported as a failed export, because the
-		 * alternative is telling the caller it worked and then deleting that
-		 * snapshot after the next restart. The unrecorded manifest is an
-		 * orphan for GC/operator cleanup. */
+		/* The prepublication reservation remains durable and pinned. Readers may
+		 * already cache this manifest. Reconcile explicitly; never orphan-clean
+		 * it based on the failed final write or a later manifest 404. */
 		SPDK_ERRLOG("Export %s is published but could not be recorded; treating "
 			    "the export as failed\n", ctx->info.export_uuid);
 	}
@@ -1300,20 +1386,13 @@ export_copy_done(void *cb_arg, struct s3_export_manifest *m, int status)
 	ctx->info.zero_copy = (m->layout == S3_EXPORT_LAYOUT_REF);
 	ctx->info.expires_at = m->expires_at;
 
-	/* Recorded once the manifest is durable, and before the caller is told the
-	 * export exists. In between is the only window in which this node could
-	 * forget the obligation across a restart, and it is one PUT wide. */
-	exp = s3lvol_export_add(ctx->lvs, m, ctx->info.snapshot_name);
+	/* The reservation was durably saved BEFORE publication. On any later
+	 * failure keep it: a remote importer may already have cached the manifest. */
+	exp = s3lvol_export_find(ctx->lvs, ctx->info.export_uuid);
+	assert(exp != NULL);
+	rc = s3lvol_export_publication_save(exp, m, export_recorded, ctx);
 	s3_export_manifest_unref(m);
-
-	if (!exp) {
-		export_report(ctx, -ENOMEM);
-		return;
-	}
-
-	rc = s3lvol_export_registry_save(ctx->lvs, export_recorded, ctx);
 	if (rc != 0) {
-		s3lvol_export_forget(exp);
 		export_report(ctx, rc);
 	}
 }
@@ -1566,6 +1645,7 @@ export_ref(struct export_ctx *ctx)
 	char esnap_uuid[SPDK_UUID_STRING_LEN];
 	uint32_t chain_len = 0;
 	int rc;
+	if (ctx->release_safe) { export_copy(ctx); return; }
 
 	rc = export_build_chain(ctx->lvs, ctx->snapshot->blob, chain,
 				SPDK_COUNTOF(chain), &chain_len,
@@ -1782,6 +1862,7 @@ export_copy(struct export_ctx *ctx)
 	}
 
 	opts.client= s3lvol_lvstore_get_client(ctx->lvs);
+	opts.release_safe = ctx->release_safe;
 	opts.prefix       = s3lvol_lvstore_get_name(ctx->lvs);
 	opts.uuid_str     = ctx->info.export_uuid;
 	opts.blob         = ctx->snapshot->blob;
@@ -1800,16 +1881,26 @@ export_copy(struct export_ctx *ctx)
 		export_report(ctx, rc);
 	}
 }
-int
-s3lvol_lvol_export(struct s3lvol_lvstore *lvs, struct spdk_lvol *snapshot,
-		   const char *export_uuid, char *uuid_out, size_t uuid_out_len,
-		   s3lvol_export_cb cb_fn, void *cb_arg)
+static int
+lvol_export_start(struct s3lvol_lvstore *lvs, struct spdk_lvol *snapshot,
+		       const char *export_uuid, char *uuid_out, size_t uuid_out_len,
+		       s3lvol_export_cb cb_fn, void *cb_arg, bool release_safe)
 {
 	struct export_ctx *ctx;
 	struct spdk_uuid uuid;
 
 	if (!lvs || !snapshot || !snapshot->blob) {
 		return -EINVAL;
+	}
+	if (!s3lvol_lvstore_xfer_allowed(lvs)) {
+		SPDK_NOTICELOG("Export admission snapshot '%s': store lifecycle not ready\n",
+			       snapshot->name);
+		return -EBUSY;
+	}
+	if (s3lvol_export_registry_busy(lvs)) {
+		SPDK_NOTICELOG("Export admission snapshot '%s': registry save in progress\n",
+			       snapshot->name);
+		return -EBUSY;
 	}
 	if (snapshot->lvol_store != s3lvol_lvstore_get_lvs(lvs)) {
 		SPDK_ERRLOG("lvol '%s' does not belong to lvstore '%s'\n",
@@ -1851,6 +1942,11 @@ s3lvol_lvol_export(struct s3lvol_lvstore *lvs, struct spdk_lvol *snapshot,
 	published = s3lvol_export_find_for_snapshot(lvs, snapshot->name);
 	if (published) {
 		s3lvol_export_get(published, &info);
+		if (info.publication_pending) {
+			SPDK_NOTICELOG("Export admission snapshot '%s': publication pending\n",
+				       snapshot->name);
+			return -EBUSY;
+		}
 		if (export_uuid && export_uuid[0] != '\0' &&
 		    strcmp(info.export_uuid, export_uuid) != 0) {
 			SPDK_ERRLOG("snapshot '%s' is already exported as %s, "
@@ -1878,6 +1974,7 @@ s3lvol_lvol_export(struct s3lvol_lvstore *lvs, struct spdk_lvol *snapshot,
 		return -ENOMEM;
 	}
 	ctx->lvs      = lvs;
+	ctx->release_safe = release_safe;
 	ctx->snapshot = snapshot;
 	ctx->cb_fn    = cb_fn;
 	ctx->cb_arg   = cb_arg;
@@ -1935,6 +2032,13 @@ s3lvol_lvol_export(struct s3lvol_lvstore *lvs, struct spdk_lvol *snapshot,
 		return -EBUSY;
 	}
 
+	if (s3lvol_export_work_busy(lvs)) {
+		SPDK_NOTICELOG("Export admission snapshot '%s': store export work in progress\n",
+			       snapshot->name);
+		free(ctx);
+		return -EBUSY;
+	}
+
 	/* Registered before the drain, which can complete synchronously: the export
 	 * has to be observable, and the snapshot protected, from here on. */
 	if (export_inflight_add(lvs, ctx->info.export_uuid, snapshot->name) != 0) {
@@ -1953,8 +2057,47 @@ s3lvol_lvol_export(struct s3lvol_lvstore *lvs, struct spdk_lvol *snapshot,
 		snprintf(uuid_out, uuid_out_len, "%s", ctx->info.export_uuid);
 	}
 
-	export_drain(ctx);
+	/* A conservative REF reservation closes publish-before-registry crashes.
+	 * Only successful first publication as dense can drop the source pin. */
+	struct s3_export_manifest reservation = {0};
+	struct s3lvol_export *reserved;
+	int rc = export_fill_src(ctx, &reservation.src);
+	if (rc != 0) {
+		export_report(ctx, rc);
+		return 0;
+	}
+	reservation.layout = S3_EXPORT_LAYOUT_REF;
+	snprintf(reservation.uuid_str, sizeof(reservation.uuid_str), "%s",
+		 ctx->info.export_uuid);
+	reserved = s3lvol_export_add(lvs, &reservation, snapshot->name);
+	if (!reserved) {
+		export_report(ctx, -ENOMEM);
+		return 0;
+	}
+	rc = s3lvol_export_registry_save(lvs, export_reserved, ctx);
+	if (rc != 0) {
+		export_report(ctx, rc);
+	}
 	return 0;
+}
+
+int
+s3lvol_lvol_export(struct s3lvol_lvstore *lvs, struct spdk_lvol *snapshot,
+		   const char *uuid, char *out, size_t len, s3lvol_export_cb cb, void *arg)
+{
+	if (s3lvol_lvol_source_held(snapshot)) return -EBUSY;
+	return lvol_export_start(lvs, snapshot, uuid, out, len, cb, arg, false);
+}
+
+int
+s3lvol_lvol_export_safe(struct s3lvol_lvstore *lvs, struct spdk_lvol *snapshot,
+			char *out, size_t len, s3lvol_export_cb cb, void *arg)
+{
+	if (s3lvol_lvol_source_held(snapshot)) return -EBUSY;
+	/* A fresh UUID is mandatory: never bless a previously visible manifest. */
+	if (s3lvol_export_find_for_snapshot(lvs, snapshot->name)) return -EEXIST;
+	if (export_inflight_find_by_snapshot(lvs, snapshot->name)) return -EBUSY;
+	return lvol_export_start(lvs, snapshot, NULL, out, len, cb, arg, true);
 }
 
 /* ==========================================================================
@@ -1965,16 +2108,10 @@ s3lvol_lvol_export(struct s3lvol_lvstore *lvs, struct spdk_lvol *snapshot,
  * them, and the pin has no expiry that means anything -- an importer renewing its
  * lease keeps the snapshot undeletable for as long as it likes.
  *
- * Materialising is the way out. The snapshot is read once, uploaded as the
- * export's own copies, and the manifest republished as dense with a higher
- * generation. The export then owes nothing and the snapshot becomes deletable.
- *
- * Importers are not notified and need not be. They keep reading the old objects
- * until those disappear with the snapshot; the resulting 404 makes them refetch,
- * find the higher generation and carry on against the copies. Which is why the
- * ordering matters in one direction only: the new manifest must exist before the
- * old objects go, or a reader refetches into the very manifest that sent it to a
- * missing key.
+ * Materialising preserves the exported data as copies and publishes a higher
+ * generation. It does not discharge REF history: derived manifests may cache
+ * original refs and refetch their own (unchanged) manifest rather than ours.
+ * Keep the source obligation until a durable detach/lineage protocol exists.
  * ========================================================================== */
 
 struct materialise_ctx {
@@ -2032,7 +2169,7 @@ materialise_saved(void *cb_arg, int status)
 			    ctx->uuid_str, spdk_strerror(-status), ctx->snapshot);
 	} else {
 		SPDK_NOTICELOG("export %s is now a copy at generation %u; snapshot "
-			       "'%s' is no longer pinned by it\n",
+			       "'%s' retains its durable source obligation\n",
 			       ctx->uuid_str, ctx->generation, ctx->snapshot);
 	}
 
@@ -2057,7 +2194,7 @@ materialise_done(void *cb_arg, struct s3_export_manifest *m, int status)
 	ctx->generation = m->generation;
 	s3_export_manifest_unref(m);
 
-	/* The registry entry follows the manifest, not the other way round: until
+	/* For a rewrite the registry follows the manifest: until
 	 * the manifest is published the export still references the snapshot, and a
 	 * registry that said otherwise would let the snapshot be deleted under a
 	 * reader. */
@@ -2085,6 +2222,8 @@ int
 s3lvol_export_materialise(struct s3lvol_lvstore *lvs, const char *export_uuid,
 			  spdk_lvol_op_complete cb_fn, void *cb_arg)
 {
+	if (s3lvol_lvstore_source_closed(lvs)) return -ESHUTDOWN;
+
 	struct spdk_lvol_store *store;
 	struct s3lvol_export_entry entry;
 	struct materialise_ctx *ctx;
@@ -2093,6 +2232,11 @@ s3lvol_export_materialise(struct s3lvol_lvstore *lvs, const char *export_uuid,
 	struct s3_export_opts opts = {0};
 	uint64_t cluster_size;
 	int rc;
+
+	if (!s3lvol_lvstore_xfer_allowed(lvs) || s3lvol_export_work_busy(lvs) ||
+	    s3lvol_export_registry_busy(lvs)) {
+		return -EBUSY;
+	}
 
 	if (!lvs || !export_uuid) {
 		return -EINVAL;
@@ -2105,6 +2249,13 @@ s3lvol_export_materialise(struct s3lvol_lvstore *lvs, const char *export_uuid,
 		return -ENOENT;
 	}
 	s3lvol_export_get(exp, &entry);
+	if (s3lvol_lvol_source_held(s3lvol_lvol_find(lvs, entry.snapshot))) return -EBUSY;
+	if (entry.publication_pending) {
+		/* The reservation may never have reached S3. Do not publish through
+		 * a different entry point without its durable predecessor. */
+		return -EBUSY;
+	}
+
 
 	if (!entry.is_ref) {
 		/* Already holds its own copies, so there is nothing to free the
@@ -2255,7 +2406,8 @@ export_snapshot_deletable(struct s3lvol_lvstore *lvs, const char *snapshot_name)
 		return false;
 	}
 
-	if (s3lvol_export_inflight_pinning(owner, lvol->name)) {
+	if (!s3lvol_lvstore_xfer_allowed(owner) ||
+	    s3lvol_export_inflight_pinning(owner, lvol->name)) {
 		return false;
 	}
 
@@ -2324,7 +2476,8 @@ s3lvol_export_query(const char *export_uuid,
 		exp = s3lvol_export_find(lvs, export_uuid);
 		if (exp) {
 			s3lvol_export_get(exp, &entry);
-			*state = S3LVOL_EXPORT_STATE_DONE;
+			*state = entry.publication_pending ? S3LVOL_EXPORT_STATE_INPROGRESS :
+				S3LVOL_EXPORT_STATE_DONE;
 			*deletable = export_snapshot_deletable(lvs, entry.snapshot);
 			return 0;
 		}
@@ -2360,6 +2513,9 @@ snapshot_export_state(struct s3lvol_lvstore *lvs, const char *snapshot_name)
 
 		s3lvol_export_get(exp, &entry);
 		if (strcmp(entry.snapshot, snapshot_name) == 0) {
+			if (entry.publication_pending) {
+				return S3LVOL_EXPORT_STATE_INPROGRESS;
+			}
 			found = true;
 			break;
 		}
@@ -2417,8 +2573,92 @@ s3lvol_snapshot_query(const char *snapshot_name,
  * Import
  * ========================================================================== */
 
+/* Blob-local and independent of the esnap/lease registry. Identity binding also
+ * prevents a snapshot or clone inheriting an xattr from claiming the import.
+ * Numeric fields are little-endian; the fixed v1 record fits one metadata page.
+ * This is provenance under a trusted single-owner host, not a content hash,
+ * checkpoint commit certificate, or retention fence. */
+#define IMPORT_ORIGIN_XATTR "rcow.import_origin.v1"
+struct import_origin_v1 {
+	uint32_t version, manifest_version, generation, cluster_size, chunk_size, block_size;
+	uint64_t blob_id, source_blob_id, size_bytes;
+	char volume_uuid[SPDK_UUID_STRING_LEN];
+	char lvstore_uuid[SPDK_UUID_STRING_LEN];
+	char export_uuid[SPDK_UUID_STRING_LEN];
+	char snapshot_uuid[SPDK_UUID_STRING_LEN];
+	char endpoint[S3_EXPORT_ENDPOINT_MAX], bucket[S3_EXPORT_BUCKET_MAX];
+	char prefix[S3_EXPORT_PREFIX_MAX], lvs_name[S3_EXPORT_NAME_MAX];
+	char snapshot[S3_EXPORT_NAME_MAX];
+};
+
+static int
+import_origin_read(struct spdk_lvol *lvol, struct import_origin_v1 *o)
+{
+	const void *value;
+	size_t len;
+	char store_uuid[SPDK_UUID_STRING_LEN];
+	int rc;
+	if (!lvol || !lvol->blob) return -EINVAL;
+	if (admission_busy(s3lvol_lvstore_of_lvol(lvol))) return -EBUSY;
+	rc = spdk_blob_get_xattr_value(lvol->blob, IMPORT_ORIGIN_XATTR, &value, &len);
+	if (rc) return -ENODATA;
+	if (len != sizeof(*o)) return -EINVAL;
+	memcpy(o, value, sizeof(*o));
+#define ORIGIN_STRING(field) do { if (!memchr(o->field, 0, sizeof(o->field))) return -EINVAL; } while (0)
+	ORIGIN_STRING(volume_uuid); ORIGIN_STRING(lvstore_uuid);
+	ORIGIN_STRING(export_uuid); ORIGIN_STRING(snapshot_uuid);
+	ORIGIN_STRING(endpoint); ORIGIN_STRING(bucket); ORIGIN_STRING(prefix);
+	ORIGIN_STRING(lvs_name); ORIGIN_STRING(snapshot);
+#undef ORIGIN_STRING
+	spdk_uuid_fmt_lower(store_uuid, sizeof(store_uuid), &lvol->lvol_store->uuid);
+	if (le32toh(o->version) != 1 || strcmp(o->volume_uuid, lvol->uuid_str) ||
+	    strcmp(o->lvstore_uuid, store_uuid) ||
+	    le64toh(o->blob_id) != spdk_blob_get_id(lvol->blob) || !o->export_uuid[0])
+		return -EINVAL;
+	return 0;
+}
+
+int
+s3lvol_import_origin_matches(struct spdk_lvol *lvol, const char *uuid,
+			    const char *endpoint, const char *bucket)
+{
+	struct import_origin_v1 o;
+	int rc = import_origin_read(lvol, &o);
+	if (rc) return rc;
+	return strcmp(o.export_uuid, uuid) || strcmp(o.endpoint, endpoint ? endpoint : "") ||
+	       strcmp(o.bucket, bucket ? bucket : "") ? -EXDEV : 0;
+}
+
+int
+s3lvol_import_origin_write_json(struct spdk_lvol *lvol, struct spdk_json_write_ctx *w)
+{
+	struct import_origin_v1 o;
+	int rc = import_origin_read(lvol, &o);
+	if (rc) return rc;
+	spdk_json_write_object_begin(w);
+	spdk_json_write_named_uint32(w, "version", 1);
+#define ORIGIN_JSON_STRING(field) spdk_json_write_named_string(w, #field, o.field)
+	ORIGIN_JSON_STRING(volume_uuid); ORIGIN_JSON_STRING(lvstore_uuid);
+	ORIGIN_JSON_STRING(export_uuid); ORIGIN_JSON_STRING(snapshot_uuid);
+	ORIGIN_JSON_STRING(endpoint); ORIGIN_JSON_STRING(bucket); ORIGIN_JSON_STRING(prefix);
+	ORIGIN_JSON_STRING(lvs_name); ORIGIN_JSON_STRING(snapshot);
+#undef ORIGIN_JSON_STRING
+#define ORIGIN_JSON_U32(field) spdk_json_write_named_uint32(w, #field, le32toh(o.field))
+	ORIGIN_JSON_U32(manifest_version); ORIGIN_JSON_U32(generation);
+	ORIGIN_JSON_U32(cluster_size); ORIGIN_JSON_U32(chunk_size); ORIGIN_JSON_U32(block_size);
+#undef ORIGIN_JSON_U32
+	spdk_json_write_named_uint64(w, "blob_id", le64toh(o.blob_id));
+	spdk_json_write_named_uint64(w, "source_blob_id", le64toh(o.source_blob_id));
+	spdk_json_write_named_uint64(w, "size_bytes", le64toh(o.size_bytes));
+	spdk_json_write_object_end(w);
+	return 0;
+}
+
 struct import_ctx {
 	struct s3lvol_lvstore     *lvs;
+	struct admission_work      work;
+	bool                       work_active;
+	bool                       admitted;
 	char                       lvol_name[SPDK_LVOL_NAME_MAX];
 	char                       uuid_str[SPDK_UUID_STRING_LEN];
 
@@ -2437,6 +2677,7 @@ struct import_ctx {
 	struct s3_export_manifest *m;
 	struct s3lvol_import      *imp;
 	bool                       decouple;
+	struct spdk_lvol          *created_lvol;
 
 	s3lvol_lvol_op_cb          cb_fn;
 	void                      *cb_arg;
@@ -2448,7 +2689,8 @@ import_report(struct import_ctx *ctx, struct spdk_lvol *lvol, int status)
 	s3lvol_lvol_op_cb cb_fn = ctx->cb_fn;
 	void *cb_arg = ctx->cb_arg;
 
-	if (status != 0 && ctx->imp) {
+	if (status != 0 && ctx->imp &&
+	    ctx->m->version != S3_EXPORT_ADMISSION_VERSION) {
 		/* Undo the registry entry. Leaving it would be harmless at runtime --
 		 * it is only a cached manifest -- but it would advertise an import
 		 * that does not exist, and release_export refuses to run while one
@@ -2467,6 +2709,7 @@ import_report(struct import_ctx *ctx, struct spdk_lvol *lvol, int status)
 	}
 	s3_export_manifest_unref(ctx->m);
 	free(ctx->body);
+	if (ctx->work_active) TAILQ_REMOVE(&g_admission_work, &ctx->work, link);
 	free(ctx);
 
 	if (cb_fn) {
@@ -2475,19 +2718,25 @@ import_report(struct import_ctx *ctx, struct spdk_lvol *lvol, int status)
 }
 
 static void
-import_clone_done(void *cb_arg, struct spdk_lvol *lvol, int lvolerrno)
+import_origin_synced(void *cb_arg, int lvolerrno)
 {
 	struct import_ctx *ctx = cb_arg;
+	struct spdk_lvol *lvol = ctx->created_lvol;
 	int rc;
 
+	lvol->action_in_progress = false;
 	if (lvolerrno != 0) {
-		SPDK_ERRLOG("Failed to create an esnap clone of '%s': %s\n",
-			    ctx->uuid_str, spdk_strerror(-lvolerrno));
+		/* Keep the real clone and its registry. Never delete by name on an
+		 * uncertain completion. Remove the unsynced in-memory evidence so a
+		 * retry cannot mistake a failed sync for a durable record. */
+		spdk_blob_remove_xattr(lvol->blob, IMPORT_ORIGIN_XATTR);
+		ctx->imp = NULL;
 		import_report(ctx, NULL, lvolerrno);
 		return;
 	}
 
-	rc = vbdev_s3lvol_bdev_register(lvol, s3lvol_lvstore_get_name(ctx->lvs));
+	rc = lvol->bdev ? 0 : vbdev_s3lvol_bdev_register(lvol, s3lvol_lvstore_get_name(ctx->lvs),
+					s3lvol_lvstore_producer_gate(ctx->lvs));
 	if (rc != 0) {
 		SPDK_ERRLOG("Imported lvol '%s' exists but its bdev could not be "
 			    "registered (%d). The clone is intact -- re-attach the "
@@ -2510,7 +2759,13 @@ import_clone_done(void *cb_arg, struct spdk_lvol *lvol, int lvolerrno)
 	 * volume is usable now, and the decouple is about the export rather than about
 	 * availability. Its outcome goes to the log -- an import that reported success
 	 * did succeed, whatever becomes of the copying afterwards. */
-	if (ctx->decouple) {
+	if (ctx->decouple && spdk_blob_is_esnap_clone(lvol->blob)) {
+		/* Admission is durable and the blob now exists. Do not let our own
+		 * import lifetime guard reject the requested automatic decouple. */
+		if (ctx->work_active) {
+			TAILQ_REMOVE(&g_admission_work, &ctx->work, link);
+			ctx->work_active = false;
+		}
 		int drc = s3lvol_lvol_decouple(ctx->lvs, lvol, NULL, NULL);
 
 		if (drc != 0) {
@@ -2525,6 +2780,49 @@ import_clone_done(void *cb_arg, struct spdk_lvol *lvol, int lvolerrno)
 }
 
 static void
+import_clone_done(void *cb_arg, struct spdk_lvol *lvol, int lvolerrno)
+{
+	struct import_ctx *ctx = cb_arg;
+	struct import_origin_v1 o = {0};
+	int rc;
+	if (lvolerrno) { import_report(ctx, NULL, lvolerrno); return; }
+	ctx->created_lvol = lvol;
+	lvol->action_in_progress = true;
+	o.version = htole32(1);
+	o.manifest_version = htole32(ctx->m->version);
+	o.generation = htole32(ctx->m->generation);
+	o.cluster_size = htole32(ctx->m->cluster_size);
+	o.chunk_size = htole32(ctx->m->chunk_size);
+	o.block_size = htole32(ctx->m->block_size);
+	o.size_bytes = htole64(ctx->m->size_bytes);
+	o.blob_id = htole64(spdk_blob_get_id(lvol->blob));
+	o.source_blob_id = htole64(ctx->m->src.blob_id);
+	spdk_uuid_fmt_lower(o.lvstore_uuid, sizeof(o.lvstore_uuid), &lvol->lvol_store->uuid);
+#define ORIGIN_COPY(field, src) snprintf(o.field, sizeof(o.field), "%s", src)
+	ORIGIN_COPY(volume_uuid, lvol->uuid_str);
+	ORIGIN_COPY(export_uuid, ctx->m->uuid_str);
+	ORIGIN_COPY(snapshot_uuid, ctx->m->src.snapshot_uuid);
+	ORIGIN_COPY(endpoint, ctx->endpoint); ORIGIN_COPY(bucket, ctx->bucket);
+	ORIGIN_COPY(prefix, ctx->m->src.prefix); ORIGIN_COPY(lvs_name, ctx->m->src.lvs_name);
+	ORIGIN_COPY(snapshot, ctx->m->src.snapshot);
+#undef ORIGIN_COPY
+	rc = spdk_blob_set_xattr(lvol->blob, IMPORT_ORIGIN_XATTR, &o, sizeof(o));
+	if (rc) { import_origin_synced(ctx, rc); return; }
+	spdk_blob_sync_md(lvol->blob, import_origin_synced, ctx);
+}
+
+static void import_registry_saved(void *cb_arg, int status);
+static void
+import_admitted(void *arg, const struct ea_doc *doc, int status)
+{
+	struct import_ctx *ctx = arg;
+	if (!status && (strcmp(doc->prefix, ctx->m->src.prefix) ||
+	    ea_chunks(doc) != ctx->m->num_chunks)) status = -EINVAL;
+	ctx->admitted = status == 0;
+	import_registry_saved(ctx, status);
+}
+
+static void
 import_registry_saved(void *cb_arg, int status)
 {
 	struct import_ctx *ctx = cb_arg;
@@ -2532,6 +2830,12 @@ import_registry_saved(void *cb_arg, int status)
 
 	if (status != 0) {
 		import_report(ctx, NULL, status);
+		return;
+	}
+	if (ctx->m->version == S3_EXPORT_ADMISSION_VERSION && !ctx->admitted) {
+		rc = admission_start(ctx->client, ctx->uuid_str, EA_ADD,
+			&s3lvol_lvstore_get_lvs(ctx->lvs)->uuid, NULL, import_admitted, ctx);
+		if (rc) import_report(ctx, NULL, rc);
 		return;
 	}
 	if (export_rewrite_find(ctx->uuid_str)) {
@@ -2556,28 +2860,11 @@ import_registry_saved(void *cb_arg, int status)
 	}
 }
 
-/* The local-clone path's completion. Separate from import_clone_done() because
- * almost everything that one does does not apply: there is no manifest-derived
- * chunk count to report, no import registry entry to roll back, and no decouple to
- * kick off. What remains is reporting. */
+/* Local clones need the same durable origin; they have no esnap to decouple. */
 static void
 import_local_clone_done(void *cb_arg, struct spdk_lvol *lvol, int lvolerrno)
 {
-	struct import_ctx *ctx = cb_arg;
-
-	if (lvolerrno != 0) {
-		SPDK_ERRLOG("cloning '%s' locally for export %s failed: %s\n",
-			    ctx->m->src.snapshot, ctx->uuid_str,
-			    spdk_strerror(-lvolerrno));
-		import_report(ctx, NULL, lvolerrno);
-		return;
-	}
-
-	SPDK_NOTICELOG("Imported export %s as lvol '%s': local clone of snapshot "
-		       "'%s', no dependency on the export\n", ctx->uuid_str,
-		       lvol->name, ctx->m->src.snapshot);
-
-	import_report(ctx, lvol, 0);
+	import_clone_done(cb_arg, lvol, lvolerrno);
 }
 
 /* Is this export's source the very snapshot this lvstore still holds?
@@ -2729,6 +3016,12 @@ import_got_manifest(void *cb_arg, uint64_t bytes_read, int status)
 		import_report(ctx, NULL, rc);
 		return;
 	}
+	{
+		if (strcmp(ctx->uuid_str, ctx->m->uuid_str)) {
+			import_report(ctx, NULL, -EBUSY);
+			return;
+		}
+	}
 
 	/* The one hard geometry check, and it is about *this* lvstore rather than
 	 * the source: spdk_lvol_create_esnap_clone() requires the parent's size to
@@ -2800,7 +3093,19 @@ import_got_manifest(void *cb_arg, uint64_t bytes_read, int status)
 	 * first still reads through it, and removing it would leave that volume
 	 * unopenable on the next attach.
 	 */
-	if (import_find(ctx->lvs, ctx->uuid_str)) {
+	struct s3lvol_import *cached = import_find(ctx->lvs, ctx->uuid_str);
+	if (cached) {
+		/* The esnap callback reads the cached manifest. Do not attribute a
+		 * newly fetched generation to a clone backed by different cached
+		 * bytes. No in-place upgrade or request-based repair is allowed. */
+		char *actual = NULL, *requested = NULL;
+		size_t actual_len = 0, requested_len = 0;
+		rc = s3_export_manifest_serialize(cached->m, &actual, &actual_len);
+		if (!rc) rc = s3_export_manifest_serialize(ctx->m, &requested, &requested_len);
+		if (!rc && (actual_len != requested_len || memcmp(actual, requested, actual_len))) rc = -ESTALE;
+		free(actual);
+		free(requested);
+		if (rc) { import_report(ctx, NULL, rc); return; }
 		SPDK_NOTICELOG("lvstore '%s' already has export %s on record; "
 			       "reusing it for '%s'\n",
 			       s3lvol_lvstore_get_name(ctx->lvs), ctx->uuid_str,
@@ -2855,8 +3160,8 @@ import_head_done(void *cb_arg, int status)
 	}
 }
 
-int
-s3lvol_lvol_import(struct s3lvol_lvstore *lvs, const struct s3lvol_import_opts *opts,
+static int
+s3lvol_lvol_import_admitted(struct s3lvol_lvstore *lvs, const struct s3lvol_import_opts *opts,
 		   s3lvol_lvol_op_cb cb_fn, void *cb_arg)
 {
 	struct import_ctx *ctx;
@@ -2866,6 +3171,10 @@ s3lvol_lvol_import(struct s3lvol_lvstore *lvs, const struct s3lvol_import_opts *
 	if (!lvs || !opts || !opts->lvol_name || !opts->export_uuid) {
 		return -EINVAL;
 	}
+	if (!s3lvol_lvstore_xfer_allowed(lvs)) {
+		return -EBUSY;
+	}
+	if (s3lvol_export_work_busy(lvs)) return -EBUSY;
 	if (spdk_uuid_parse(&uuid, opts->export_uuid) != 0) {
 		SPDK_ERRLOG("export_uuid '%s' is not a uuid\n", opts->export_uuid);
 		return -EINVAL;
@@ -2876,9 +3185,13 @@ s3lvol_lvol_import(struct s3lvol_lvstore *lvs, const struct s3lvol_import_opts *
 		return -EBUSY;
 	}
 	if (s3lvol_lvol_find(lvs, opts->lvol_name)) {
-		SPDK_ERRLOG("lvstore '%s' already has an lvol named '%s'\n",
-			    s3lvol_lvstore_get_name(lvs), opts->lvol_name);
-		return -EEXIST;
+		const char *ns = opts->src_namespace ? opts->src_namespace :
+			s3lvol_lvstore_get_namespace(lvs);
+		const struct s3_target *target = rcow_namespace_to_target(ns);
+		if (!target) return -ENOENT;
+		rc = s3lvol_import_origin_matches(s3lvol_lvol_find(lvs, opts->lvol_name),
+			opts->export_uuid, target->endpoint, target->bucket);
+		return rc ? rc : -EEXIST;
 	}
 
 	ctx = calloc(1, sizeof(*ctx));
@@ -2935,9 +3248,13 @@ s3lvol_lvol_import(struct s3lvol_lvstore *lvs, const struct s3lvol_import_opts *
 	}
 
 	s3_export_manifest_key(ctx->uuid_str, ctx->key, sizeof(ctx->key));
+	ctx->work.lvs = lvs;
+	TAILQ_INSERT_TAIL(&g_admission_work, &ctx->work, link);
+	ctx->work_active = true;
 
 	rc = s3_head(ctx->client, ctx->key, &ctx->size, import_head_done, ctx);
 	if (rc != 0) {
+		TAILQ_REMOVE(&g_admission_work, &ctx->work, link);
 		s3_client_put(ctx->client);
 		free(ctx);
 	}
@@ -4045,6 +4362,9 @@ int
 s3lvol_lvol_decouple(struct s3lvol_lvstore *lvs, struct spdk_lvol *lvol,
 		   spdk_lvol_op_complete cb_fn, void *cb_arg)
 {
+	if (s3lvol_lvol_source_held(lvol)) return -EBUSY;
+	if (s3lvol_lvstore_source_closed(lvs)) return -ESHUTDOWN;
+
 	char esnap_uuid[SPDK_UUID_STRING_LEN] = {0};
 	struct s3lvol_decouple *running;
 	struct decouple_queued *q;
@@ -4054,6 +4374,7 @@ s3lvol_lvol_decouple(struct s3lvol_lvstore *lvs, struct spdk_lvol *lvol,
 	if (!lvs || !lvol || !lvol->blob) {
 		return -EINVAL;
 	}
+	if (admission_busy(lvs)) return -EBUSY;
 
 	if (!spdk_blob_is_esnap_clone(lvol->blob)) {
 		SPDK_ERRLOG("lvol '%s' does not read through to an export; there is "
@@ -4198,45 +4519,55 @@ s3lvol_decouple_get(const struct s3lvol_decouple *d, struct s3lvol_decouple_info
  *     fail on the first read of a hole that is not a hole.
  * ========================================================================== */
 
-/* The volume that still reads through to this export, or NULL.
+/* Zero proves no volume still reads through to this export; otherwise an error.
  *
  * Every blob of the lvstore is asked, rather than the imports registry, because
  * the dependency moves and the registry does not follow it. Taking a snapshot of
  * an imported clone hands the esnap parent to the *snapshot* -- blobstore moves
  * the parent link across and makes the clone a clone of that snapshot -- so after
  * deleting the clone the registry entry says nothing about who reads the export.
- * Asking the blobs cannot drift: it is their metadata that names the export, and
- * it is their reads that break when the objects go away.
+ * Their metadata names the export, and their reads break when objects go away.
  *
- * Only open blobs are visible here, which is the right scope: an lvol whose blob
- * could not be opened is not in this list, and the usual reason an esnap clone
- * cannot be opened is that its export is already unreachable. */
-static struct spdk_lvol *
-export_reader_find(struct s3lvol_lvstore *lvs, const char *uuid_str)
+ * A failed open can remove a durable dependency from the live list. Require a
+ * complete attach and readable metadata, not merely absence of an open reader.
+ * Closed blobs and in-flight operations cannot establish this proof either. */
+static int
+export_reader_check(struct s3lvol_lvstore *lvs, const char *uuid_str)
 {
 	struct spdk_lvol_store *store = s3lvol_lvstore_get_lvs(lvs);
 	size_t uuid_len = strlen(uuid_str);
 	struct spdk_lvol *lvol;
 
-	if (!store) {
-		return NULL;
+	if (!store || !s3lvol_lvstore_dependency_view_complete(lvs)) {
+		return -EIO;
+	}
+	if (!TAILQ_EMPTY(&store->pending_lvols) ||
+	    !TAILQ_EMPTY(&store->retry_open_lvols)) {
+		return -EBUSY;
 	}
 
 	TAILQ_FOREACH(lvol, &store->lvols, link) {
 		const void *esnap_id = NULL;
 		size_t id_len = 0;
 
-		if (!lvol->blob || !spdk_blob_is_esnap_clone(lvol->blob)) {
+		if (lvol->action_in_progress) {
+			return -EBUSY;
+		}
+		if (!lvol->blob) {
+			return -EIO;
+		}
+		if (!spdk_blob_is_esnap_clone(lvol->blob)) {
 			continue;
 		}
-		if (spdk_blob_get_esnap_id(lvol->blob, &esnap_id, &id_len) != 0) {
-			continue;
+		if (spdk_blob_get_esnap_id(lvol->blob, &esnap_id, &id_len) != 0 ||
+		    !esnap_id || id_len != SPDK_UUID_STRING_LEN - 1) {
+			return -EIO;
 		}
 		if (id_len == uuid_len && memcmp(esnap_id, uuid_str, id_len) == 0) {
-			return lvol;
+			return -EBUSY;
 		}
 	}
-	return NULL;
+	return 0;
 }
 
 /* How many volumes of one lvstore read through to an export, rather than just
@@ -4347,9 +4678,12 @@ s3lvol_imports_recheck(struct s3lvol_lvstore *lvs, const char *uuid_str)
 	}
 
 	imp = import_find(lvs, uuid_str);
-	if (!imp || export_reader_find(lvs, uuid_str)) {
+	if (!imp || export_reader_check(lvs, uuid_str) != 0) {
 		return;
 	}
+	/* Retain v4 metadata until the explicit, checkpointed detach acknowledgment.
+	 * Deletion/decouple is not a remote durability barrier. */
+	if (imp->m->version == S3_EXPORT_ADMISSION_VERSION) return;
 
 	SPDK_NOTICELOG("lvstore '%s' no longer has a volume reading export %s; "
 		       "dropping the registry entry\n",
@@ -4361,397 +4695,242 @@ s3lvol_imports_recheck(struct s3lvol_lvstore *lvs, const char *uuid_str)
 	}
 }
 
-struct release_ctx {
-	struct s3lvol_lvstore     *lvs;
-	char                   uuid_str[SPDK_UUID_STRING_LEN];
-	char                       key[S3_EXPORT_KEY_MAX];
-	uint64_t                   size;
-	char                      *body;
-	struct s3_export_manifest *m;
-
-	/* Chunk deletions in flight, plus a self reference held while the loop
-	 * runs. */
-	uint32_t                   pending;
-	uint64_t                   deleted;
-	int                        status;
-	struct export_rewrite    *rewrite;
-
-	spdk_lvol_op_complete      cb_fn;
-	void                      *cb_arg;
+struct detach_ack {
+	struct admission_work work;
+	struct s3lvol_import *imp;
+	struct s3_client *client;
+	spdk_lvol_op_complete cb;
+	void *arg;
 };
 
-static void
-release_finish(struct release_ctx *ctx)
+struct restore_hold_io {
+	struct admission_work work;
+	spdk_lvol_op_complete cb;
+	void *arg;
+};
+static void restore_hold_done(void *arg, const struct ea_doc *doc, int status)
 {
-	spdk_lvol_op_complete cb_fn = ctx->cb_fn;
-	void *cb_arg = ctx->cb_arg;
-	int status = ctx->status;
-
-	if (status == 0) {
-		SPDK_NOTICELOG("Released export %s: %" PRIu64 " object(s) deleted\n",
-			       ctx->uuid_str, ctx->deleted);
-	}
-
-	s3_export_manifest_unref(ctx->m);
-	free(ctx->body);
-	export_rewrite_remove(ctx->rewrite);
-	free(ctx);
-
-	if (cb_fn) {
-		cb_fn(cb_arg, status);
-	}
+	struct restore_hold_io *h = arg;
+	TAILQ_REMOVE(&g_admission_work, &h->work, link);
+	h->cb(h->arg, status);
+	free(h);
+}
+int s3lvol_restore_hold(struct s3lvol_lvstore *lvs, const char *uuid,
+		       const uint8_t attempt[32], const uint8_t commit[32],
+		       spdk_lvol_op_complete cb, void *arg)
+{
+	struct restore_hold_io *h;
+	int rc;
+	if (!lvs || !cb || !uuid) return -EINVAL;
+	if (!s3lvol_lvstore_xfer_allowed(lvs)) return -EBUSY;
+	h = calloc(1, sizeof(*h));
+	if (!h) return -ENOMEM;
+	h->work.lvs = lvs; h->cb = cb; h->arg = arg;
+	TAILQ_INSERT_TAIL(&g_admission_work, &h->work, link);
+	rc = admission_attempt_start(s3lvol_lvstore_get_client(lvs), uuid, true,
+				     attempt, commit, restore_hold_done, h);
+	if (rc) { TAILQ_REMOVE(&g_admission_work, &h->work, link); free(h); }
+	return rc;
+}
+static void detach_ack_done(void *arg, int status)
+{
+	struct detach_ack *d = arg;
+	TAILQ_REMOVE(&g_admission_work, &d->work, link);
+	s3_client_put(d->client);
+	d->cb(d->arg, status);
+	free(d);
+}
+static void detach_ack_dropped(void *arg, const struct ea_doc *doc, int status)
+{
+	struct detach_ack *d = arg;
+	int rc;
+	if (status) { detach_ack_done(d, status); return; }
+	import_remove(d->imp);
+	rc = imports_save(d->work.lvs, detach_ack_done, d);
+	if (rc) detach_ack_done(d, rc);
+}
+static void detach_ack_checkpointed(void *arg, int status)
+{
+	struct detach_ack *d = arg;
+	int rc;
+	if (status) { detach_ack_done(d, status); return; }
+	/* Recheck after asynchronous durability work, before discharging the pin. */
+	rc = export_reader_check(d->work.lvs, d->imp->m->uuid_str);
+	if (rc) { detach_ack_done(d, rc); return; }
+	rc = admission_start(d->client, d->imp->m->uuid_str, EA_DROP,
+		&s3lvol_lvstore_get_lvs(d->work.lvs)->uuid, NULL, detach_ack_dropped, d);
+	if (rc) detach_ack_done(d, rc);
+}
+static void detach_ack_drained(void *arg, int status)
+{
+	struct detach_ack *d = arg;
+	if (status) { detach_ack_done(d, status); return; }
+	s3lvol_lvstore_checkpoint(d->work.lvs, detach_ack_checkpointed, d);
+}
+int s3lvol_import_detach_ack(struct s3lvol_lvstore *lvs, const char *uuid,
+			    spdk_lvol_op_complete cb, void *arg)
+{
+	struct s3lvol_import *imp = import_find(lvs, uuid);
+	struct detach_ack *d;
+	struct s3_target target;
+	int rc;
+	if (!imp || imp->m->version != S3_EXPORT_ADMISSION_VERSION) return -ENOTSUP;
+	if (!s3lvol_lvstore_xfer_allowed(lvs) || s3lvol_export_work_busy(lvs) ||
+	    s3lvol_export_registry_busy(lvs) || decouple_find_blocker(lvs, uuid)) return -EBUSY;
+	rc = export_reader_check(lvs, uuid);
+	if (rc) return rc;
+	d = calloc(1, sizeof(*d));
+	if (!d) return -ENOMEM;
+	import_build_target(imp, &target);
+	rc = s3_client_get_or_create(&target, &d->client);
+	if (rc) { free(d); return rc; }
+	d->imp = imp; d->work.lvs = lvs; d->cb = cb; d->arg = arg;
+	TAILQ_INSERT_TAIL(&g_admission_work, &d->work, link);
+	/* Dense parents cannot be inherited by REF children. All derived exports
+	 * have copied their bytes before publication; busy publication is refused.
+	 * Persist mappings AND cleared esnap metadata before discharging the reader. */
+	s3lvol_lvstore_flush(lvs, detach_ack_drained, d);
+	return 0;
 }
 
-static void
-release_registry_saved(void *cb_arg, int status)
+struct release_ctx {
+	struct admission_work work;
+	struct s3_client *client;
+	char uuid[SPDK_UUID_STRING_LEN];
+	char key[S3_EXPORT_KEY_MAX];
+	struct ea_doc doc;
+	uint64_t next;
+	spdk_lvol_op_complete cb;
+	void *arg;
+};
+static void release_done(void *arg, int status)
 {
-	struct release_ctx *ctx = cb_arg;
-
-	if (status != 0) {
-		/* The objects are gone but this node still lists the export on disk, so
-		 * after a restart it would go on refusing to delete a snapshot for an
-		 * importer that has nothing left to read. Reported, because the operator
-		 * needs to know the obligation outlived the export. */
-		SPDK_ERRLOG("Export %s was released but the registry of '%s' could not "
-			    "be rewritten: %s. This node may still refuse to delete "
-			    "snapshot '%s'.\n", ctx->uuid_str,
-			    s3lvol_lvstore_get_name(ctx->lvs), spdk_strerror(-status),
-			    ctx->m ? ctx->m->src.snapshot : "?");
-		ctx->status = status;
-	}
-
-	/* The release is authoritative: this node verified that no volume anywhere
-	 * still reads the export (readers == 0 check above), so no importer can be
-	 * renewing its lease. Delete it rather than waiting for it to go stale --
-	 * a stale lease costs the grace period (3x renew interval) before the
-	 * snapshot becomes deletable again, and nothing needs that delay now.
-	 *
-	 * Fire-and-forget on purpose. If the delete fails, the lease goes stale in
-	 * a few renew intervals; there is no correctness question either way, only
-	 * how soon a following snapshot delete is allowed. */
-	char lease_key[S3_EXPORT_KEY_MAX];
-
-	snprintf(lease_key, sizeof(lease_key), "%s/meta/exports/%s.lease",
-		 s3lvol_lvstore_get_name(ctx->lvs), ctx->uuid_str);
-	if (s3_delete(s3lvol_lvstore_get_client(ctx->lvs), lease_key,
-		      NULL, NULL) != 0) {
-		SPDK_WARNLOG("Could not submit the delete of lease '%s' of "
-			     "export %s; it will go stale on its own\n",
-			     lease_key, ctx->uuid_str);
-	}
-
-	release_finish(ctx);
+	struct release_ctx *r = arg;
+	TAILQ_REMOVE(&g_admission_work, &r->work, link);
+	r->cb(r->arg, status);
+	free(r);
 }
-
-static void
-release_report(struct release_ctx *ctx)
+static void release_finished(void *arg, const struct ea_doc *doc, int status)
 {
+	struct release_ctx *r = arg;
 	struct s3lvol_export *exp;
-
-	if (ctx->status != 0) {
-		release_finish(ctx);
-		return;
-	}
-
-	/* The obligation ends with the objects. Without this the entry would outlive
-	 * the export it describes, and legacy readers would keep the snapshot
-	 * conservatively pinned. */
-	exp = s3lvol_export_find(ctx->lvs, ctx->uuid_str);
-	if (!exp) {
-		release_finish(ctx);
-		return;
-	}
-
-	s3lvol_export_forget(exp);
-	if (s3lvol_export_registry_save(ctx->lvs, release_registry_saved, ctx) != 0) {
-		SPDK_ERRLOG("Export %s was released but the registry of '%s' could not "
-			    "be rewritten\n", ctx->uuid_str,
-			    s3lvol_lvstore_get_name(ctx->lvs));
-		release_finish(ctx);
-	}
+	int rc;
+	if (status) { release_done(r, status); return; }
+	exp = s3lvol_export_find(r->work.lvs, r->uuid);
+	if (exp) s3lvol_export_forget(exp);
+	rc = s3lvol_export_registry_save(r->work.lvs, release_done, r);
+	if (rc) release_done(r, rc);
 }
-
-static void
-release_put(struct release_ctx *ctx)
+static void release_manifest_deleted(void *arg, int status)
 {
-	assert(ctx->pending > 0);
-	if (--ctx->pending == 0) {
-		release_report(ctx);
-	}
+	struct release_ctx *r = arg;
+	int rc;
+	if (status) { release_done(r, status); return; }
+	rc = admission_start(r->client, r->uuid, EA_FINISH,
+		&s3lvol_lvstore_get_lvs(r->work.lvs)->uuid, NULL, release_finished, r);
+	if (rc) release_done(r, rc);
 }
-
-static void
-release_chunk_deleted(void *cb_arg, int status)
+static void release_delete_next(void *arg, int status)
 {
-	struct release_ctx *ctx = cb_arg;
-
-	if (status != 0 && ctx->status == 0) {
-		/* Reported, but the export is gone either way: its manifest was
-		 * deleted first, so whatever is left is unreferenced and GC will
-		 * take it. */
-		SPDK_WARNLOG("Some objects of export %s could not be deleted (%s); "
-			     "they are unreferenced and left to GC\n",
-			     ctx->uuid_str, spdk_strerror(-status));
-		ctx->status = 0;
-	} else if (status == 0) {
-		ctx->deleted++;
+	struct release_ctx *r = arg;
+	int rc;
+	if (status) { release_done(r, status); return; }
+	if (r->next < ea_chunks(&r->doc)) {
+		s3_export_chunk_key(r->doc.prefix, r->uuid, r->next++, r->key, sizeof(r->key));
+		rc = s3_delete(r->client, r->key, release_delete_next, r);
+	} else {
+		s3_export_manifest_key(r->uuid, r->key, sizeof(r->key));
+		rc = s3_delete(r->client, r->key, release_manifest_deleted, r);
 	}
-	release_put(ctx);
+	if (rc) release_done(r, rc);
 }
-
-/* Delete the objects this export owns.
- *
- * A ref export owns none: its manifest names the source lvstore's live chunk
- * objects, which belong to the snapshot and stay in the chunk map. The keys built
- * below would not touch them -- they address the export's own prefix, which is
- * empty -- but issuing one pointless DELETE per present chunk is not a harmless
- * no-op at a million chunks. What actually ends a ref export is the manifest going
- * away, plus the registry entry that stops pinning the snapshot.
- */
-static void
-release_delete_chunks(struct release_ctx *ctx)
+static void release_cleanup_started(void *arg, const struct ea_doc *doc, int status)
 {
-	uint64_t i;
-
-	if (ctx->m->layout == S3_EXPORT_LAYOUT_REF) {
-		release_report(ctx);
-		return;
-	}
-
-	ctx->pending = 1;    /* self reference for the duration of the loop */
-
-	for (i = 0; i < ctx->m->num_chunks; i++) {
-		char key[S3_EXPORT_KEY_MAX];
-		int rc;
-
-		if (!s3_export_manifest_is_present(ctx->m, i)) {
-			continue;
-		}
-		s3_export_chunk_key(ctx->m->src.prefix, ctx->uuid_str, i, key,
-				    sizeof(key));
-
-		ctx->pending++;
-		rc = s3_delete(s3lvol_lvstore_get_client(ctx->lvs), key,
-			       release_chunk_deleted, ctx);
-		if (rc != 0) {
-			SPDK_WARNLOG("Could not submit a delete of '%s': %s\n", key,
-				     spdk_strerror(-rc));
-			ctx->pending--;
+	struct release_ctx *r = arg;
+	if (status) { release_done(r, status); return; }
+	r->doc = *doc;
+	if (doc->state == EA_DONE) release_finished(r, doc, 0);
+	else release_delete_next(r, 0);
+}
+static void release_closed(void *arg, const struct ea_doc *doc, int status)
+{
+	struct release_ctx *r = arg;
+	struct s3lvol_export *exp;
+	int rc;
+	/* Record what the admission document actually said, so the status RPC can
+	 * describe retention without a second S3 read. A missing document is the
+	 * legacy case and stays ABSENT. */
+	exp = s3lvol_export_find(r->work.lvs, r->uuid);
+	if (exp) {
+		if (status == -ENOENT) {
+			s3lvol_export_note_admission(exp,
+				S3LVOL_EXPORT_ADMISSION_ABSENT);
+		} else if (!status && doc) {
+			switch (doc->state) {
+			case EA_OPEN:
+				s3lvol_export_note_admission(exp,
+					S3LVOL_EXPORT_ADMISSION_OPEN);
+				break;
+			case EA_CLOSED:
+				s3lvol_export_note_admission(exp,
+					S3LVOL_EXPORT_ADMISSION_CLOSED);
+				break;
+			case EA_CLEANUP:
+				s3lvol_export_note_admission(exp,
+					S3LVOL_EXPORT_ADMISSION_CLEANUP);
+				break;
+			case EA_DONE:
+				s3lvol_export_note_admission(exp,
+					S3LVOL_EXPORT_ADMISSION_DONE);
+				break;
+			default:
+				s3lvol_export_note_admission(exp,
+					S3LVOL_EXPORT_ADMISSION_MALFORMED);
+				break;
+			}
+		} else if (status == -EINVAL) {
+			s3lvol_export_note_admission(exp,
+				S3LVOL_EXPORT_ADMISSION_MALFORMED);
 		}
 	}
-
-	release_put(ctx);
+	if (!status && (memcmp(doc->owner_id, &s3lvol_lvstore_get_lvs(r->work.lvs)->uuid, 16) ||
+	    strcmp(doc->prefix, s3lvol_lvstore_get_name(r->work.lvs)))) status = -EPERM;
+	if (!status && doc->count) status = -EBUSY;
+	if (status) { release_done(r, status); return; }
+	rc = admission_start(r->client, r->uuid, EA_BEGIN_CLEANUP,
+		&s3lvol_lvstore_get_lvs(r->work.lvs)->uuid, NULL,
+			     release_cleanup_started, r);
+	if (rc) release_done(r, rc);
 }
 
-static void
-release_manifest_deleted(void *cb_arg, int status)
-{
-	struct release_ctx *ctx = cb_arg;
-
-	if (status == -ENOENT) {
-		/* A concurrent delete already removed it. The export is no longer
-		 * importable; continue as if this DELETE had succeeded. */
-		ctx->deleted++;
-		release_delete_chunks(ctx);
-		return;
-	}
-	if (status != 0) {
-		SPDK_ERRLOG("Failed to delete the manifest '%s': %s. Nothing else "
-			    "was deleted -- the export is still importable.\n",
-			    ctx->key, spdk_strerror(-status));
-		ctx->status = status;
-		release_report(ctx);
-		return;
-	}
-
-	ctx->deleted++;
-	release_delete_chunks(ctx);
-}
-
-static void
-release_got_manifest(void *cb_arg, uint64_t bytes_read, int status)
-{
-	struct release_ctx *ctx = cb_arg;
-	int rc;
-
-	if (status == -ENOENT) {
-		SPDK_NOTICELOG("No manifest for export %s under prefix '%s'; "
-			       "dropping the registry entry\n",
-			       ctx->uuid_str, s3lvol_lvstore_get_name(ctx->lvs));
-		ctx->status = 0;
-		release_report(ctx);
-		return;
-	}
-	if (status != 0) {
-		SPDK_ERRLOG("Failed to read the manifest '%s': %s\n", ctx->key,
-			    spdk_strerror(-status));
-		ctx->status = status;
-		release_report(ctx);
-		return;
-	}
-
-	rc = s3_export_manifest_parse(ctx->body, bytes_read, &ctx->m);
-	if (rc != 0) {
-		/* The chunk keys come out of the bitmap, so without a readable
-		 * manifest there is no list of what to delete. Left to GC, which
-		 * needs no manifest to decide a prefix is garbage. */
-		SPDK_ERRLOG("Manifest '%s' is unreadable, so the objects of export %s "
-			    "cannot be enumerated. Delete the prefix by hand or wait "
-			    "for GC.\n", ctx->key, ctx->uuid_str);
-		ctx->status = rc;
-		release_report(ctx);
-		return;
-	}
-
-	rc = s3_delete(s3lvol_lvstore_get_client(ctx->lvs), ctx->key,
-		       release_manifest_deleted, ctx);
-	if (rc != 0) {
-		ctx->status = rc;
-		release_report(ctx);
-	}
-}
-
-static void
-release_head_done(void *cb_arg, int status)
-{
-	struct release_ctx *ctx = cb_arg;
-	int rc;
-
-	if (status == -ENOENT) {
-		/* The obligation is already discharged: there is nothing left to
-		 * import. Forget the registry entry so a snapshot delete can finish. */
-		SPDK_NOTICELOG("No manifest for export %s under prefix '%s'; "
-			       "dropping the registry entry\n",
-			       ctx->uuid_str, s3lvol_lvstore_get_name(ctx->lvs));
-		ctx->status = 0;
-		release_report(ctx);
-		return;
-	}
-	if (status != 0) {
-		SPDK_ERRLOG("Could not HEAD the manifest of export %s under prefix "
-			     "'%s': %s\n",
-			     ctx->uuid_str, s3lvol_lvstore_get_name(ctx->lvs),
-			     spdk_strerror(-status));
-		ctx->status = status;
-		release_report(ctx);
-		return;
-	}
-
-	ctx->body = malloc(ctx->size);
-	if (!ctx->body) {
-		ctx->status = -ENOMEM;
-		release_report(ctx);
-		return;
-	}
-
-	rc = s3_get_range(s3lvol_lvstore_get_client(ctx->lvs), ctx->key, 0, ctx->size,
-			  ctx->body, release_got_manifest, ctx);
-	if (rc != 0) {
-		ctx->status = rc;
-		release_report(ctx);
-	}
-}
-
+/* Legacy exports have no admission document: ENOENT never permits cleanup.
+ * The permanent document survives manifest deletion and store restart. Retrying
+ * release resumes CLOSED/CLEANUP/DONE without reopening or relying on DELETE CAS. */
 static int
 export_release(struct s3lvol_lvstore *lvs, const char *export_uuid,
-	       bool deleting_snapshot, spdk_lvol_op_complete cb_fn, void *cb_arg)
+               bool deleting_snapshot, spdk_lvol_op_complete cb_fn, void *cb_arg)
 {
-	struct s3lvol_lvstore *other;
-	struct s3lvol_export *published;
-	struct release_ctx *ctx;
+	struct s3lvol_export *held_exp = s3lvol_export_find(lvs, export_uuid);
+	struct s3lvol_export_entry held_info;
+	if (s3lvol_scoped_source_held(lvs)) {
+		if (!held_exp) return -EBUSY;
+		s3lvol_export_get(held_exp, &held_info);
+		if (s3lvol_lvol_source_held(s3lvol_lvol_find(lvs, held_info.snapshot))) return -EBUSY;
+	}
+
+	struct release_ctx *r;
 	int rc;
-
-	if (!lvs || !export_uuid) {
-		return -EINVAL;
-	}
-	if (export_rewrite_find(export_uuid)) {
-		SPDK_ERRLOG("export %s is being rewritten; release it after that "
-			    "finishes\n", export_uuid);
-		return -EBUSY;
-	}
-	published = s3lvol_export_find(lvs, export_uuid);
-	if (published) {
-		struct s3lvol_export_entry info;
-		struct spdk_lvol *snapshot;
-
-		s3lvol_export_get(published, &info);
-		snapshot = info.is_ref ? s3lvol_lvol_find(lvs, info.snapshot) : NULL;
-		if (snapshot && snapshot->action_in_progress && !deleting_snapshot) {
-			SPDK_ERRLOG("export %s names snapshot '%s', which is being "
-				    "decoupled\n", export_uuid, info.snapshot);
-			return -EBUSY;
-		}
-	}
-
-	/* Refuse while a volume *in this process* still reads through to it. Deleting
-	 * the objects under a live esnap clone would leave it reading holes that are
-	 * not holes, and after a restart it would not open at all.
-	 *
-	 * Every reader is counted before refusing, not just the first one found. One
-	 * export commonly has several volumes imported from it, and a message naming
-	 * only one of them makes the caller delete that volume, retry, and be refused
-	 * again -- once per volume, with no idea how many are left. The count says how
-	 * far there is to go.
-	 *
-	 * This is not a cross-node guarantee and cannot be: the exporting node has
-	 * no way to know who imported. That is what release_export exists for --
-	 * the importer says when it is done. */
-	struct spdk_lvol *first_reader = NULL;
-	struct s3lvol_lvstore *first_lvs = NULL;
-	uint32_t readers = 0;
-
-	for (other = s3lvol_lvstore_first(); other;
-	     other = s3lvol_lvstore_next(other)) {
-		struct spdk_lvol *reader = NULL;
-		uint32_t n = export_reader_count(other, export_uuid, &reader);
-
-		if (n == 0) {
-			continue;
-		}
-		readers += n;
-		if (!first_reader) {
-			first_reader = reader;
-			first_lvs = other;
-		}
-	}
-
-	if (readers != 0) {
-		SPDK_ERRLOG("export %s is still the parent of %u volume(s), "
-			    "including '%s' in lvstore '%s'; delete them first\n",
-			    export_uuid, readers, first_reader->name,
-			    s3lvol_lvstore_get_name(first_lvs));
-		return -EBUSY;
-	}
-
-	/* Belt and braces for the entry s3lvol_imports_recheck() should already have
-	 * dropped: a crash between the last reader going away and the registry being
-	 * rewritten leaves one behind, and it is this call that keeps such a leftover
-	 * from being mistaken for a live import later on. */
-	for (other = s3lvol_lvstore_first(); other; other = s3lvol_lvstore_next(other)) {
-		s3lvol_imports_recheck(other, export_uuid);
-	}
-
-	ctx = calloc(1, sizeof(*ctx));
-	if (!ctx) {
-		return -ENOMEM;
-	}
-	ctx->lvs    = lvs;
-	ctx->cb_fn  = cb_fn;
-	ctx->cb_arg = cb_arg;
-	snprintf(ctx->uuid_str, sizeof(ctx->uuid_str), "%s", export_uuid);
-	ctx->rewrite = export_rewrite_add(export_uuid);
-	if (!ctx->rewrite) {
-		free(ctx);
-		return -ENOMEM;
-	}
-	s3_export_manifest_key(ctx->uuid_str, ctx->key, sizeof(ctx->key));
-
-	rc = s3_head(s3lvol_lvstore_get_client(lvs), ctx->key, &ctx->size,
-		     release_head_done, ctx);
-	if (rc != 0) {
-		export_rewrite_remove(ctx->rewrite);
-		free(ctx);
-	}
+	if (!lvs || !export_uuid || !cb_fn) return -EINVAL;
+	if (!s3lvol_lvstore_xfer_allowed(lvs) || s3lvol_export_work_busy(lvs)) return -EBUSY;
+	r = calloc(1, sizeof(*r));
+	if (!r) return -ENOMEM;
+	r->work.lvs = lvs; r->client = s3lvol_lvstore_get_client(lvs);
+	r->cb = cb_fn; r->arg = cb_arg;
+	snprintf(r->uuid, sizeof(r->uuid), "%s", export_uuid);
+	TAILQ_INSERT_TAIL(&g_admission_work, &r->work, link);
+	rc = admission_start(r->client, r->uuid, EA_CLOSE,
+		&s3lvol_lvstore_get_lvs(lvs)->uuid, NULL, release_closed, r);
+	if (rc) { TAILQ_REMOVE(&g_admission_work, &r->work, link); free(r); }
 	return rc;
 }
 
@@ -4759,6 +4938,8 @@ int
 s3lvol_export_release(struct s3lvol_lvstore *lvs, const char *export_uuid,
 		      spdk_lvol_op_complete cb_fn, void *cb_arg)
 {
+	if (s3lvol_lvstore_source_closed(lvs)) return -ESHUTDOWN;
+
 	return export_release(lvs, export_uuid, false, cb_fn, cb_arg);
 }
 
@@ -4767,5 +4948,209 @@ s3lvol_export_release_for_delete(struct s3lvol_lvstore *lvs,
 				 const char *export_uuid,
 				 spdk_lvol_op_complete cb_fn, void *cb_arg)
 {
+	if (s3lvol_lvstore_source_closed(lvs)) return -ESHUTDOWN;
+
 	return export_release(lvs, export_uuid, true, cb_fn, cb_arg);
+}
+
+/* Explicit reconciliation of a first publication only. A v4 manifest plus its
+ * existing OPEN admission proves the fresh dense path; v2/v3 or rewritten REF
+ * history cannot establish that proof and must retain the reservation. No GET
+ * failure, including 404, authorizes republishing or deleting anything. */
+struct reconcile_ctx {
+	struct admission_work work;
+	struct s3lvol_export *exp;
+	struct s3_export_manifest *m;
+	struct ea_doc admission;
+	struct s3_export_source expected;
+	char uuid[SPDK_UUID_STRING_LEN];
+	char key[S3_EXPORT_KEY_MAX];
+	uint64_t size;
+	uint64_t size_bytes;
+	uint32_t cluster_size;
+	char *body;
+	spdk_lvol_op_complete cb;
+	void *arg;
+};
+static void reconcile_done(void *arg, int status)
+{
+	struct reconcile_ctx *r = arg;
+	TAILQ_REMOVE(&g_admission_work, &r->work, link);
+	s3_export_manifest_unref(r->m);
+	free(r->body);
+	r->cb(r->arg, status);
+	free(r);
+}
+static void reconcile_admission_got(void *arg, uint64_t bytes, int status)
+{
+	struct reconcile_ctx *r = arg;
+	struct spdk_uuid uuid;
+	struct s3lvol_export_entry e;
+	int rc = status;
+	if (!rc) rc = ea_validate(&r->admission, bytes);
+	spdk_uuid_parse(&uuid, r->uuid);
+	if (!rc && (memcmp(r->admission.export_id, &uuid, 16) ||
+	    memcmp(r->admission.owner_id, &s3lvol_lvstore_get_lvs(r->work.lvs)->uuid, 16) ||
+	    strcmp(r->admission.prefix, r->expected.prefix) ||
+	    ea_chunks(&r->admission) != r->m->num_chunks)) rc = -EINVAL;
+	/* Record what was read, so status describes the real state afterwards. */
+	if (r->exp) {
+		if (status == -ENOENT) {
+			s3lvol_export_note_admission(r->exp,
+				S3LVOL_EXPORT_ADMISSION_ABSENT);
+		} else if (!rc) {
+			switch (r->admission.state) {
+			case EA_OPEN:
+				s3lvol_export_note_admission(r->exp,
+					S3LVOL_EXPORT_ADMISSION_OPEN);
+				break;
+			case EA_CLOSED:
+				s3lvol_export_note_admission(r->exp,
+					S3LVOL_EXPORT_ADMISSION_CLOSED);
+				break;
+			case EA_CLEANUP:
+				s3lvol_export_note_admission(r->exp,
+					S3LVOL_EXPORT_ADMISSION_CLEANUP);
+				break;
+			case EA_DONE:
+				s3lvol_export_note_admission(r->exp,
+					S3LVOL_EXPORT_ADMISSION_DONE);
+				break;
+			default:
+				s3lvol_export_note_admission(r->exp,
+					S3LVOL_EXPORT_ADMISSION_MALFORMED);
+				break;
+			}
+		} else {
+			s3lvol_export_note_admission(r->exp,
+				S3LVOL_EXPORT_ADMISSION_MALFORMED);
+		}
+	}
+	/* Never revive a closed/releasing export, even if its manifest still exists.
+	 * This read does not mutate admission or race with remote reader additions. */
+	if (!rc && r->admission.state != EA_OPEN) rc = -EBUSY;
+	if (rc) { reconcile_done(r, rc); return; }
+	s3lvol_export_get(r->exp, &e);
+	if (!e.publication_pending) { reconcile_done(r, 0); return; }
+	rc = s3lvol_export_publication_save(r->exp, r->m, reconcile_done, r);
+	if (rc) reconcile_done(r, rc);
+}
+static void reconcile_admission_head(void *arg, int status)
+{
+	struct reconcile_ctx *r = arg;
+	int rc;
+	if (status || r->size != sizeof(r->admission)) {
+		reconcile_done(r, status ? status : -EINVAL); return;
+	}
+	rc = s3_get_range(s3lvol_lvstore_get_client(r->work.lvs), r->key, 0,
+		 sizeof(r->admission), &r->admission, reconcile_admission_got, r);
+	if (rc) reconcile_done(r, rc);
+}
+static void reconcile_manifest_got(void *arg, uint64_t bytes, int status)
+{
+	struct reconcile_ctx *r = arg;
+	struct s3_export_manifest *m;
+	int rc = status;
+	if (!rc && bytes != r->size) rc = -EIO;
+	if (!rc) rc = s3_export_manifest_parse(r->body, bytes, &r->m);
+	if (rc) { reconcile_done(r, rc); return; }
+	m = r->m;
+	if (m->version != S3_EXPORT_ADMISSION_VERSION ||
+	    m->layout != S3_EXPORT_LAYOUT_DENSE || m->generation != 0) {
+		reconcile_done(r, -ENOTSUP); return;
+	}
+	if (strcmp(m->uuid_str, r->uuid) ||
+	    strcmp(m->src.snapshot_uuid, r->expected.snapshot_uuid) ||
+	    strcmp(m->src.snapshot, r->expected.snapshot) ||
+	    m->src.blob_id != r->expected.blob_id ||
+	    strcmp(m->src.prefix, r->expected.prefix) ||
+	    strcmp(m->src.lvs_name, r->expected.lvs_name) ||
+	    strcmp(m->src.endpoint, r->expected.endpoint) ||
+	    strcmp(m->src.bucket, r->expected.bucket) ||
+	    strcmp(m->src.region, r->expected.region) ||
+	    m->size_bytes != r->size_bytes || m->cluster_size != r->cluster_size ||
+	    m->chunk_size != r->cluster_size || m->block_size != S3LVOL_BLOCK_SIZE ||
+	    m->expires_at != 0) {
+		reconcile_done(r, -EINVAL); return;
+	}
+	snprintf(r->key, sizeof(r->key), "exports/admission/%s", r->uuid);
+	rc = s3_head(s3lvol_lvstore_get_client(r->work.lvs), r->key, &r->size,
+		     reconcile_admission_head, r);
+	if (rc) reconcile_done(r, rc);
+}
+static void reconcile_manifest_head(void *arg, int status)
+{
+	struct reconcile_ctx *r = arg;
+	int rc;
+	if (status || !r->size || r->size > 64u * 1024 * 1024) {
+		reconcile_done(r, status ? status : -EINVAL); return;
+	}
+	r->body = malloc(r->size);
+	if (!r->body) { reconcile_done(r, -ENOMEM); return; }
+	rc = s3_get_range(s3lvol_lvstore_get_client(r->work.lvs), r->key, 0,
+		 r->size, r->body, reconcile_manifest_got, r);
+	if (rc) reconcile_done(r, rc);
+}
+int
+s3lvol_export_reconcile(struct s3lvol_lvstore *lvs, const char *uuid,
+                        spdk_lvol_op_complete cb, void *arg)
+{
+	if (s3lvol_lvstore_source_closed(lvs)) return -ESHUTDOWN;
+
+	struct reconcile_ctx *r;
+	struct s3lvol_export *exp;
+	struct s3lvol_export_entry e;
+	struct spdk_lvol *snapshot;
+	struct spdk_uuid parsed;
+	int rc;
+	if (!lvs || !uuid || !cb || spdk_uuid_parse(&parsed, uuid)) return -EINVAL;
+	if (!s3lvol_lvstore_xfer_allowed(lvs) || s3lvol_export_work_busy(lvs) ||
+	    s3lvol_export_registry_busy(lvs)) return -EBUSY;
+	if (!s3lvol_lvstore_exports_ready(lvs) ||
+	    !s3lvol_lvstore_dependency_view_complete(lvs)) return -EIO;
+	exp = s3lvol_export_find(lvs, uuid);
+	if (!exp) return -ENOENT;
+	s3lvol_export_get(exp, &e);
+	/* Completed historical REF/dense rewrites are not first-publication proof. */
+	if (e.generation || e.reaping || (!e.publication_pending && e.source_obligation))
+		return -ENOTSUP;
+	snapshot = s3lvol_lvol_find(lvs, e.snapshot);
+	if (!snapshot || !snapshot->blob || !e.snapshot_uuid[0] ||
+	    strcmp(snapshot->uuid_str, e.snapshot_uuid) || snapshot->blob_id != e.blob_id)
+		return -ESTALE;
+	if (snapshot->action_in_progress) return -EBUSY;
+	if (!spdk_blob_is_read_only(snapshot->blob)) return -EINVAL;
+	r = calloc(1, sizeof(*r));
+	if (!r) return -ENOMEM;
+	r->work.lvs = lvs; r->exp = exp; r->cb = cb; r->arg = arg;
+	snprintf(r->uuid, sizeof(r->uuid), "%s", uuid);
+	rc = export_fill_src_for(lvs, snapshot, &r->expected);
+	if (rc) { free(r); return rc; }
+	r->size_bytes = spdk_blob_get_num_io_units(snapshot->blob) * S3LVOL_BLOCK_SIZE;
+	r->cluster_size = spdk_bs_get_cluster_size(s3lvol_lvstore_get_lvs(lvs)->blobstore);
+	TAILQ_INSERT_TAIL(&g_admission_work, &r->work, link);
+	s3_export_manifest_key(uuid, r->key, sizeof(r->key));
+	rc = s3_head(s3lvol_lvstore_get_client(lvs), r->key, &r->size,
+		     reconcile_manifest_head, r);
+	if (rc) { TAILQ_REMOVE(&g_admission_work, &r->work, link); free(r); }
+	return rc;
+}
+
+/* Admission wrappers: callbacks retain the store until after delivery. */
+
+int
+s3lvol_lvol_import(struct s3lvol_lvstore *lvs, const struct s3lvol_import_opts *opts,
+		   s3lvol_lvol_op_cb cb_fn, void *cb_arg)
+{
+	struct source_control_ticket *ticket;
+	struct s3lvol_lvstore *owner = lvs;
+	int rc = s3lvol_control_enter(owner);
+	if (rc) return rc;
+	ticket = calloc(1, sizeof(*ticket));
+	if (!ticket) { s3lvol_control_leave(owner, 0); return -ENOMEM; }
+	ticket->lvs = owner; ticket->arg = cb_arg;
+	ticket->lvol_cb = cb_fn;
+	rc = s3lvol_lvol_import_admitted(lvs, opts, source_control_lvol_done, ticket);
+	if (rc) { s3lvol_control_leave(owner, 0); free(ticket); }
+	return rc;
 }

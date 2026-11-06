@@ -1,0 +1,17 @@
+# Focused offline sanitizer harness. No framework init or product build.
+ROOT ?= ../..
+SPDK_ROOT ?= $(ROOT)/deps/spdk
+OUT ?= /tmp
+CC ?= gcc
+SANITIZERS ?= address,undefined
+FLAGS = -std=gnu11 -D_GNU_SOURCE -Wall -Wextra -Werror -Wno-unused-parameter \
+        -Wno-unused-function -Wno-pointer-sign -pthread -g -O1 -ffunction-sections -fdata-sections \
+        -fsanitize=$(SANITIZERS) -fno-omit-frame-pointer \
+        -I$(ROOT)/include -I$(SPDK_ROOT)/include -I$(SPDK_ROOT)/build/include \
+        -I$(ROOT)/module/bdev/s3lvol
+JSON = $(SPDK_ROOT)/lib/json/json_parse.c $(SPDK_ROOT)/lib/json/json_util.c \
+       $(SPDK_ROOT)/lib/json/json_write.c $(SPDK_ROOT)/lib/util/uuid.c
+.PHONY: build
+build:
+	$(CC) $(FLAGS) source_drain_path_test.c -Wl,--gc-sections -o $(OUT)/source_drain_path_test
+	$(CC) $(FLAGS) scoped_source_path_test.c $(JSON) -luuid -Wl,--gc-sections -o $(OUT)/scoped_source_path_test

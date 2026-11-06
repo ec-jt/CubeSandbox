@@ -47,9 +47,8 @@ type Deps struct {
 	Registry  *registry.Registry
 	Redis     stateStore
 	ProxyPush stateNotifier
-	// TTL is the state key TTL applied when we SET the new state. Uses the
-	// same value as sweeper/resumer's StateLockTTL so a state written from
-	// this path is indistinguishable from one written by the CLM itself.
+	// TTL is retained for interface compatibility. The Redis store persists
+	// terminal states without expiry; only transition ownership uses a TTL.
 	TTL time.Duration
 	Log *zap.Logger
 	// Now returns the current time. Injectable for tests.
@@ -135,7 +134,7 @@ func Handle(ctx context.Context, d Deps, ev redisstream.Event) {
 	// external event here would race against that write and could clobber
 	// a "resuming" lock with a "paused" verdict — the opposite of what we
 	// want.
-	if cur == "pausing" || cur == "resuming" {
+	if cur == "pausing" || cur == "resuming" || cur == "killing" || cur == lifecycle.StateKilled {
 		log.Info("state event skipped: transition in progress",
 			zap.String("sandbox_id", ev.SandboxID),
 			zap.String("cur", cur),
@@ -143,7 +142,14 @@ func Handle(ctx context.Context, d Deps, ev redisstream.Event) {
 		return
 	}
 
-	updated, err := d.Redis.WriteStateCAS(ctx, ev.SandboxID, cur, newState, d.TTL)
+	var updated bool
+	if ordered, ok := d.Redis.(interface {
+		ApplyStateEvent(context.Context, string, string, string, string, time.Duration) (bool, error)
+	}); ok {
+		updated, err = ordered.ApplyStateEvent(ctx, ev.SandboxID, cur, newState, ev.StreamID, d.TTL)
+	} else {
+		updated, err = d.Redis.WriteStateCAS(ctx, ev.SandboxID, cur, newState, d.TTL)
+	}
 	if err != nil {
 		log.Warn("state event: set state failed",
 			zap.String("sandbox_id", ev.SandboxID),

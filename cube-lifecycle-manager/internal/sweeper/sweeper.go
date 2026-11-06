@@ -18,6 +18,7 @@ import (
 	"github.com/tencentcloud/CubeSandbox/cube-lifecycle-manager/internal/cubemasterclient"
 	"github.com/tencentcloud/CubeSandbox/cube-lifecycle-manager/internal/leader"
 	"github.com/tencentcloud/CubeSandbox/cube-lifecycle-manager/internal/lifecycle"
+	"github.com/tencentcloud/CubeSandbox/cube-lifecycle-manager/internal/redisstream"
 	"github.com/tencentcloud/CubeSandbox/cube-lifecycle-manager/internal/registry"
 )
 
@@ -235,7 +236,7 @@ func rpcContext(parent context.Context) (context.Context, context.CancelFunc) {
 //     already where we wanted it (peer CLM replica / earlier failed-but-applied
 //     attempt). Treat exactly like a fresh successful pause.
 func (s *Sweeper) tryPause(ctx context.Context, e registry.Entry) error {
-	ctx, cancel := context.WithTimeout(ctx, s.o.ActionTimeout)
+	ctx, cancel := context.WithTimeout(redisstream.WithTransitionOwner(ctx), s.o.ActionTimeout)
 	defer cancel()
 
 	sid := e.Meta.SandboxID
@@ -298,7 +299,9 @@ func (s *Sweeper) tryPause(ctx context.Context, e registry.Entry) error {
 			// Real failure (definitive APIError). Roll back: clear the pausing
 			// state so a future sweep can retry, and tell CubeProxy the sandbox
 			// is back to running (it never actually paused).
-			_ = s.o.Redis.ClearStateNotify(ctx, sid)
+			if err := s.o.Redis.WriteState(ctx, sid, "running", 0); err != nil {
+				return err
+			}
 			_ = s.o.ProxyPush.SetState(ctx, sid, "running")
 			return errors.New("cubemaster pause: " + pauseErr.Error())
 		}
@@ -307,6 +310,7 @@ func (s *Sweeper) tryPause(ctx context.Context, e registry.Entry) error {
 	if err := s.o.Redis.WriteState(ctx, sid, "paused", s.o.StateLockTTL); err != nil {
 		s.o.Log.Warn("write paused state failed",
 			zap.String("sandbox_id", sid), zap.Error(err))
+		return err
 	}
 	s.o.Registry.SetRuntimeState(sid, lifecycle.StatePaused)
 	if err := s.o.ProxyPush.SetState(ctx, sid, "paused"); err != nil {
@@ -340,7 +344,7 @@ func (s *Sweeper) KillStats() (triggered, failed int64) {
 // gate maps `killing` / `killed` to 410 Gone so any in-flight client
 // request fails fast instead of hanging on a doomed retry.
 func (s *Sweeper) tryKill(ctx context.Context, e registry.Entry) error {
-	ctx, cancel := context.WithTimeout(ctx, s.o.ActionTimeout)
+	ctx, cancel := context.WithTimeout(redisstream.WithTransitionOwner(ctx), s.o.ActionTimeout)
 	defer cancel()
 
 	sid := e.Meta.SandboxID
@@ -378,7 +382,9 @@ func (s *Sweeper) tryKill(ctx context.Context, e registry.Entry) error {
 			// lifecycle operation holds the sandbox". Evicting here would
 			// drop a live sandbox that lost a race with resume. Treat every
 			// structured non-NotFound error as retryable rollback.
-			_ = s.o.Redis.ClearStateNotify(ctx, sid)
+			if err := s.o.Redis.WriteState(ctx, sid, killRollbackProxyState(prior), 0); err != nil {
+				return err
+			}
 			_ = s.o.ProxyPush.SetState(ctx, sid, killRollbackProxyState(prior))
 			return errors.New("cubemaster kill: " + killErr.Error())
 		}
@@ -413,7 +419,7 @@ func (s *Sweeper) tryKill(ctx context.Context, e registry.Entry) error {
 // on_timeout=kill a paused sandbox is not finished work.
 func skipSweepState(state string, autoPause bool) bool {
 	switch state {
-	case "pausing", "resuming", "killing", lifecycle.StateKilled:
+	case redisstream.UnknownState, "pausing", "resuming", "killing", lifecycle.StateKilled:
 		return true
 	case lifecycle.StatePaused:
 		return autoPause

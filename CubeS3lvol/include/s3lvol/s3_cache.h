@@ -115,6 +115,10 @@ struct s3_cache;
 
 typedef void (*s3_cache_read_cb)(void *cb_arg, int status);
 
+/* Fired once when a quiescing cache has no I/O and no frame of its own left on
+ * the stack. The callback may destroy the cache. */
+typedef void (*s3_cache_quiesce_cb)(void *cb_arg);
+
 struct s3_cache_opts {
 	/* Local device region to use, and how to reach it. Channels are
 	 * per-thread; this one must belong to the calling thread, which is also
@@ -247,6 +251,31 @@ void s3_cache_drop_chunk(struct s3_cache *cache, uint64_t chunk_index);
  * already accounted for those.
  */
 bool s3_cache_is_quiesced(const struct s3_cache *cache);
+
+/**
+ * Begin teardown: stop admitting new reads and populates, and learn when the
+ * last outstanding one has completed.
+ *
+ * Completion-driven and allocation-free: no poller, no message, no memory. The
+ * callback is stored in the cache itself and fired from the completion (or
+ * submission-error unwind, or read callback return) that makes the cache idle,
+ * as that frame's very last action, so it may destroy the cache. It never fires
+ * inline from this call.
+ *
+ * From the first call on, s3_cache_read() returns -ENOENT (a miss) and
+ * s3_cache_populate() drops, permanently. Completions already submitted still
+ * run normally, including read callbacks to their owners.
+ *
+ * \return 0 when already idle (\p cb_fn is not stored and will not run: the
+ *         caller continues inline); -EINPROGRESS when \p cb_fn will run exactly
+ *         once later; -EBUSY when a previous quiesce is still pending (its
+ *         callback will run; this one will not); -EINVAL on NULL arguments.
+ *
+ * The owner must keep the local device descriptor and channel open until 0 is
+ * returned or \p cb_fn runs: until then a bdev completion may still arrive.
+ */
+int s3_cache_quiesce(struct s3_cache *cache, s3_cache_quiesce_cb cb_fn,
+		     void *cb_arg);
 
 void s3_cache_get_stats(struct s3_cache *cache, struct s3_cache_stats *stats);
 

@@ -72,6 +72,7 @@
 #include "s3lvol/s3_bs_dev.h"
 #include "s3lvol/s3_cache.h"
 #include "s3lvol/s3_checkpoint.h"
+#include "s3lvol/s3_recovery.h"
 #include "s3lvol/s3_chunk_map.h"
 #include "s3lvol/s3_client.h"
 #include "s3lvol/s3_flusher.h"
@@ -129,6 +130,41 @@ struct s3_retry_item {
 
 	STAILQ_ENTRY(s3_retry_item) link;
 };
+
+/* An object whose chunk mapping has been superseded, kept until a later
+ * checkpoint proves no durable snapshot needs it.
+ *
+ * The hazard this closes: a checkpoint names the object for chunk N. A later
+ * write replaces that mapping, and the old delete removed the object
+ * immediately. The checkpoint was then stale by one object, and remote-only
+ * recovery failed closed on a missing chunk. A clean unload makes this
+ * unavoidable: blobstore writes its final metadata through chunk 0, replacing
+ * the object the last checkpoint named.
+ *
+ * `epoch` is the checkpoint generation that was in progress when the object was
+ * superseded. Publishing checkpoint generation G may release entries with
+ * epoch < G -- they were superseded before G sampled the map, so G cannot name
+ * them. Entries superseded while G was in flight keep epoch G and are released
+ * by a later checkpoint. That is what makes the release safe without keeping
+ * the checkpoint's own object set in memory.
+ *
+ * Bounded by allocations between two successful checkpoints, not by the size
+ * of the lvstore. A failing checkpoint chain makes it grow; the warning below
+ * reports that rather than deleting something a checkpoint may need.
+ */
+struct s3_deferred_delete {
+	struct s3_deferred_delete *next;
+	/* Set once the delete is submitted, so its completion can tell a
+	 * waiting teardown that one fewer delete is in flight. */
+	struct s3_ctx             *ctx;
+	uint64_t                   epoch;
+	char                       key[];
+};
+
+/* Large enough that a healthy lvstore never reaches it, small enough that a
+ * stuck checkpoint chain does not grow without anyone noticing. 8K objects is
+ * roughly 400 KiB. */
+#define S3_DEFERRED_WARN_AT 8192
 
 struct s3_ctx {
 	/* Must be the first member: blobstore gets &ctx->bs_dev, and we recover
@@ -191,9 +227,10 @@ struct s3_ctx {
 	 * conditional beyond the null check itself. */
 	struct s3_cache *cache;
 
-	/* Registered only while teardown is waiting for a cache fill to land. See
-	 * s3_bs_dev_teardown(). */
-	struct spdk_poller *cache_quiesce_poller;
+	/* Set while teardown is parked on s3_cache_quiesce(); the cache fires
+	 * s3_cache_quiesced_cb() from the completion that makes it idle. No
+	 * poller and no allocation: see s3_bs_dev_teardown(). */
+	bool cache_quiesce_waiting;
 
 	/* Checkpoint state. Registered together with the journal.
 	 *
@@ -204,16 +241,41 @@ struct s3_ctx {
 	struct spdk_poller *ckpt_poller;
 	bool ckpt_in_flight;
 
+	/* Set while remote-only recovery is rebuilding this device. No
+	 * checkpoint may run: see s3_bs_dev_set_checkpoint_suppressed(). */
+	bool ckpt_suppressed;
+	const char *ckpt_suppress_reason;
+
 	/* Set the moment destroy() is entered, and never cleared: teardown is one
 	 * way. Two things consult it -- ckpt_start() refuses to begin anything new,
 	 * and ckpt_finish() knows that a teardown is waiting for it. */
 	bool destroying;
+	bool source_hold;
+	bool scoped_source_hold;
 
 	uint64_t ckpt_gen;
 	uint64_t ckpt_lsn_pending;
 	uint64_t ckpt_lsn_done;
 	uint64_t ckpt_done_count;
 	uint64_t ckpt_failed_count;
+
+	/* Superseded objects retained until a checkpoint that cannot reference
+	 * them is published. See struct s3_deferred_delete. */
+	struct s3_deferred_delete *deferred_deletes;
+	uint32_t deferred_delete_count;
+	/* Submitted deferred deletes whose completion has not arrived. Teardown
+	 * waits for zero: the caller releases the lvstore's ownership marker
+	 * after destroy_cb, and no delete issued by this owner may still be
+	 * landing on the bucket after that. */
+	uint32_t deferred_inflight;
+	bool teardown_waiting_deletes;
+	uint64_t ckpt_epoch;
+
+	/* What the last successful upload actually wrote. Reported by
+	 * s3_checkpoint_save()'s callback and used to publish the recovery
+	 * descriptor, which has to name the exact object. */
+	uint64_t ckpt_object_bytes;
+	uint32_t ckpt_entries_crc;
 
 	/* Time-based trigger. interval_sec is kept alongside the tsc form purely
 	 * so stats can report what was configured without dividing by a clock
@@ -244,6 +306,13 @@ struct s3_ctx {
 	 * asynchronous on the WAL path. */
 	s3_bs_dev_cb destroy_cb;
 	void *destroy_arg;
+	/* First teardown failure (flusher drain timeout, WAL close error), passed
+	 * to destroy_cb. Non-zero means acknowledged writes may exist only in the
+	 * local WAL, so the caller must not advertise the lvstore as free. */
+	int teardown_status;
+	/* The teardown drain reported a timeout. Informational only: the outcome
+	 * that counts is the retirement status (s3_bs_dev_flusher_retired). */
+	bool drain_timed_out;
 
 	/* Fired with the final chunk map, just before it is freed. See
 	 * s3_bs_dev_set_reap_cb(). */
@@ -905,6 +974,131 @@ s3_chunk_wal_submit(void *arg)
  * Write path (direct to S3; RMW handles writes shorter than a chunk)
  * ========================================================================== */
 
+static void s3_bs_dev_teardown(struct s3_ctx *ctx);
+
+static void
+s3_deferred_deleted(void *cb_arg, int status)
+{
+	struct s3_deferred_delete *d = cb_arg;
+	struct s3_ctx *ctx = d->ctx;
+
+	if (status != 0) {
+		SPDK_WARNLOG("Failed to delete a superseded chunk object after "
+			     "checkpoint publication: %d (leaked, GC will "
+			     "collect)\n", status);
+	}
+	free(d);
+
+	assert(ctx->deferred_inflight > 0);
+	ctx->deferred_inflight--;
+	/* A teardown that found deletes in flight parked itself; this is the
+	 * last one, so resume it. Last, because teardown ends in ctx being
+	 * freed. */
+	if (ctx->destroying && ctx->deferred_inflight == 0 &&
+	    ctx->teardown_waiting_deletes) {
+		ctx->teardown_waiting_deletes = false;
+		s3_bs_dev_teardown(ctx);
+	}
+}
+
+/* Keep the superseded key until a later checkpoint publishes. */
+static void
+s3_defer_delete(struct s3_ctx *ctx, const char *key)
+{
+	struct s3_deferred_delete *d;
+	size_t len = strlen(key) + 1;
+
+	d = calloc(1, sizeof(*d) + len);
+	if (!d) {
+		/* Out of memory must not turn into a delete: the checkpoint may
+		 * still name this object. Leaking it is the safe direction. */
+		SPDK_ERRLOG("Could not retain a superseded chunk object on '%s'; "
+			    "leaking it rather than deleting data a checkpoint "
+			    "may name\n", ctx->prefix);
+		return;
+	}
+	memcpy(d->key, key, len);
+	d->epoch = ctx->ckpt_epoch;
+	d->next = ctx->deferred_deletes;
+	ctx->deferred_deletes = d;
+
+	if (++ctx->deferred_delete_count == S3_DEFERRED_WARN_AT) {
+		SPDK_WARNLOG("'%s': %u superseded chunk objects are retained "
+			     "waiting for a checkpoint to publish; checkpointing "
+			     "is not making progress\n", ctx->prefix,
+			     ctx->deferred_delete_count);
+	}
+}
+
+/* A checkpoint that does not name the retained entries is durable. Delete
+ * everything superseded before it started. */
+static void
+s3_deferred_release(struct s3_ctx *ctx)
+{
+	struct s3_deferred_delete **pp = &ctx->deferred_deletes;
+	uint32_t released = 0;
+
+	if (ctx->source_hold || ctx->scoped_source_hold) return;
+
+	while (*pp) {
+		struct s3_deferred_delete *d = *pp;
+
+		if (d->epoch >= ctx->ckpt_epoch) {
+			/* Superseded while the checkpoint that just published was
+			 * in flight: it may name this object. A later checkpoint
+			 * releases it. */
+			pp = &d->next;
+			continue;
+		}
+
+		*pp = d->next;
+		ctx->deferred_delete_count--;
+		{
+			int rc;
+
+			d->ctx = ctx;
+			ctx->deferred_inflight++;
+			rc = s3_delete(ctx->client, d->key,
+				       s3_deferred_deleted, d);
+			if (rc != 0) {
+				SPDK_WARNLOG("Failed to submit a deferred delete "
+					     "for '%s': %d (leaked, GC will "
+					     "collect)\n", ctx->prefix, rc);
+				ctx->deferred_inflight--;
+				free(d);
+			}
+		}
+		released++;
+	}
+
+	if (released) {
+		SPDK_NOTICELOG("'%s': released %u superseded chunk object(s) "
+			       "after checkpoint publication (%u still held)\n",
+			       ctx->prefix, released, ctx->deferred_delete_count);
+	}
+}
+
+/* Teardown: the process is going away. Do not delete, because no checkpoint
+ * publication is left to prove the objects are unreferenced. Log the leak so it
+ * is visible rather than silent. */
+static void
+s3_deferred_discard(struct s3_ctx *ctx)
+{
+	struct s3_deferred_delete *d;
+
+	while ((d = ctx->deferred_deletes) != NULL) {
+		ctx->deferred_deletes = d->next;
+		free(d);
+	}
+	if (ctx->deferred_delete_count) {
+		SPDK_NOTICELOG("'%s': %u superseded chunk object(s) were still "
+			       "retained at teardown and are left in S3 for an "
+			       "operator/GC run\n", ctx->prefix,
+			       ctx->deferred_delete_count);
+		ctx->deferred_delete_count = 0;
+	}
+}
+
 static void
 s3_chunk_old_deleted(void *cb_arg, int status)
 {
@@ -955,6 +1149,17 @@ s3_chunk_map_updated(void *cb_arg, const struct spdk_uuid *old_uuid, int status)
 		char old_key[S3_KEY_MAX];
 
 		s3_data_key(ctx, &cio->old_uuid, old_key, sizeof(old_key));
+
+		/* On the checkpointed (WAL) path the last durable checkpoint may
+		 * still name this object. Retain it until a checkpoint that
+		 * cannot reference it is published. Direct-to-S3 mode has no
+		 * checkpoint, so it keeps the immediate delete. */
+		if (ctx->local_dev) {
+			s3_defer_delete(ctx, old_key);
+			s3_chunk_io_finish(cio, 0);
+			return;
+		}
+
 		rc = s3_delete(ctx->client, old_key, s3_chunk_old_deleted, cio);
 		if (rc == 0) {
 			/* Finish only once the delete completes, so the inflight
@@ -1484,10 +1689,17 @@ s3_unmap_chunk_removed(void *cb_arg, const struct spdk_uuid *old_uuid, int statu
 		 * this call passed NULL for years while s3_delete() rejected NULL
 		 * callbacks, so it always failed here and never deleted anything. */
 		s3_data_key(uctx->ctx, old_uuid, key, sizeof(key));
-		rc = s3_delete(uctx->ctx->client, key, NULL, NULL);
-		if (rc != 0) {
-			SPDK_WARNLOG("Could not submit delete for unmapped chunk "
-				     "(key=%s): %s\n", key, spdk_strerror(-rc));
+		if (uctx->ctx->local_dev) {
+			/* An unmap removes the mapping from the current map, but
+			 * the last durable checkpoint still names the object. */
+			s3_defer_delete(uctx->ctx, key);
+		} else {
+			rc = s3_delete(uctx->ctx->client, key, NULL, NULL);
+			if (rc != 0) {
+				SPDK_WARNLOG("Could not submit delete for unmapped "
+					     "chunk (key=%s): %s\n", key,
+					     spdk_strerror(-rc));
+			}
 		}
 	} else if (status != -ENOENT) {
 		/* The journal write failed, so the mapping is still there and this
@@ -1835,6 +2047,7 @@ s3_bs_dev_free_cb(void *io_device)
 	struct s3_ctx *ctx = io_device;
 	s3_bs_dev_cb cb_fn = ctx->destroy_cb;
 	void *cb_arg = ctx->destroy_arg;
+	int teardown_status = ctx->teardown_status;
 
 	/* Nothing may still be able to reach ctx, the chunk map or the journal. A
 	 * checkpoint is the one thing that can be outstanding without holding a
@@ -1856,6 +2069,7 @@ s3_bs_dev_free_cb(void *io_device)
 		ctx->reap_cb(ctx->reap_arg, ctx->chunk_map);
 	}
 
+	s3_deferred_discard(ctx);
 	s3_overlay_destroy(ctx->overlay);
 	/* After the overlay and before the chunk map, though the order does not
 	 * matter here: by now nothing can reach the cache, and teardown has already
@@ -1869,7 +2083,7 @@ s3_bs_dev_free_cb(void *io_device)
 	 * release the journal and the local device, which the chunk map and the
 	 * WAL were still writing to a moment ago. */
 	if (cb_fn) {
-		cb_fn(cb_arg, 0);
+		cb_fn(cb_arg, teardown_status);
 	}
 }
 
@@ -1905,24 +2119,42 @@ s3_bs_dev_wal_closed(void *cb_arg, int status)
 	if (status != 0) {
 		SPDK_ERRLOG("Failed to close the WAL: %d — the log stays on disk "
 			    "and will be replayed on the next attach\n", status);
+		if (ctx->teardown_status == 0) {
+			ctx->teardown_status = status;
+		}
 	}
 	ctx->wal = NULL;
 
 	spdk_io_device_unregister(ctx, s3_bs_dev_free_cb);
 }
 
+/* The flusher is retired: no upload and no WAL super sync can call back any
+ * more, so it -- and after it the WAL, the chunk map and ctx -- may be freed.
+ * Runs from the flusher's poller tick (s3_flusher_retire() contract), never
+ * inline from a frame that still uses the flusher.
+ *
+ * This, not the drain result, decides teardown_status: 0 means everything
+ * acknowledged reached S3 before the last upload stopped (possibly after the
+ * drain had already timed out); -EAGAIN means dirty data remains, durable only
+ * in the WAL. The latter is reported as -ETIMEDOUT, which makes destroy_cb's
+ * consumer retain the owner marker. */
 static void
-s3_bs_dev_flusher_drained(void *cb_arg, int status)
+s3_bs_dev_flusher_retired(void *cb_arg, int status)
 {
 	struct s3_ctx *ctx = cb_arg;
 	struct s3_wal *wal = ctx->wal;
 
 	if (status != 0) {
-		/* -ETIMEDOUT means dirty chunks are left behind. Not a loss --
-		 * they are in the log -- but say so, because until they are
-		 * replayed S3 does not have them. */
-		SPDK_WARNLOG("Flusher did not fully drain before destroy: %d\n",
-			     status);
+		SPDK_WARNLOG("s3_bs_dev for '%s': flusher retired with dirty "
+			     "chunks left (%d); they stay in the WAL for replay "
+			     "and S3 does not have them\n", ctx->prefix, status);
+		if (ctx->teardown_status == 0) {
+			ctx->teardown_status = -ETIMEDOUT;
+		}
+	} else if (ctx->drain_timed_out) {
+		SPDK_NOTICELOG("s3_bs_dev for '%s': the teardown drain timed out, "
+			       "but every acknowledged write reached S3 before "
+			       "the last upload stopped\n", ctx->prefix);
 	}
 
 	/* Order matters: the flusher writes the WAL (truncation, super sync), so
@@ -1940,25 +2172,40 @@ s3_bs_dev_flusher_drained(void *cb_arg, int status)
 	spdk_io_device_unregister(ctx, s3_bs_dev_free_cb);
 }
 
+/* The teardown drain answered: a bounded observation only. Whatever it says,
+	* nothing is freed here -- uploads may still be in flight after -ETIMEDOUT and
+	* their completions write through ctx, the chunk map and the WAL. Retire the
+	* flusher and free from its callback. */
+static void
+s3_bs_dev_flusher_drained(void *cb_arg, int status)
+{
+	struct s3_ctx *ctx = cb_arg;
+
+	if (status != 0) {
+		SPDK_WARNLOG("s3_bs_dev for '%s': flusher did not drain before "
+			     "destroy (%d); retiring it and waiting for uploads "
+			     "already in flight\n", ctx->prefix, status);
+		ctx->drain_timed_out = true;
+	}
+
+	s3_flusher_retire(ctx->flusher, s3_bs_dev_flusher_retired, ctx);
+}
+
 static void s3_bs_dev_teardown(struct s3_ctx *ctx);
 
-/* Wait out an in-flight cache fill, then resume teardown.
+/* The cache's last outstanding I/O has completed (or its last frame unwound).
  *
- * Registered only when there is something to wait for; see the call site for why
- * waiting is necessary at all. */
-static int
-s3_cache_quiesce_poll(void *arg)
+ * Fired by the cache as the very last action of that completion frame, so the
+ * cache is not touched again by it; it is freed later, in s3_bs_dev_free_cb,
+ * after an asynchronous io_device unregister. Resume teardown. */
+static void
+s3_cache_quiesced_cb(void *arg)
 {
 	struct s3_ctx *ctx = arg;
 
-	if (!s3_cache_is_quiesced(ctx->cache)) {
-		return SPDK_POLLER_BUSY;
-	}
-
-	spdk_poller_unregister(&ctx->cache_quiesce_poller);
+	assert(ctx->cache_quiesce_waiting);
+	ctx->cache_quiesce_waiting = false;
 	s3_bs_dev_teardown(ctx);
-
-	return SPDK_POLLER_BUSY;
 }
 
 /* Teardown proper, split out of destroy() because it can have to wait.
@@ -1988,35 +2235,56 @@ s3_bs_dev_teardown(struct s3_ctx *ctx)
 		return;
 	}
 
-	/* A cache fill is a write to the local device, and it holds a pointer into
-	 * the cache's slot array while it runs. Two things downstream of here would
-	 * break under it: the cache is freed in s3_bs_dev_free_cb, and the caller
-	 * closes the local device's descriptor as soon as destroy_cb fires -- and
-	 * closing a descriptor with I/O outstanding on it is not allowed.
+	/* A checkpoint publication issues deferred deletes and does not wait for
+	 * them. Their completion touches ctx, and -- the reason this matters for
+	 * ownership -- the caller releases the owner marker after destroy_cb, so
+	 * a delete still in flight then would be this owner mutating the bucket
+	 * after it advertised the lvstore as free. s3_deferred_deleted() resumes
+	 * here when the last one lands. */
+	if (ctx->deferred_inflight > 0) {
+		SPDK_NOTICELOG("Destroying s3_bs_dev for '%s': waiting for %u "
+			       "deferred delete(s) still in flight\n",
+			       ctx->prefix, ctx->deferred_inflight);
+		ctx->teardown_waiting_deletes = true;
+		return;
+	}
+
+	/* A cache fill (or read) is I/O on the local device, and it holds a
+	 * pointer into the cache's slot array while it runs. Two things
+	 * downstream of here would break under it: the cache is freed in
+	 * s3_bs_dev_free_cb, and the caller closes the local device's descriptor
+	 * as soon as destroy_cb fires -- and closing a descriptor with I/O
+	 * outstanding on it is not allowed.
 	 *
-	 * In practice the WAL close that follows takes a write plus a flush and the
-	 * fill would land inside it, but "usually long enough" is not a lifetime
-	 * rule. New fills cannot start, because s3_flush_map_updated stops
-	 * populating once ctx->destroying is set. */
-	if (ctx->cache && !s3_cache_is_quiesced(ctx->cache)) {
-		if (!ctx->cache_quiesce_poller) {
+	 * So nothing downstream may run until the cache is idle. The wait is
+	 * completion-driven and allocation-free: s3_cache_quiesce() stops new
+	 * reads and fills at once and stores our callback in the cache itself,
+	 * to be fired by whichever completion makes it idle. There is no failure
+	 * branch that could proceed early -- the previous poller-based wait had
+	 * one (poller registration failure dropped ctx->cache and carried on to
+	 * the descriptor close with the fill still live). */
+	if (ctx->cache_quiesce_waiting) {
+		/* Re-entered (e.g. from ckpt_finish) while already parked. The
+		 * cache callback will resume us; do not proceed. */
+		return;
+	}
+	if (ctx->cache) {
+		int qrc = s3_cache_quiesce(ctx->cache, s3_cache_quiesced_cb, ctx);
+
+		if (qrc == -EINPROGRESS) {
 			SPDK_NOTICELOG("Destroying s3_bs_dev for '%s': waiting for "
-				       "a cache fill to land\n", ctx->prefix);
-			ctx->cache_quiesce_poller =
-				SPDK_POLLER_REGISTER(s3_cache_quiesce_poll, ctx,
-						     S3_RETRY_POLL_US);
-			if (ctx->cache_quiesce_poller) {
-				return;
-			}
-			/* No poller to be had. Falling through would free the
-			 * cache under its own write; leaking it is survivable,
-			 * since it holds nothing but copies. */
-			SPDK_ERRLOG("Could not register the cache quiesce poller "
-				    "for '%s'; leaking the cache rather than "
-				    "freeing it under an in-flight write\n",
-				    ctx->prefix);
-			ctx->cache = NULL;
-		} else {
+				       "cache I/O to land\n", ctx->prefix);
+			ctx->cache_quiesce_waiting = true;
+			return;
+		}
+		/* 0: already idle, continue. -EBUSY cannot happen (only this
+		 * function quiesces, guarded above); treat it as still waiting
+		 * rather than proceed under live I/O. */
+		if (qrc != 0) {
+			SPDK_ERRLOG("s3_bs_dev for '%s': unexpected cache quiesce "
+				    "result %d; holding teardown\n", ctx->prefix,
+				    qrc);
+			assert(false);
 			return;
 		}
 	}
@@ -2343,7 +2611,11 @@ ingest_bound(void *cb_arg, const struct spdk_uuid *old_uuid, int status)
 		char old_key[S3_KEY_MAX];
 
 		s3_data_key(ctx, old_uuid, old_key, sizeof(old_key));
-		s3_delete(ctx->client, old_key, NULL, NULL);
+		if (ctx->local_dev) {
+			s3_defer_delete(ctx, old_key);
+		} else {
+			s3_delete(ctx->client, old_key, NULL, NULL);
+		}
 	}
 
 	ingest_slot_reset(slot);
@@ -2822,11 +3094,18 @@ s3_flush_map_updated(void *cb_arg, const struct spdk_uuid *old_uuid, int status)
 		 * nobody looked at the return value. Every overwritten chunk leaked
 		 * its old object. */
 		s3_data_key(ctx, old_uuid, old_key, sizeof(old_key));
-		rc = s3_delete(ctx->client, old_key, NULL, NULL);
-		if (rc != 0) {
-			SPDK_WARNLOG("Could not submit delete for the superseded "
-				     "object (key=%s): %s\n",
-				     old_key, spdk_strerror(-rc));
+		if (ctx->local_dev) {
+			/* The last durable checkpoint may still name this object.
+			 * Retain it until a checkpoint that cannot name it is
+			 * published. */
+			s3_defer_delete(ctx, old_key);
+		} else {
+			rc = s3_delete(ctx->client, old_key, NULL, NULL);
+			if (rc != 0) {
+				SPDK_WARNLOG("Could not submit delete for the "
+					     "superseded object (key=%s): %s\n",
+					     old_key, spdk_strerror(-rc));
+			}
 		}
 	}
 
@@ -2855,7 +3134,13 @@ s3_flush_put_done(void *cb_arg, int status)
 			       "discarding the object just written\n",
 			       fc->view->chunk_index);
 		s3_data_key(ctx, &fc->new_uuid, key, sizeof(key));
-		rc = s3_delete(ctx->client, key, NULL, NULL);
+		if (ctx->local_dev) {
+			/* Track this deletion through checkpoint retirement as well. */
+			s3_defer_delete(ctx, key);
+			rc = 0;
+		} else {
+			rc = s3_delete(ctx->client, key, NULL, NULL);
+		}
 		if (rc != 0) {
 			/* Nothing references it, so this is a leak rather than a
 			 * correctness problem -- but it is worth saying so. */
@@ -3296,6 +3581,15 @@ s3_bs_dev_drain(struct spdk_bs_dev *bs_dev, s3_bs_dev_cb cb_fn, void *cb_arg)
 {
 	struct s3_ctx *ctx = (struct s3_ctx *)bs_dev;
 
+	if (ctx && ctx->destroying) {
+		/* Teardown owns the flusher from here (it may already be retired
+		 * or freed). Answering 0 when ctx->flusher had been cleared would
+		 * claim INV2 for a device that is going away. */
+		if (cb_fn) {
+			cb_fn(cb_arg, -ESHUTDOWN);
+		}
+		return;
+	}
 	if (!ctx || !ctx->flusher) {
 		/* Direct-to-S3 mode: a completed write is already in S3. */
 		if (cb_fn) {
@@ -3307,6 +3601,32 @@ s3_bs_dev_drain(struct spdk_bs_dev *bs_dev, s3_bs_dev_cb cb_fn, void *cb_arg)
 	assert(ctx->owner_thread == NULL || ctx->owner_thread == spdk_get_thread());
 
 	s3_flusher_drain(ctx->flusher, 0, cb_fn, cb_arg);
+}
+
+void
+s3_bs_dev_source_hold(struct spdk_bs_dev *bs_dev)
+{
+	struct s3_ctx *ctx = (struct s3_ctx *)bs_dev;
+	assert(ctx && ctx->owner_thread == spdk_get_thread());
+	ctx->source_hold = true;
+	spdk_poller_unregister(&ctx->ckpt_poller);
+}
+
+void
+s3_bs_dev_scoped_source_hold(struct spdk_bs_dev *bs_dev)
+{
+	struct s3_ctx *ctx = (struct s3_ctx *)bs_dev;
+	assert(ctx && ctx->owner_thread == spdk_get_thread());
+	ctx->scoped_source_hold = true;
+}
+
+bool
+s3_bs_dev_source_busy(struct spdk_bs_dev *bs_dev)
+{
+	struct s3_ctx *ctx = (struct s3_ctx *)bs_dev;
+	assert(ctx && ctx->owner_thread == spdk_get_thread());
+	return ctx->inflight || ctx->retry_count || ctx->ckpt_in_flight ||
+		ctx->deferred_inflight;
 }
 
 int
@@ -3441,10 +3761,44 @@ ckpt_finish(struct s3_ctx *ctx, int status)
 	}
 }
 
+/* The recovery descriptor is published after the super block, so it can never
+ * name a checkpoint the super block does not also name. Its own failure is
+ * logged and swallowed: the checkpoint is complete and the journal is already
+ * truncatable, and failing the checkpoint over a bookkeeping object would make
+ * the lvstore stop checkpointing for a reason that does not affect its data.
+ * The consequence of a missing descriptor is only that remote-only recovery
+ * for this lvstore reports "no descriptor" instead of working. */
+static void
+ckpt_recovery_published(void *cb_arg, int status)
+{
+	struct s3_ctx *ctx = cb_arg;
+
+	if (status != 0) {
+		/* The descriptor is the pair half that recovery reads. Releasing
+		 * the retained objects now would delete what the last
+		 * *published* pair still names. Keep them. */
+		SPDK_WARNLOG("Checkpoint gen=%" PRIu64 " for '%s' completed, but "
+			     "its recovery descriptor could not be published "
+			     "(%d); remote-only recovery will not be possible "
+			     "from this checkpoint, and superseded objects stay "
+			     "retained\n",
+			     ctx->ckpt_gen, ctx->prefix, status);
+	} else {
+		/* Both halves of the new pair (checkpoint object, super block,
+		 * descriptor) are durable. Only now may objects superseded
+		 * before this checkpoint was sampled be deleted. */
+		s3_deferred_release(ctx);
+	}
+
+	ckpt_finish(ctx, (ctx->source_hold || ctx->scoped_source_hold) ? status : 0);
+}
+
 static void
 ckpt_super_updated(void *cb_arg, int status)
 {
 	struct s3_ctx *ctx = cb_arg;
+	const struct s3_super_block *sb;
+	const struct s3_region *jregion, *wregion;
 
 	if (status != 0) {
 		/* The snapshot is in S3 but the super block does not point at it.
@@ -3467,11 +3821,25 @@ ckpt_super_updated(void *cb_arg, int status)
 		       "truncated to LSN %" PRIu64 "\n",
 		       ctx->ckpt_gen, ctx->prefix, ctx->ckpt_lsn_pending);
 
-	ckpt_finish(ctx, 0);
+	/* Publish what a fresh local device would need to rebuild from this
+	 * checkpoint. The object's size and entry CRC come from the upload
+	 * callback, so the descriptor names the exact object that landed. */
+	sb = s3_local_dev_get_super(ctx->local_dev);
+	jregion = s3_local_dev_get_region(ctx->local_dev, S3_REGION_JOURNAL);
+	wregion = s3_local_dev_get_region(ctx->local_dev, S3_REGION_WAL);
+
+	s3_recovery_publish(ctx->client, ctx->prefix, &sb->lvs_uuid,
+			    sb->capacity_bytes, sb->chunk_size,
+			    jregion ? jregion->size : 0,
+			    wregion ? wregion->size : 0,
+			    ctx->ckpt_gen, ctx->ckpt_lsn_pending,
+			    ctx->ckpt_object_bytes, ctx->ckpt_entries_crc,
+			    ckpt_recovery_published, ctx);
 }
 
 static void
-ckpt_saved(void *cb_arg, int status)
+ckpt_saved(void *cb_arg, int status, uint64_t object_bytes,
+	   uint32_t entries_crc)
 {
 	struct s3_ctx *ctx = cb_arg;
 
@@ -3481,6 +3849,10 @@ ckpt_saved(void *cb_arg, int status)
 		ckpt_finish(ctx, status);
 		return;
 	}
+
+	/* Remembered so the recovery descriptor can name this exact object. */
+	ctx->ckpt_object_bytes = object_bytes;
+	ctx->ckpt_entries_crc = entries_crc;
 
 	s3_local_dev_update_checkpoint(ctx->local_dev, ctx->ckpt_gen,
 				       ctx->ckpt_lsn_pending,
@@ -3523,6 +3895,12 @@ ckpt_start(struct s3_ctx *ctx, bool forced)
 	if (ctx->destroying) {
 		return -ESHUTDOWN;
 	}
+	/* A checkpoint during the recovery rebuild would snapshot a chunk map
+	 * that is still being restored and overwrite the checkpoint pointer the
+	 * recovery descriptor names. Refused for both triggers. */
+	if (ctx->ckpt_suppressed) {
+		return -EAGAIN;
+	}
 	if (ctx->ckpt_in_flight) {
 		return -EBUSY;
 	}
@@ -3551,7 +3929,7 @@ ckpt_start(struct s3_ctx *ctx, bool forced)
 	 * serialises synchronously. *Nothing may yield between these two lines*,
 	 * or the snapshot would no longer match the LSN it is stamped with. */
 	lsn = s3_chunk_map_get_applied_lsn(ctx->chunk_map);
-	if (lsn <= ctx->ckpt_lsn_done) {
+	if (lsn <= ctx->ckpt_lsn_done && !ctx->source_hold && !ctx->scoped_source_hold) {
 		/* Everything in the journal is already covered. Another snapshot
 		 * would not move truncation forward, so there is nothing useful to
 		 * do -- and if this persists while the region fills, the append path
@@ -3569,6 +3947,9 @@ ckpt_start(struct s3_ctx *ctx, bool forced)
 	ctx->ckpt_in_flight = true;
 	ctx->ckpt_lsn_pending = lsn;
 	ctx->ckpt_gen++;
+	/* Objects superseded from here on are stamped with this epoch, so this
+	 * checkpoint's publication does not delete something it may name. */
+	ctx->ckpt_epoch++;
 	ctx->ckpt_last_tsc = now;
 
 	if (forced) {
@@ -3613,6 +3994,18 @@ s3_bs_dev_checkpoint(struct spdk_bs_dev *bs_dev, s3_bs_dev_cb cb_fn, void *cb_ar
 		return;
 	}
 
+	if (ctx->ckpt_suppressed) {
+		/* Distinct from the -EAGAIN "nothing new to snapshot" path below,
+		 * which is reported as success. This one is a refusal. */
+		SPDK_ERRLOG("Checkpoint for '%s' refused: %s\n", ctx->prefix,
+			    ctx->ckpt_suppress_reason ? ctx->ckpt_suppress_reason :
+			    "checkpoints are suppressed while recovery rebuilds "
+			    "the device");
+		if (cb_fn) {
+			cb_fn(cb_arg, -EAGAIN);
+		}
+		return;
+	}
 	if (ctx->ckpt_in_flight) {
 		/* Not queued behind the running one: the caller asked for "a
 		 * checkpoint now" and one is being taken, but reporting success
@@ -3644,6 +4037,28 @@ s3_bs_dev_checkpoint(struct spdk_bs_dev *bs_dev, s3_bs_dev_cb cb_fn, void *cb_ar
 			cb_fn(cb_arg, rc);
 		}
 	}
+}
+
+void
+s3_bs_dev_set_checkpoint_suppressed(struct spdk_bs_dev *bs_dev,
+				    bool suppressed, const char *reason)
+{
+	struct s3_ctx *ctx = (struct s3_ctx *)bs_dev;
+
+	if (!ctx) {
+		return;
+	}
+
+	if (suppressed && !ctx->ckpt_suppressed) {
+		SPDK_NOTICELOG("Checkpoints for '%s' suppressed: %s\n",
+			       ctx->prefix, reason ? reason : "(no reason given)");
+	} else if (!suppressed && ctx->ckpt_suppressed) {
+		SPDK_NOTICELOG("Checkpoints for '%s' allowed again\n",
+			       ctx->prefix);
+	}
+
+	ctx->ckpt_suppressed = suppressed;
+	ctx->ckpt_suppress_reason = suppressed ? reason : NULL;
 }
 
 int

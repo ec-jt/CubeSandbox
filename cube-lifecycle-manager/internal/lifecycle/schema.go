@@ -115,7 +115,8 @@ const (
 // StatePayload mirrors CubeMaster/pkg/lifecycle.StatePayload. Whenever you
 // change one side, change the other in the same commit.
 type StatePayload struct {
-	State  string `json:"state"`
-	Actor  string `json:"actor,omitempty"`
-	Source string `json:"source,omitempty"`
+	RequestID string `json:"request_id,omitempty"`
+	State     string `json:"state"`
+	Actor     string `json:"actor,omitempty"`
+	Source    string `json:"source,omitempty"`
 }

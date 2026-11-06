@@ -23,7 +23,8 @@
  *   makes it runnable in CI. The S3 side is exercised by s3_bs_dev_test.
  *
  *   A real spdk_thread is required because the flusher registers a poller.
- *   DPDK comes up with --no-huge so no hugepages and no root are needed.
+ *   DPDK comes up with --no-huge and --no-pci: this test never needs hardware.
+ *   Isolated runners must also mask host sysfs as defense in depth.
  *
  *   Usage:
  *     ./s3_flush_test
@@ -795,6 +796,24 @@ test_flusher(void)
 		check_true("drain reported success", probe.status == 0, NULL);
 	}
 
+	/* Drain completion is not the retirement contract. Exercise the real
+	 * poller before freeing the flusher and the overlay it references. */
+	{
+		struct drain_probe retired = { .status = -1, .done = false };
+		uint64_t deadline = spdk_get_ticks() + 5 * spdk_get_ticks_hz();
+
+		s3_flusher_retire(fl, drain_cb, &retired);
+		while (!retired.done && spdk_get_ticks() < deadline) {
+			spdk_thread_poll(spdk_get_thread(), 0, 0);
+		}
+		check_true("retirement completed", retired.done, NULL);
+		if (!retired.done) {
+			/* Do not return with a live callback pointing to this stack. */
+			fprintf(stderr, "retirement deadline exceeded\n");
+			abort();
+		}
+		check_true("retirement reported success", retired.status == 0, NULL);
+	}
 	s3_flusher_destroy(fl);
 	s3_overlay_destroy(ov);
 
@@ -821,11 +840,12 @@ main(void)
 
 	printf("=== overlay + flusher unit test ===\n\n");
 
-	printf("[1] SPDK env (--no-huge)\n");
+	printf("[1] SPDK env (--no-huge --no-pci)\n");
 	opts.opts_size = sizeof(opts);
 	spdk_env_opts_init(&opts);
 	opts.name = "s3_flush_test";
 	opts.no_huge = true;
+	opts.no_pci = true;
 	opts.mem_size = 64;
 
 	if (spdk_env_init(&opts) < 0) {
@@ -833,7 +853,7 @@ main(void)
 		spdk_log_close();
 		return 77;   /* automake convention for "skipped" */
 	}
-	check_true("spdk_env_init", true, "no_huge=true");
+	check_true("spdk_env_init", true, "no_huge=true no_pci=true");
 
 	printf("\n[2] spdk_thread for the flusher poller\n");
 	rc = spdk_thread_lib_init(NULL, 0);

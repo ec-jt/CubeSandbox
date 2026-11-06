@@ -71,6 +71,9 @@ governor = { version = "0.6", features = ["dashmap"] }
 # connection pool built-in, rustls for TLS
 reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
 
+ring = "0.17"
+base64 = "0.22"
+
 # ── Validation ────────────────────────────────────────────────────────────
 validator = { version = "0.16", features = ["derive"] }
 

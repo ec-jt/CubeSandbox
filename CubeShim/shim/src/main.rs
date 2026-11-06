@@ -23,6 +23,14 @@ fn main() {
 
     let mut thread_num = 1;
     let os_args: Vec<_> = std::env::args_os().collect();
+    if os_args.len() == 2 && os_args[1] == "--arm-retained-runtime" {
+        if let Err(e) = common::retained::arm_from_stdin() {
+            eprintln!("retained runtime arm failed: {e}");
+            std::process::exit(1);
+        }
+        println!("retention armed; runtime not stopped; storage drain unproven");
+        return;
+    }
     if is_version_request(&os_args[1..]) {
         print_version();
         return;

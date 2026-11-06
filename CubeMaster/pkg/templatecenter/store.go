@@ -547,7 +547,9 @@ func CreateTemplate(ctx context.Context, req *sandboxtypes.CreateCubeSandboxReq)
 	if err != nil {
 		return nil, err
 	}
-	storedReq, err := normalizeStoredTemplateRequest(req)
+	// Persist the identity already selected for the replica build. Normalizing
+	// the original request again generates a second ID when none was supplied.
+	storedReq, err := normalizeStoredTemplateRequest(createReq)
 	if err != nil {
 		return nil, err
 	}

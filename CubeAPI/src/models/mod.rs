@@ -698,6 +698,9 @@ pub struct SnapshotListItem {
 pub struct RollbackRequest {
     #[serde(rename = "snapshotID")]
     pub snapshot_id: String,
+    /// Caller operation UUID. Master binds it to the sandbox and selected snapshot.
+    #[serde(rename = "requestID", default)]
+    pub request_id: Option<String>,
     /// CoW backend (xfs | s3). Empty means Cubelet uses the snapshot catalog.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backend: Option<String>,
@@ -706,6 +709,8 @@ pub struct RollbackRequest {
 /// Response for POST /sandboxes/{id}/rollback after synchronous completion.
 #[derive(Debug, Serialize, ToSchema)]
 pub struct RollbackResponse {
+    #[serde(rename = "requestID")]
+    pub request_id: String,
     #[serde(rename = "sandboxID")]
     pub sandbox_id: String,
     #[serde(rename = "snapshotID")]

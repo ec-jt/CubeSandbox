@@ -66,6 +66,29 @@ func newExt4BaseRaw(filePath, uuid string, size int64) error {
 }
 
 func initExt4BlockDevice(devicePath string) (err error) {
+	info, err := os.Stat(devicePath)
+	if err != nil {
+		return err
+	}
+	if info.Mode().IsRegular() {
+		// XFS CoW volumes are files, not block devices. Populate them directly
+		// instead of requiring a host-global loop allocation and mount.
+		seedDir, err := os.MkdirTemp("", "cube-cubecow-seed-*")
+		if err != nil {
+			return err
+		}
+		defer os.RemoveAll(seedDir)
+		for _, name := range []string{emptyDirInnerSourcePath, "containerd"} {
+			if err := os.MkdirAll(path.Join(seedDir, name), 0755); err != nil {
+				return err
+			}
+		}
+		_, stderr, err := utils.ExecV([]string{"mkfs.ext4", "-F", "-O", "^has_journal", "-d", seedDir, devicePath}, cmdTimeout)
+		if err != nil {
+			return fmt.Errorf("initExt4BlockDevice format regular file: %s: %w", stderr, err)
+		}
+		return nil
+	}
 	mountDir, err := os.MkdirTemp("", "cube-cubecow-mount-*")
 	if err != nil {
 		return err

@@ -7,6 +7,7 @@ package cubebox
 import (
 	"context"
 	"fmt"
+	"github.com/tencentcloud/CubeSandbox/Cubelet/plugins/workflow"
 	"runtime/debug"
 	"time"
 
@@ -77,8 +78,25 @@ func (s *service) Update(ctx context.Context, req *cubebox.UpdateCubeSandboxRequ
 	}
 	rt.CalleeAction = action
 
+	if action == sourceFenceAction {
+		return s.stopRecoverySource(ctx, req, rsp)
+	}
+	// Read-only origin record lookup for the Master cross-node restore
+	// precondition. Dispatched before the fence gate and lifecycle lock because
+	// it must answer "no record" for a sandbox that is gone, and it never
+	// mutates local state.
+	if action == sourceQuiescedReadAction {
+		return s.readRecoverySourceQuiesced(ctx, req, rsp)
+	}
+
 	unlock := s.sandboxLifecycleLocks.Lock(req.SandboxID)
 	defer unlock()
+	if err := workflow.SourceFences.Check(req.SandboxID); err != nil {
+		rsp.Ret.RetCode = errorcode.ErrorCode_PreConditionFailed
+		rsp.Ret.RetMsg = err.Error()
+		return rsp, nil
+	}
+	ctx = workflow.BeginSandboxLifecycle(ctx, req.SandboxID)
 	defer recov.HandleCrash(func(panicError interface{}) {
 		log.G(ctx).Fatalf("Update panic info:%s, stack:%s", panicError, string(debug.Stack()))
 		rsp.Ret.RetMsg = fmt.Sprintf("Update panic info:%s", panicError)

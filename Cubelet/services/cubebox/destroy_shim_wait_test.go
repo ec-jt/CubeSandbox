@@ -62,7 +62,7 @@ func TestCollectSandboxRuntimePIDsReadsBundlePidFiles(t *testing.T) {
 }
 
 func TestWaitSandboxRuntimeGoneNoPIDs(t *testing.T) {
-	require.NoError(t, waitSandboxRuntimeGone(context.Background(), "sb-empty", nil))
+	require.ErrorContains(t, waitSandboxRuntimeGone(context.Background(), "sb-empty", nil), "ownership unknown")
 }
 
 func TestWaitSandboxRuntimeGoneBlocksUntilExit(t *testing.T) {

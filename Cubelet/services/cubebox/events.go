@@ -8,6 +8,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/tencentcloud/CubeSandbox/Cubelet/plugins/workflow"
 	"strings"
 	"sync"
 	"time"
@@ -223,6 +224,9 @@ func (em *eventMonitor) handleEvent(ctx context.Context, any interface{}) error 
 		cb.Lock()
 		defer cb.Unlock()
 
+		if workflow.SourceFences.Check(cb.ID) != nil {
+			return nil
+		}
 		if cb.UserMarkDeletedTime != nil || cb.GetPublicationHold() != nil {
 			return nil
 		}
@@ -274,6 +278,9 @@ func (em *eventMonitor) handleEvent(ctx context.Context, any interface{}) error 
 		cb.Lock()
 		defer cb.Unlock()
 		// Do not backfill paused semantics once it has entered a terminal state.
+		if workflow.SourceFences.Check(cb.ID) != nil {
+			return nil
+		}
 		if cb.UserMarkDeletedTime != nil || cb.GetPublicationHold() != nil {
 			return nil
 		}
@@ -310,6 +317,9 @@ func (em *eventMonitor) handleEvent(ctx context.Context, any interface{}) error 
 		}
 		cb.Lock()
 		defer cb.Unlock()
+		if workflow.SourceFences.Check(cb.ID) != nil {
+			return nil
+		}
 		if cb.UserMarkDeletedTime != nil || cb.GetPublicationHold() != nil {
 			return nil
 		}

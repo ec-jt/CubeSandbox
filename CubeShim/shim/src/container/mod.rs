@@ -171,6 +171,13 @@ pub async fn create_sandbox_log_paths(sandbox_id: &str) -> CResult<(String, Stri
 /// so a crashed shim still drops `/data/cubelet/log/<id>` when containerd
 /// reaps the leftover task.
 pub fn remove_sandbox_log_dir_sync(sandbox_id: &str) -> CResult<()> {
+    let retention = crate::common::retained::Guard::host()?;
+    retention.require_absent(sandbox_id)?;
+    remove_sandbox_log_dir_unchecked(sandbox_id)
+}
+
+// Caller holds the retained-runtime guard through deletion.
+pub(crate) fn remove_sandbox_log_dir_unchecked(sandbox_id: &str) -> CResult<()> {
     let dir = sandbox_log_dir(sandbox_id)?;
     match std::fs::remove_dir_all(&dir) {
         Ok(()) => Ok(()),
@@ -557,7 +564,14 @@ impl Container {
     }
 
     fn is_cold_start(&self) -> bool {
-        self.id == self.real_id
+        // Same-ID pause resume keeps the already-running guest init process.
+        // A new container added after restore has no restored identity and
+        // must still be started normally.
+        let restored_identity = self.sb_conf.app_snapshot_restore
+            && self.spec.annotations().as_ref().map_or(false, |annotations| {
+                annotations.contains_key(ANNO_APP_SNAPSHOT_CONTAINER_ID)
+            });
+        !restored_identity && self.id == self.real_id
     }
 
     /// Passfd stays compiled in but is opt-in. Cubelet must set

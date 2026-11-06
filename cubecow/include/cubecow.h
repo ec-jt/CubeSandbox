@@ -332,6 +332,7 @@ int32_t cubecow_create_volume_from_snapshot(
  * Get all metrics as a JSON object string (key-value pairs).
  */
 int32_t cubecow_get_metrics(CubecowEngineHandle engine, char** out_json);
+int32_t cubecow_checkpoint_record(CubecowEngineHandle engine, const char* request, char** out_json);
 
 #ifdef __cplusplus
 } /* extern "C" */

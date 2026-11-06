@@ -24,9 +24,60 @@
 
 #include "s3lvol/s3_bs_dev.h"
 #include "s3lvol/s3_types.h"
+#include "s3lvol/s3_producer_gate.h"
+
+/* Pure retention-disposition classification (header-only, no module state). */
+#include "export_disposition_ctl.h"
 
 struct spdk_lvol;
 struct s3lvol_lvstore;
+
+/* Internal, opt-in store-wide retirement. The trusted caller supplies ALL
+ * native lvol UUIDs, including snapshots (imports currently refused), and accepts
+ * store-wide exclusion. This does not establish source ownership. The strict
+ * owner nonce is the native store incarnation (not a caller invented epoch).
+ * No RPC is exposed. No unlock, unload, release or deletion follows success or
+ * timeout. Restart is denied by the retained strict remote owner claim; the
+ * token/result itself is not replayable across processes. */
+struct s3lvol_source_binding {
+	struct spdk_uuid operation;
+	struct spdk_uuid source;
+	uint64_t source_generation;
+	struct spdk_uuid store_uuid;
+	struct spdk_uuid owner_nonce;
+	const char *endpoint;
+	const char *bucket;
+	const char *prefix;
+	const struct spdk_uuid *volumes;
+	size_t volume_count;
+	bool exclusive_store;
+};
+struct spdk_json_write_ctx;
+struct s3_producer_gate *s3lvol_lvstore_producer_gate(struct s3lvol_lvstore *lvs);
+struct s3_producer_gate *s3lvol_lvol_producer_gate(struct spdk_lvol *lvol);
+struct s3_producer_gate *s3lvol_source_gate_alloc(struct spdk_lvol *lvol, struct s3_producer_gate *store_gate);
+bool s3lvol_lvol_source_closed(struct spdk_lvol *lvol);
+bool s3lvol_lvol_source_held(struct spdk_lvol *lvol);
+bool s3lvol_scoped_source_held(struct s3lvol_lvstore *lvs);
+int s3lvol_source_inventory(struct s3lvol_lvstore *lvs, struct spdk_json_write_ctx *w);
+int s3lvol_scoped_source_prepare(struct s3lvol_lvstore *lvs, const char *body);
+int s3lvol_scoped_source_drain(struct s3lvol_lvstore *lvs, const char *body,
+	spdk_lvs_op_complete cb, void *arg);
+void s3lvol_source_pending_loaded(struct s3lvol_lvstore *lvs, int status);
+int s3lvol_control_enter(struct s3lvol_lvstore *lvs);
+void s3lvol_control_leave(struct s3lvol_lvstore *lvs, int status);
+bool s3lvol_lvstore_source_closed(struct s3lvol_lvstore *lvs);
+int s3lvol_source_drain(struct s3lvol_lvstore *lvs,
+	const struct s3lvol_source_binding *binding, uint64_t timeout_us,
+	spdk_lvs_op_complete cb, void *arg);
+
+/* Versioned evidence read from the destination blob, not the import registry.
+ * Writes occur only on a newly created import. No legacy/request backfill. */
+struct spdk_json_write_ctx;
+int s3lvol_import_origin_write_json(struct spdk_lvol *lvol,
+				  struct spdk_json_write_ctx *w);
+int s3lvol_import_origin_matches(struct spdk_lvol *lvol, const char *export_uuid,
+			       const char *endpoint, const char *bucket);
 
 /**
  * Get this vbdev module's handle, needed when registering bdevs.
@@ -48,7 +99,8 @@ struct spdk_bdev_module *vbdev_s3lvol_get_module(void);
  * \return 0 on success; -EEXIST if a bdev with the same name already exists;
  *         other negative errno
  */
-int vbdev_s3lvol_bdev_register(struct spdk_lvol *lvol, const char *lvs_name);
+int vbdev_s3lvol_bdev_register(struct spdk_lvol *lvol, const char *lvs_name,
+                             struct s3_producer_gate *gate);
 
 /**
  * Unregister the bdev for an lvol. Asynchronous.
@@ -97,6 +149,69 @@ int s3lvol_lvstore_create(const struct s3_lvs_opts *opts,
  */
 int s3lvol_lvstore_attach(const struct s3_lvs_opts *opts,
 			  s3lvol_lvs_op_cb cb_fn, void *cb_arg);
+
+/**
+ * Rebuild an lvstore's local state from the remote checkpoint alone.
+ *
+ * This is the explicit, opt-in counterpart to attach for the case attach
+ * cannot handle: the local WAL/cache device is gone (replaced disk, rebuilt
+ * host, lost container volume) and the only surviving copy of the chunk map is
+ * the checkpoint in the bucket.
+ *
+ * === What it does ===
+ *
+ *   1. Reads `<lvs_name>/meta/recovery` and validates it (geometry, identity,
+ *      checkpoint generation, CRC). A missing descriptor is -ENOENT: the
+ *      lvstore predates the descriptor and cannot be recovered this way.
+ *   2. Downloads `<lvs_name>/meta/checkpoint` bounded by the descriptor's
+ *      recorded object size and proves it is the checkpoint the descriptor
+ *      names: exact size, uuid, chunk size, generation, covered LSN, entry CRC,
+ *      and chunk indices inside the recorded capacity. A mismatch fails here,
+ *      before anything is claimed or written. The validated bytes are kept and
+ *      applied later, so a second download cannot change the restored state.
+ *   3. Claims the owner marker. Recovery refuses `force` outright: the marker
+ *      is a sequential-misoperation guard, not mutual exclusion.
+ *   4. Proves the designated local device(s) blank with a positive full-device
+ *      zero scan (a separate cache bdev is scanned too). A parse error is never
+ *      treated as blank. Anything non-zero, unreadable or unusable is refused,
+ *      because formatting it would destroy a journal that may hold the only
+ *      copy of unflushed mappings.
+ *   5. Formats a fresh local layout using the descriptor's geometry, applies
+ *      the validated checkpoint to the chunk map, and writes the checkpoint
+ *      pointer into the new super block.
+ *   6. Only after that is durable does it load blobstore and register the
+ *      lvols, exactly like attach.
+ *
+ * These checks are necessary but not sufficient: see the section comment in
+ * vbdev_s3lvol_lvstore.c for the window the owner marker cannot close.
+ *
+ * === What it does not do ===
+ *
+ *   - It never creates a blank lvstore over live remote data. The create path
+ *     is untouched and still refuses an existing checkpoint.
+ *   - It never falls back to create, and never bypasses the owner check.
+ *   - It does not replay a journal or WAL, because there is none. The restored
+ *     state is **the last checkpoint**, not every acknowledged write: anything
+ *     committed after that checkpoint and not yet checkpointed is lost. That
+ *     is the RPO of this operation and it is reported in the reply.
+ *   - It does not touch remote objects. The checkpoint, the data objects and
+ *     the descriptor are read only.
+ *
+ * === Ownership ===
+ *
+ * The owner marker is a sequential-misoperation guard, not distributed mutual
+ * exclusion (see s3_owner.h). This operation therefore requires the caller to
+ * be certain no other process is attached, and refuses to proceed while a
+ * marker exists unless \c force is set. It does not claim to fence a
+ * concurrent writer.
+ *
+ * Fails with -ENOENT (no descriptor), -EILSEQ/-EPROTO (corrupt or unsupported
+ * descriptor), -EINVAL (descriptor does not match this lvstore), -EEXIST (the
+ * local device is not blank), -EBUSY (another owner), or -ENODEV (bdev
+ * missing).
+ */
+int s3lvol_lvstore_recover(const struct s3_lvs_opts *opts,
+			   s3lvol_lvs_op_cb cb_fn, void *cb_arg);
 
 /**
  * Unload an lvstore (without deleting the S3 data).
@@ -196,6 +311,32 @@ struct s3lvol_lvstore *s3lvol_lvstore_find_by_lvs(struct spdk_lvol_store *store)
 
 struct spdk_lvol_store *s3lvol_lvstore_get_lvs(struct s3lvol_lvstore *lvs);
 const char             *s3lvol_lvstore_get_name(struct s3lvol_lvstore *lvs);
+
+/* Owner-thread, read-only local snapshots. No remote ownership verification,
+ * allocation, timers or mutation. Unload status uses values, never ctx pointers.
+ * timeout_reported describes the last unload attempt until the next starts.
+ * owner_claim_local is local bookkeeping, NOT proof of remote exclusivity.
+ * Once release_pending is true the remote outcome is explicitly unknown. */
+struct s3lvol_lifecycle_status {
+	struct spdk_uuid uuid;
+	bool unload_in_progress;
+	bool timeout_reported;
+	bool release_pending;
+	bool owner_claim_local;
+	bool native_available;
+	bool write_path_available;
+};
+void s3lvol_lvstore_get_lifecycle(const struct s3lvol_lvstore *lvs,
+				 struct s3lvol_lifecycle_status *out);
+
+/* Only same-process retained attach records. Excludes setup/unwind and destroy
+ * after handoff, completed operations and remote state. Absence proves nothing
+ * about completion or ownership. A ready record still requires matching local
+ * devices and remote claim verification by attach. Callback must not mutate
+ * registries or retain the borrowed name/uuid pointers. No claim secrets. */
+typedef void (*s3lvol_retained_status_cb)(void *arg, const char *name,
+		const struct spdk_uuid *uuid, bool busy, uint32_t failed_attempts);
+void s3lvol_lvstore_foreach_retained_status(s3lvol_retained_status_cb cb, void *arg);
 
 /**
  * The S3 client this lvstore reads and writes through. Its bucket and prefix are
@@ -724,6 +865,14 @@ typedef void (*s3lvol_export_cb)(void *cb_arg, const struct s3lvol_export_info *
 int s3lvol_lvol_export(struct s3lvol_lvstore *lvs, struct spdk_lvol *snapshot,
 		       const char *export_uuid, char *uuid_out, size_t uuid_out_len,
 		       s3lvol_export_cb cb_fn, void *cb_arg);
+int s3lvol_lvol_export_safe(struct s3lvol_lvstore *lvs, struct spdk_lvol *snapshot,
+			   char *uuid_out, size_t uuid_out_len,
+			   s3lvol_export_cb cb_fn, void *cb_arg);
+int s3lvol_restore_hold(struct s3lvol_lvstore *lvs, const char *uuid,
+		       const uint8_t attempt[32], const uint8_t commit[32],
+		       spdk_lvol_op_complete cb, void *arg);
+int s3lvol_import_detach_ack(struct s3lvol_lvstore *lvs, const char *uuid,
+			    spdk_lvol_op_complete cb_fn, void *cb_arg);
 
 /* The states an export can be observed in. Queried live, never stored.
  *
@@ -944,6 +1093,13 @@ unsigned s3lvol_pending_load_release(void);
 void s3lvol_snapshot_pending_clear_lvs(const struct spdk_uuid *lvs_uuid);
 
 /**
+ * True while a pending-delete registry PUT for this lvstore is in flight or
+ * still owed. The unload waits for false before it releases the S3 owner
+ * marker, so no registry write lands after the release.
+ */
+bool s3lvol_pending_persist_busy(const struct spdk_uuid *lvs_uuid);
+
+/**
  * Whether an export that has not published its manifest yet names this snapshot.
  *
  * The registry only learns an export once it is durable, so this is the only way
@@ -1156,10 +1312,9 @@ void s3lvol_imports_recheck(struct s3lvol_lvstore *lvs, const char *export_uuid)
 /**
  * Delete an export's objects.
  *
- * Refuses with -EBUSY while a volume in this process still reads through to it.
- * That is the only protection available: the exporting node cannot know who else
- * imported, which is why the importer is the one that asks for the release, once
- * its clone no longer needs the export.
+ * Fails closed with -EBUSY. The current protocol has no closed-admission and
+ * durable all-reader detach proof. Local reader counts, lease expiry, missing
+ * manifests and an explicit caller request cannot discharge remote obligations.
  */
 int s3lvol_export_release(struct s3lvol_lvstore *lvs, const char *export_uuid,
 			  spdk_lvol_op_complete cb_fn, void *cb_arg);
@@ -1207,6 +1362,17 @@ int s3lvol_esnap_dev_create(void *bs_ctx, void *blob_ctx, struct spdk_blob *blob
 
 struct s3lvol_export;
 
+/* Reactor-thread lifecycle gates. Unknown/incomplete registries are not empty. */
+bool s3lvol_lvstore_exports_ready(const struct s3lvol_lvstore *lvs);
+void s3lvol_lvstore_exports_set_ready(struct s3lvol_lvstore *lvs, bool ready);
+bool s3lvol_lvstore_xfer_allowed(const struct s3lvol_lvstore *lvs);
+bool s3lvol_lvstore_dependency_view_complete(const struct s3lvol_lvstore *lvs);
+bool s3lvol_export_work_busy(struct s3lvol_lvstore *lvs);
+bool s3lvol_export_registry_busy(struct s3lvol_lvstore *lvs);
+void s3lvol_export_publication_complete(struct s3lvol_export *exp,
+                                      const struct s3_export_manifest *m);
+
+
 /**
  * Why the snapshot is (or is not) held, for callers that need more than
  * yes/no.
@@ -1214,23 +1380,23 @@ struct s3lvol_export;
  * Ordered by how restrictive the answer is, so aggregating several exports over
  * one snapshot is a max().
  *
- * The distinction that matters is STALE versus LEGACY. STALE is evidence that
- * no importer currently holds the export. LEGACY predates leases, so reader
- * liveness is unknown: status still reports it, but an explicit snapshot delete
- * is the revocation (the same statement Cubelet used to make with
- * rcow_release_export).
+ * STALE, LEGACY and LEASE are retained for diagnostic compatibility only.
+ * OBLIGATION is the durable safety pin and does not expire with a heartbeat.
  */
 enum s3lvol_export_pin {
 	S3LVOL_EXPORT_PIN_NONE,		/* no reference export names it */
 	S3LVOL_EXPORT_PIN_STALE,	/* named, but its lease says nobody reads */
 	S3LVOL_EXPORT_PIN_LEGACY,	/* named, no trustworthy lease evidence */
-	S3LVOL_EXPORT_PIN_LEASE,	/* an importer is reading, or may be */
+	S3LVOL_EXPORT_PIN_LEASE,	/* diagnostic compatibility */
+	S3LVOL_EXPORT_PIN_OBLIGATION, /* durable, independent of lease liveness */
 };
 
 static inline const char *
 s3lvol_export_pin_str(enum s3lvol_export_pin pin)
 {
 	switch (pin) {
+	case S3LVOL_EXPORT_PIN_OBLIGATION:
+		return "obligation";
 	case S3LVOL_EXPORT_PIN_STALE:
 		return "stale";
 	case S3LVOL_EXPORT_PIN_LEGACY:
@@ -1251,6 +1417,8 @@ struct s3lvol_export_entry {
 	uint64_t    expires_at;
 	uint32_t    generation;
 	bool    is_ref;
+	bool    publication_pending;
+	bool    source_obligation;
 	bool    lease_aware;
 	bool    lease_checked;
 	bool    lease_absent;
@@ -1262,13 +1430,45 @@ struct s3lvol_export_entry {
 	enum s3lvol_export_pin pin;
 };
 
+/* ==========================================================================
+ * Legacy / REF retention disposition
+ *
+ * The classification lives in export_disposition_ctl.h (pure, header-only,
+ * unit-testable). These declarations are the module-side glue: the cached
+ * admission state and the entry-to-facts adapter.
+ *
+ * Invariants the classification keeps:
+ *   - release_supported is true only for the opt-in dense v4 path with a
+ *     durable admission document.
+ *   - migration_supported is false everywhere. There is no supported
+ *     automated migration for REF or legacy dense exports.
+ *   - No field is an authorization. They describe; they do not permit.
+ * ========================================================================== */
+
+/**
+ * The admission state this node last observed for \p exp.
+ *
+ * Synchronous and non-blocking: the status RPC must not become an S3 GET per
+ * export. ABSENT means "no document observed", which is correct for a legacy
+ * export and conservative for a v4 export not yet read.
+ */
+enum s3lvol_export_admission
+s3lvol_export_admission_state(const struct s3lvol_export *exp);
+
+/** Record an observed admission state. Called by release/reconcile only. */
+void s3lvol_export_note_admission(struct s3lvol_export *exp,
+				  enum s3lvol_export_admission adm);
+
+/** Derive the disposition of one registry entry. Pure; no I/O. */
+void s3lvol_export_disposition_of(const struct s3lvol_export *exp,
+				  struct s3lvol_export_disposition_info *out);
+
 /**
  * The export that still pins \c snapshot_name, or NULL if it may be deleted.
  *
- * Only a reference export with a live or still-unknown reader counts. A
- * confirmed lease miss older than the source grace, and a pre-lease (LEGACY)
- * export, do not pin: they remain importable until the snapshot is deleted, and
- * that delete releases them internally.
+ * A reference export pins independently of heartbeat liveness. Its source
+ * obligation remains sticky after materialisation because derived manifests can
+ * retain old source refs. A first publication as dense owes no source snapshot.
  */
 struct s3lvol_export *s3lvol_export_pinning(struct s3lvol_lvstore *lvs,
 					    const char *snapshot_name);
@@ -1282,6 +1482,12 @@ struct s3lvol_export *s3lvol_export_find(struct s3lvol_lvstore *lvs,
 struct s3lvol_export *s3lvol_export_add(struct s3lvol_lvstore *lvs,
 					const struct s3_export_manifest *m,
 					const char *snapshot_name);
+int s3lvol_export_publication_save(struct s3lvol_export *exp, struct s3_export_manifest *m,
+                                  spdk_lvs_op_complete cb, void *arg);
+/** Explicit read-only proof followed by registry commit. No republish or cleanup.
+ * Only first-generation admission-enabled dense publications are supported. */
+int s3lvol_export_reconcile(struct s3lvol_lvstore *lvs, const char *uuid,
+                            spdk_lvol_op_complete cb, void *arg);
 void s3lvol_export_forget(struct s3lvol_export *exp);
 void s3lvol_export_set_materialised(struct s3lvol_export *exp, uint32_t generation);
 void s3lvol_export_set_local_ref(struct s3lvol_export *exp, uint32_t generation);
@@ -1320,33 +1526,16 @@ int s3lvol_xfer_exports_load(struct s3lvol_lvstore *lvs,
 void s3lvol_xfer_exports_fini(struct s3lvol_lvstore *lvs);
 
 /**
- * Turn a reference export into a copied one, so this node stops owing anybody
- * its snapshot.
+ * Publish copied objects and a higher-generation dense manifest.
  *
- * A reference export names this lvstore's live chunk objects, which is why it
- * pins the snapshot behind it: those objects cannot be reclaimed while an
- * importer may read them. Snapshot deletion waits for readers and then releases
- * the ref export. Materialising is the alternative when the export itself must
- * survive: copy the snapshot and publish the manifest as dense with `generation`
- * bumped.
+ * This preserves direct-reader refetch, but does NOT discharge the source
+ * obligation: a derived manifest can cache the old source refs independently.
+ * Source deletion and export release remain blocked until a future durable
+ * detach/lineage protocol can prove those readers independent. First publication
+ * as dense is different: it never exposed the source refs.
  *
- * Afterwards the export owes nothing. It holds copies, so the pin and lease
- * watch go away -- see
- * s3lvol_export_set_materialised().
- *
- * **Importers are not told, and do not have to be.** The manifest is replaced in
- * place, so an importer holding the old one keeps reading until the objects it
- * names disappear; the 404 then makes it refetch, find the higher generation, and
- * carry on against the copies. That is why the ordering here is not negotiable:
- * the new manifest has to be published before the old objects can be deleted, or
- * a reader hits a 404 and refetches into the manifest that sent it there.
- *
- * This does not delete the old chunk objects. They belong to the snapshot's chunk
- * map, not to the export, and they go when the snapshot does -- which is now
- * allowed to happen.
- *
- * \return 0 with the callback pending; -ENOENT if no such export; -EALREADY if it
- * is already a copy; -EBUSY if a materialisation of it is already running.
+ * Returns 0 with callback pending, -ENOENT if absent, -EALREADY if already dense,
+ * or -EBUSY during unload/publication/registry writes or another rewrite.
  */
 int s3lvol_export_materialise(struct s3lvol_lvstore *lvs, const char *export_uuid,
 			      spdk_lvol_op_complete cb_fn, void *cb_arg);

@@ -51,6 +51,42 @@
 
 #include "vbdev_s3lvol.h"
 
+/* The immutable gate pointer avoids walking the owner-thread store registry
+ * from an NVMe poll-group thread. The bdev keeps the store alive. */
+struct s3lvol_gated_bdev {
+	struct spdk_bdev bdev;
+	struct s3_producer_gate *gate;
+	struct s3_producer_gate *source_gate;
+};
+
+struct s3_producer_gate *
+s3lvol_lvol_producer_gate(struct spdk_lvol *lvol)
+{
+	if (!lvol || !lvol->bdev) return NULL;
+	return SPDK_CONTAINEROF(lvol->bdev, struct s3lvol_gated_bdev, bdev)->source_gate;
+}
+
+bool
+s3lvol_lvol_source_closed(struct spdk_lvol *lvol)
+{
+	struct s3_producer_gate *g = s3lvol_lvol_producer_gate(lvol);
+	return g && s3_producer_closed(g);
+}
+
+static struct s3_producer_gate *
+s3lvol_io_gate(struct spdk_bdev_io *io)
+{
+	return SPDK_CONTAINEROF(io->bdev, struct s3lvol_gated_bdev, bdev)->gate;
+}
+
+static bool
+s3lvol_io_mutates(struct spdk_bdev_io *io)
+{
+	return io->type == SPDK_BDEV_IO_TYPE_WRITE ||
+		io->type == SPDK_BDEV_IO_TYPE_UNMAP ||
+		io->type == SPDK_BDEV_IO_TYPE_WRITE_ZEROES;
+}
+
 /* ==========================================================================
  * Completion callbacks
  * ========================================================================== */
@@ -60,6 +96,10 @@ s3lvol_io_complete(void *cb_arg, int bserrno)
 {
 	struct spdk_bdev_io *bdev_io = cb_arg;
 	enum spdk_bdev_io_status status;
+	struct s3_producer_gate *gate = s3lvol_io_gate(bdev_io);
+	struct s3_producer_gate *source = SPDK_CONTAINEROF(bdev_io->bdev,
+		struct s3lvol_gated_bdev, bdev)->source_gate;
+	bool mutates = s3lvol_io_mutates(bdev_io);
 
 	if (bserrno == 0) {
 		status = SPDK_BDEV_IO_STATUS_SUCCESS;
@@ -72,6 +112,11 @@ s3lvol_io_complete(void *cb_arg, int bserrno)
 	}
 
 	spdk_bdev_io_complete(bdev_io, status);
+	/* bdev_io may already have been freed by the callback. */
+	if (mutates) {
+		s3_producer_leave(source, bserrno == -ENOMEM ? 0 : bserrno);
+		s3_producer_leave(gate, bserrno == -ENOMEM ? 0 : bserrno);
+	}
 }
 
 /* ==========================================================================
@@ -134,6 +179,19 @@ static void
 s3lvol_submit_request(struct spdk_io_channel *ch, struct spdk_bdev_io *bdev_io)
 {
 	struct spdk_lvol *lvol = bdev_io->bdev->ctxt;
+
+	/* Also covers a bdev-layer retry queued before closure but submitted after
+	 * it. Previously admitted blob I/O retains its ticket through all retries. */
+	if (s3lvol_io_mutates(bdev_io) && s3_producer_enter(s3lvol_io_gate(bdev_io))) {
+		spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_FAILED);
+		return;
+	}
+	if (s3lvol_io_mutates(bdev_io) &&
+	    s3_producer_enter(s3lvol_lvol_producer_gate(lvol))) {
+		s3_producer_leave(s3lvol_io_gate(bdev_io), 0);
+		spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_FAILED);
+		return;
+	}
 
 	switch (bdev_io->type) {
 	case SPDK_BDEV_IO_TYPE_READ:
@@ -279,6 +337,9 @@ s3lvol_destruct(void *ctx)
 {
 	struct spdk_lvol *lvol = ctx;
 	struct spdk_bdev *bdev = lvol->bdev;
+	if (s3lvol_lvol_source_held(lvol)) return -EBUSY;
+	if (s3_producer_closed(SPDK_CONTAINEROF(bdev,
+		struct s3lvol_gated_bdev, bdev)->gate)) return -EBUSY;
 
 	/* The bdev layer has already guaranteed there is no in-flight I/O.
 	 *
@@ -335,7 +396,8 @@ static const struct spdk_bdev_fn_table s3lvol_fn_table = {
  * ========================================================================== */
 
 int
-vbdev_s3lvol_bdev_register(struct spdk_lvol *lvol, const char *lvs_name)
+vbdev_s3lvol_bdev_register(struct spdk_lvol *lvol, const char *lvs_name,
+                         struct s3_producer_gate *gate)
 {
 	struct spdk_bdev *bdev;
 	struct spdk_blob_store *bs;
@@ -366,9 +428,18 @@ vbdev_s3lvol_bdev_register(struct spdk_lvol *lvol, const char *lvs_name)
 	bs = lvol->lvol_store->blobstore;
 	cluster_sz = spdk_bs_get_cluster_size(bs);
 
-	bdev = calloc(1, sizeof(*bdev));
+	bdev = calloc(1, sizeof(struct s3lvol_gated_bdev));
 	if (!bdev) {
 		return -ENOMEM;
+	}
+ SPDK_CONTAINEROF(bdev, struct s3lvol_gated_bdev, bdev)->source_gate = s3lvol_source_gate_alloc(lvol, gate);
+ if(!SPDK_CONTAINEROF(bdev, struct s3lvol_gated_bdev, bdev)->source_gate){free(bdev);return -ENOMEM;}
+
+	SPDK_CONTAINEROF(bdev, struct s3lvol_gated_bdev, bdev)->gate =
+		gate;
+	if (!SPDK_CONTAINEROF(bdev, struct s3lvol_gated_bdev, bdev)->gate) {
+		free(bdev);
+		return -EINVAL;
 	}
 
 	bdev->name = strdup(bdev_name);

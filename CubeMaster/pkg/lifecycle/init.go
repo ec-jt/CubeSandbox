@@ -164,9 +164,9 @@ func onAfterDestroy(ctx context.Context, sandboxID string) error {
 // *Store reference to announce a pause / resume transition to the CLM.
 // Safe to call when lifecycle is disabled or Redis is unreachable — the
 // underlying Store swallows those cases.
-func PublishStateDefault(ctx context.Context, sandboxID, state, source string) {
+func PublishStateDefault(ctx context.Context, sandboxID, state, source string, requestID ...string) {
 	if store := getDefaultStore(); store != nil {
-		store.PublishState(ctx, sandboxID, state, source)
+		store.PublishState(ctx, sandboxID, state, source, requestID...)
 	}
 }
 
@@ -177,7 +177,7 @@ func PublishStateDefault(ctx context.Context, sandboxID, state, source string) {
 // Unknown actions are ignored (the update handler already validates that
 // action ∈ {"pause","resume"}; this is defence-in-depth against future
 // action codes reaching the hook chain without a schema update here).
-func onAfterUpdate(ctx context.Context, sandboxID, _ /*instanceType*/, action, _ /*requestID*/ string) {
+func onAfterUpdate(ctx context.Context, sandboxID, _ /*instanceType*/, action, requestID string) {
 	var state string
 	switch action {
 	case "pause":
@@ -187,5 +187,5 @@ func onAfterUpdate(ctx context.Context, sandboxID, _ /*instanceType*/, action, _
 	default:
 		return
 	}
-	PublishStateDefault(ctx, sandboxID, state, "api")
+	PublishStateDefault(ctx, sandboxID, state, "api", requestID)
 }

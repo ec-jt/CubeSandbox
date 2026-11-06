@@ -78,6 +78,11 @@ extern "C" {
 
 struct s3_chunk_map;
 
+/* Object key the checkpoint lives under, relative to the lvstore prefix. Also
+ * used by the recovery preflight, which has to read the same object the load
+ * path reads. */
+#define S3_CKPT_KEY_FMT     "%s/meta/checkpoint"
+
 /* "S3LVCKPT" */
 #define S3_CKPT_MAGIC       0x53334C56434B5054ULL
 #define S3_CKPT_VERSION     1
@@ -134,7 +139,67 @@ struct s3_ckpt_entry {
 SPDK_STATIC_ASSERT(sizeof(struct s3_ckpt_entry) == 40,
 		   "checkpoint entry must stay 40 bytes");
 
-typedef void (*s3_checkpoint_cb)(void *cb_arg, int status);
+/**
+ * A validated view of a checkpoint blob held in memory. Both pointers alias the
+ * buffer that was validated; nothing is copied.
+ */
+struct s3_ckpt_view {
+	const struct s3_ckpt_header *hdr;
+	const struct s3_ckpt_entry  *entries;
+};
+
+/**
+ * What a caller already knows about the checkpoint it expects.
+ *
+ * Every member is optional: a zero value, NULL pointer or false flag means "do
+ * not check this". That keeps the one parser usable both by the normal load
+ * path (which knows only the chunk size) and by the recovery preflight (which
+ * knows the identity, the point in time and the geometry from a descriptor).
+ *
+ * `num_chunks_limit` is the number of chunks the lvstore's capacity admits. When
+ * non-zero, every entry's chunk_index must be below it and the array must be
+ * strictly increasing, which also rejects duplicates. The serialiser walks the
+ * map in index order, so a well-formed checkpoint always satisfies this.
+ */
+struct s3_ckpt_expect {
+	uint32_t                chunk_size;
+	const struct spdk_uuid *lvs_uuid;
+	bool                    check_point;
+	uint64_t                gen;
+	uint64_t                lsn;
+	uint64_t                num_chunks_limit;
+};
+
+/**
+ * Validate a serialised checkpoint in memory, without applying it.
+ *
+ * Always checks: header present, magic, version, header CRC, exact object size
+ * (header + num_entries entries, with the multiplication bounded by `len`), and
+ * the entry-array CRC. Then applies whichever expectations were set.
+ *
+ * This is the *only* checkpoint parser. s3_checkpoint_load() calls it before
+ * applying entries, and the recovery preflight calls it before anything is
+ * claimed or formatted, so the two paths cannot drift apart.
+ *
+ * \return 0 and fills \c view on success; -EILSEQ on structural corruption;
+ *         -EPROTO on an unknown version; -EINVAL on a value that parses but is
+ *         not the one the caller expected.
+ */
+int s3_checkpoint_validate(const void *buf, uint64_t len,
+			   const struct s3_ckpt_expect *expect,
+			   struct s3_ckpt_view *view);
+
+/**
+ * \param status        0 on success
+ * \param object_bytes  size of the object that was uploaded (header + entries).
+ *                      Reported so the caller can publish a recovery descriptor
+ *                      that names this exact object; 0 on failure.
+ * \param entries_crc   CRC32C over the entry array, as written into the header.
+ *                      Lets the recovery path prove the checkpoint it downloads
+ *                      is the one the descriptor was written for. 0 on failure.
+ */
+typedef void (*s3_checkpoint_cb)(void *cb_arg, int status,
+				 uint64_t object_bytes, uint32_t entries_crc);
 
 /**
  * \param lsn     LSN the loaded snapshot covers; 0 when there was none
@@ -142,6 +207,21 @@ typedef void (*s3_checkpoint_cb)(void *cb_arg, int status);
  */
 typedef void (*s3_checkpoint_load_cb)(void *cb_arg, uint64_t lsn, uint64_t gen,
 				      int status);
+
+/**
+ * Apply a checkpoint blob that has already been validated.
+ *
+ * Unlike s3_checkpoint_load() this reads nothing from S3: exactly the bytes
+ * handed in are applied. The recovery path uses it so that the state restored
+ * is the state that passed the preflight, not a second download that could
+ * differ.
+ *
+ * \c expect is re-validated here rather than trusted, because a caller that
+ * skipped the preflight must not be able to apply unvalidated bytes.
+ */
+int s3_checkpoint_apply(struct s3_chunk_map *map, const void *buf,
+			uint64_t len, const struct s3_ckpt_expect *expect,
+			s3_checkpoint_load_cb cb_fn, void *cb_arg);
 
 /**
  * Snapshot \c map to `<lvs_name>/meta/checkpoint`.

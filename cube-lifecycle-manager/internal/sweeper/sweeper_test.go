@@ -334,8 +334,8 @@ func TestSweeper_KillRollsBackOnFailure(t *testing.T) {
 	s := newTestSweeper(reg, store, master, push, now)
 	s.sweepOnce(context.Background())
 
-	if got := store.state("sbx-killfail"); got != "" {
-		t.Fatalf("redis state should be cleared after rollback, got %q", got)
+	if got := store.state("sbx-killfail"); got != "running" {
+		t.Fatalf("redis state should restore terminal state after rollback, got %q", got)
 	}
 	pushed := push.states("sbx-killfail")
 	if len(pushed) == 0 || pushed[len(pushed)-1] != "running" {
@@ -370,8 +370,8 @@ func TestSweeper_KillPausedRollsBackToPausedOnFailure(t *testing.T) {
 	s := newTestSweeper(reg, store, master, push, now)
 	s.sweepOnce(context.Background())
 
-	if got := store.state(sid); got != "" {
-		t.Fatalf("redis state should be cleared after rollback, got %q", got)
+	if got := store.state(sid); got != "paused" {
+		t.Fatalf("redis state should restore terminal state after rollback, got %q", got)
 	}
 	pushed := push.states(sid)
 	if len(pushed) == 0 || pushed[len(pushed)-1] != lifecycle.StatePaused {
@@ -409,8 +409,8 @@ func TestSweeper_KillPausedDoesNotEvictOnTaskStateInvalid(t *testing.T) {
 	if reg.Get(sid) == nil {
 		t.Fatal("130490 must not evict a live paused sandbox")
 	}
-	if got := store.state(sid); got != "" {
-		t.Fatalf("must not write killed; redis should be cleared for retry, got %q", got)
+	if got := store.state(sid); got != "paused" {
+		t.Fatalf("must not write killed; redis should retain paused for retry, got %q", got)
 	}
 	if got := push.deletedIDs(); len(got) != 0 {
 		t.Fatalf("DeleteMeta must not fire on 130490, got %v", got)
@@ -638,8 +638,8 @@ func TestSweeper_RollsBackOnPauseFailure(t *testing.T) {
 	s := newTestSweeper(reg, store, master, push, now)
 	s.sweepOnce(context.Background())
 
-	if got := store.state("sbx-4"); got != "" {
-		t.Fatalf("redis state should be cleared after rollback, got %q", got)
+	if got := store.state("sbx-4"); got != "running" {
+		t.Fatalf("redis state should restore terminal state after rollback, got %q", got)
 	}
 	pushed := push.states("sbx-4")
 	if len(pushed) == 0 || pushed[len(pushed)-1] != "running" {
@@ -1005,7 +1005,7 @@ func TestSweeper_OtherMasterParamsErrorStillFails(t *testing.T) {
 	s := newTestSweeper(reg, store, master, push, now)
 	s.sweepOnce(context.Background())
 
-	if got := store.state("sbx-bad"); got != "" {
+	if got := store.state("sbx-bad"); got != "running" {
 		t.Fatalf("unrelated 130400 must not leave paused, got %q", got)
 	}
 	pushed := push.states("sbx-bad")

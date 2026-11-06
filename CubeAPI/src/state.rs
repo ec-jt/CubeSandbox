@@ -42,10 +42,13 @@ impl AppState {
         let http_client = reqwest::Client::builder()
             .pool_max_idle_per_host(100)
             .connection_verbose(false)
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .expect("failed to build HTTP client");
 
-        let cubemaster = CubeMasterClient::new(config.cubemaster_url.clone(), http_client.clone());
+        let cubemaster = CubeMasterClient::new(config.cubemaster_url.clone(), http_client.clone())
+            .with_master_auth(std::env::var("CUBE_MASTER_USER_ID").ok(), std::env::var("CUBE_MASTER_SECRET").ok())
+            .expect("invalid outbound Master authentication configuration");
         let services = AppServices::new(&config, cubemaster);
 
         Self {

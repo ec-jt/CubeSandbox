@@ -34,6 +34,29 @@ pub use crate::engine::Engine;
 // Public types — clean API surface for lib consumers
 // ---------------------------------------------------------------------------
 
+/// Native import provenance, independent of source-side snapshot exports.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ImportOrigin {
+    pub version: u32,
+    pub volume_uuid: String,
+    pub lvstore_uuid: String,
+    pub export_uuid: String,
+    pub snapshot_uuid: String,
+    pub endpoint: String,
+    pub bucket: String,
+    pub prefix: String,
+    pub lvs_name: String,
+    pub snapshot: String,
+    pub manifest_version: u32,
+    pub generation: u32,
+    pub cluster_size: u32,
+    pub chunk_size: u32,
+    pub block_size: u32,
+    pub blob_id: u64,
+    pub source_blob_id: u64,
+    pub size_bytes: u64,
+}
+
 /// Volume information returned by the library API.
 ///
 /// This is a clean, public-facing type that exposes only the information
@@ -51,6 +74,10 @@ pub use crate::engine::Engine;
 /// upload-status must therefore surface on the same struct.
 #[derive(Debug, Clone)]
 pub struct Volume {
+    /// Live native destination identity, never inferred from the local index.
+    pub volume_uuid: String,
+    /// Blob-local import evidence. None means unattributed, not verified.
+    pub import_origin: Option<ImportOrigin>,
     /// User-specified volume name.
     pub name: String,
     /// Logical size in bytes.

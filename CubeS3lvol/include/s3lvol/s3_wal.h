@@ -204,6 +204,9 @@ struct s3_wal_opts {
 /**
  * Format a fresh WAL in the local bdev's WAL region.
  *
+ * Requires at least two usable segments plus the two slack segments and the
+ * super block. Insufficient geometry returns -ENOSPC before WAL writes.
+ *
  * Writes both super slots and zeroes the head of the first segment so a later
  * scan can tell "no entries" from "unreadable". *Destroys any existing log.*
  */
@@ -215,6 +218,8 @@ void s3_wal_create(struct s3_local_dev *local_dev, const struct s3_wal_opts *opt
  *
  * Reads both super slots and takes the newer valid one. Does *not* replay:
  * call s3_wal_replay() next, which also positions the append cursor.
+ * Legacy one-segment logs remain replayable, but appends return -ENOSPC.
+ * Recover into a new adequate WAL; resizing an existing region is unsupported.
  *
  * status is -EILSEQ when neither slot is valid, and -EPROTO on a version this
  * build does not understand.

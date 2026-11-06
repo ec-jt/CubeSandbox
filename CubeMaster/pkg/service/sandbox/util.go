@@ -976,6 +976,8 @@ func setCreateTimeEnvVarsAnnotation(out map[string]string, envVars map[string]st
 // and make CleanupTemplate no-op for another tenant's pause catalog.
 func rejectUserCubeMasterAnnotation(key string) bool {
 	switch strings.TrimSpace(key) {
+	case "cube.master.recreate.policy":
+		return true
 	case constants.CubeAnnotationPauseSnapshotID,
 		constants.CubeAnnotationLaunchMemorySnapshotID,
 		constants.CubeAnnotationRuntimeRestoreSnapshotID,

@@ -11,7 +11,6 @@ import (
 	"time"
 
 	"github.com/tencentcloud/CubeSandbox/Cubelet/storage/cow"
-	CubeLog "github.com/tencentcloud/CubeSandbox/pkgs/CubeLog"
 )
 
 type s3UploadEntry struct {
@@ -58,9 +57,16 @@ func (m *S3Cow) Upload(ctx context.Context, snapshotID string) (*cow.RemoteUUIDs
 		exportable = append(exportable, ref)
 	}
 
-	// Parallel export: fire every export_snapshot back-to-back and let the
-	// backend drain them together.
-	for _, ref := range exportable {
+	// Native registry persistence is serialized per store. Acceptance is not
+	// completion: wait for each accepted role before submitting the next.
+	// Never retry an admission/transport error whose acceptance is ambiguous.
+	settleCtx, cancel := context.WithTimeout(ctx, exportSettleBudget)
+	defer cancel()
+	for i, ref := range exportable {
+		if err := settleCtx.Err(); err != nil {
+			m.setUpload(id, cow.RemoteStateFailed, err.Error(), nil)
+			return nil, err
+		}
 		uuid, err := m.uploadOne(ref.Name)
 		if err != nil {
 			m.setUpload(id, cow.RemoteStateFailed, err.Error(), nil)
@@ -74,31 +80,14 @@ func (m *S3Cow) Upload(ctx context.Context, snapshotID string) (*cow.RemoteUUIDs
 		case "metadata":
 			uuids.Metadata = uuid
 		}
+		if i < len(exportable)-1 {
+			if err := m.waitExportSettled(settleCtx, ref.Name, uuid); err != nil {
+				m.setUpload(id, cow.RemoteStateFailed, err.Error(), nil)
+				return nil, fmt.Errorf("settle %s %s: %w", ref.Role, ref.Name, err)
+			}
+		}
 	}
 
-	// Serial export (kept for switch-back): wait for each object to leave
-	// the drain path before starting the next. The last one does not wait,
-	// so Pause still has time for Destroy inside the same RPC budget.
-	//
-	// settleBy := time.Now().Add(exportSettleBudget)
-	// for i, ref := range exportable {
-	// 	uuid, err := m.uploadOne(ref.Name)
-	// 	if err != nil {
-	// 		m.setUpload(id, cow.RemoteStateFailed, err.Error(), nil)
-	// 		return nil, fmt.Errorf("upload %s %s: %w", ref.Role, ref.Name, err)
-	// 	}
-	// 	switch ref.Role {
-	// 	case "rootfs":
-	// 		uuids.Rootfs = uuid
-	// 	case "memory":
-	// 		uuids.Memory = uuid
-	// 	case "metadata":
-	// 		uuids.Metadata = uuid
-	// 	}
-	// 	if i < len(exportable)-1 {
-	// 		m.waitExportSettled(ctx, ref.Name, uuid, settleBy)
-	// 	}
-	// }
 	if uuids.Empty() {
 		m.setUpload(id, cow.RemoteStateFailed, "empty remote_uuids", nil)
 		return nil, fmt.Errorf("s3 export returned empty remote_uuids for %s", id)
@@ -120,43 +109,39 @@ func (m *S3Cow) Upload(ctx context.Context, snapshotID string) (*cow.RemoteUUIDs
 // is a drain, not a transfer, and is normally seconds.
 const exportSettleBudget = 75 * time.Second
 
-// waitExportSettled blocks until this object's export is out of the
-// backend's drain path, so the next export does not collide with it.
-//
-// s3lvol drains one lvstore at a time and gives a waiting export 5s to win
-// that race. Every package exports three objects out of the same lvstore,
-// and export_snapshot returns its uuid before any bytes move, so issuing
-// them back to back — which is what a plain sequential loop does — loses
-// two of the three to "Device or resource busy".
-//
-// Advisory: a wait that runs out of budget or lands on a dead export is
-// reported by UploadStatus, not here, because Upload only promises that
-// the exports were accepted.
-func (m *S3Cow) waitExportSettled(ctx context.Context, name, uuid string, deadline time.Time) {
+// waitExportSettled requires durable completion of the exact accepted export.
+// Missing/failed/changed identities and lookup errors fail closed. The shared
+// Upload context bounds all role waits; timing out never starts the next role.
+func (m *S3Cow) waitExportSettled(ctx context.Context, name, uuid string) error {
 	for {
-		info, infoErr := m.GetVolumeInfo(ctx, name)
-		status := ""
-		if info != nil {
-			status = strings.ToUpper(strings.TrimSpace(info.ExportStatus))
+		if err := ctx.Err(); err != nil {
+			return err
 		}
-		switch {
-		case infoErr == nil && status == cow.ExportStatusDone:
-			return
-		case infoErr == nil && status == "" && uuid != "":
-			// s3lvol dropped the uuid: the export failed and no amount of
-			// waiting brings it back.
-			CubeLog.Warnf("s3 export %s (%s) died before draining", name, uuid)
-			return
+		info, err := m.GetVolumeInfo(ctx, name)
+		if err != nil {
+			return err
 		}
-		if time.Now().After(deadline) {
-			CubeLog.Warnf("s3 export %s (%s) still %q when the settle budget ran out; continuing",
-				name, uuid, status)
-			return
+		if err := ctx.Err(); err != nil {
+			return err
 		}
+		if info == nil || strings.TrimSpace(info.ExportUUID) != uuid {
+			return fmt.Errorf("accepted export %s identity missing or changed for %s", uuid, name)
+		}
+		status := strings.ToUpper(strings.TrimSpace(info.ExportStatus))
+		switch status {
+		case cow.ExportStatusDone:
+			return nil
+		case cow.ExportStatusInProgress, "":
+			// An empty status is not a terminal native failure. Wait boundedly.
+		default:
+			return fmt.Errorf("accepted export %s has terminal or unknown status %q", uuid, status)
+		}
+		timer := time.NewTimer(100 * time.Millisecond)
 		select {
 		case <-ctx.Done():
-			return
-		case <-time.After(time.Second):
+			timer.Stop()
+			return ctx.Err()
+		case <-timer.C:
 		}
 	}
 }
@@ -316,8 +301,15 @@ func (m *S3Cow) UploadStatus(ctx context.Context, snapshotID string) (*cow.Remot
 		st.State = cow.RemoteStateFailed
 		st.Message = strings.Join(messages, "; ")
 	case allDone:
+		committed, err := m.commitCheckpoint(ctx, id)
+		if err != nil {
+			return nil, fmt.Errorf("checkpoint commit: %w", err)
+		}
 		st.State = cow.RemoteStateReady
 		st.Message = "export_status DONE"
+		if committed {
+			st.Message = "committed capture; export_status DONE"
+		}
 	case anyProgress:
 		st.State = cow.RemoteStateRunning
 		if len(messages) > 0 {

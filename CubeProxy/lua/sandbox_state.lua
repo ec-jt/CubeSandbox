@@ -38,17 +38,18 @@ function _M.gate(ins_id)
         return
     end
 
-    local states = ngx.shared.cube_sandbox_state
-    if not states then
+    local authoritative = require "lifecycle_state"
+    local state, read_err = authoritative.read(ins_id)
+    if read_err then
+        ngx.header["Retry-After"] = "2"
+        return utils:respond_unavailable()
+    end
+    if not state then return end
+    if state == "running" then
         return
     end
 
-    local state = states:get(ins_id)
-    if not state or state == "running" then
-        return
-    end
-
-    if state == "pausing" then
+    if state == "pausing" or state == "resuming" then
         -- CLM is mid-flight; better to bounce the client than race it.
         ngx.log(ngx.WARN, "LEVEL_WARN||",
             string.format("request %s sandbox %s is pausing; returning 503",
@@ -64,14 +65,9 @@ function _M.gate(ins_id)
         utils:respond_gone()
     end
 
-    if state ~= "paused" then
-        -- Unknown state — log once and let the request through; resume logic
-        -- only fires for the well-known "paused" value to keep behaviour
-        -- predictable as new states are added.
-        ngx.log(ngx.WARN, "LEVEL_WARN||",
-            string.format("sandbox %s has unknown state %q; passing through",
-                ins_id, tostring(state)))
-        return
+    if state ~= "paused" and state ~= "unknown" then
+        ngx.header["Retry-After"] = "2"
+        return utils:respond_unavailable()
     end
 
     -- state == "paused": ask CLM to resume, then continue.
@@ -79,7 +75,7 @@ function _M.gate(ins_id)
         ngx.log(ngx.ERR, "LEVEL_ERROR||",
             string.format("sandbox %s is paused but cube_sidecar_addr is unset; dataplane will fail",
                 ins_id))
-        return
+        return utils:respond_unavailable()
     end
 
     -- ngx.location.capture issues a sub-request to /_sidecar_resume which
@@ -116,12 +112,13 @@ function _M.gate(ins_id)
         utils:respond_unavailable()
     end
 
-    -- Resume succeeded. Optimistically mark the sandbox running locally so a
-    -- burst of concurrent requests that arrived during the pause don't all
-    -- launch their own resume sub-requests. CLM will push the
-    -- authoritative value via /admin/state shortly after, which simply
-    -- overwrites this.
-    states:set(ins_id, "running")
+    -- A successful HTTP response describes an earlier operation. A newer
+    -- pause/kill may have completed while that response was in flight.
+    state, read_err = authoritative.read(ins_id)
+    if not read_err and state == "running" then return end
+    if state == "killing" or state == "killed" then return utils:respond_gone() end
+    ngx.header["Retry-After"] = "2"
+    return utils:respond_unavailable()
 end
 
 return _M

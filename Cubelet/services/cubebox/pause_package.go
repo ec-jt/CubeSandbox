@@ -8,6 +8,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"github.com/containerd/containerd/v2/pkg/namespaces"
 	"os"
 	"path/filepath"
 	"strings"
@@ -16,6 +17,7 @@ import (
 	"github.com/tencentcloud/CubeSandbox/Cubelet/pkg/constants"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/pkg/pathutil"
 	cubeboxstore "github.com/tencentcloud/CubeSandbox/Cubelet/pkg/store/cubebox"
+	"github.com/tencentcloud/CubeSandbox/Cubelet/plugins/workflow"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/storage"
 	"github.com/tencentcloud/CubeSandbox/pkgs/proto/services/cubebox/v1"
 	"google.golang.org/protobuf/proto"
@@ -45,6 +47,9 @@ func buildPauseSandboxSpec(sb *cubeboxstore.CubeBox, requestID string) *cubebox.
 	if runReq.Annotations == nil {
 		runReq.Annotations = map[string]string{}
 	}
+	// An operation policy is not durable sandbox configuration. A later normal
+	// Resume must not inherit an earlier cold-recreate authorization.
+	delete(runReq.Annotations, workflow.ColdRecreatePolicy)
 	if runReq.InstanceType == "" {
 		runReq.InstanceType = cubebox.InstanceType_cubebox.String()
 	}
@@ -72,12 +77,25 @@ func containerConfigForPause(c *cubeboxstore.Container) *cubebox.ContainerConfig
 	if cloned == nil {
 		return c.Config
 	}
+	cloned.Id = c.ID
 	if c.Container == nil {
 		return cloned
 	}
-	spec, err := c.Container.Spec(context.Background())
+	ns := c.Namespace
+	if ns == "" {
+		ns = namespaces.Default
+	}
+	spec, err := c.Container.Spec(namespaces.WithNamespace(context.Background(), ns))
 	if err != nil || spec == nil || spec.Process == nil {
 		return cloned
+	}
+	// Only the digest computed by the runtime plugin is producer metadata.
+	if cloned.Annotations == nil {
+		cloned.Annotations = map[string]string{}
+	}
+	delete(cloned.Annotations, workflow.RetainedLowerSHA256)
+	if digest := spec.Annotations[workflow.RetainedLowerSHA256]; digest != "" {
+		cloned.Annotations[workflow.RetainedLowerSHA256] = digest
 	}
 	if len(cloned.GetCommand()) == 0 && len(cloned.GetArgs()) == 0 && len(spec.Process.Args) > 0 {
 		cloned.Args = append([]string{}, spec.Process.Args...)
@@ -176,6 +194,7 @@ type pauseRestoreBinding struct {
 	attachedAt       string
 	remoteUUIDs      string
 	crossNode        bool
+	coldPolicy       string
 }
 
 func pauseRestoreBindingFrom(req *cubebox.RunCubeSandboxRequest, snapshotID, backend string) pauseRestoreBinding {
@@ -188,6 +207,7 @@ func pauseRestoreBindingFrom(req *cubebox.RunCubeSandboxRequest, snapshotID, bac
 		attachedAt:       strings.TrimSpace(ann[constants.MasterAnnotationRuntimeSnapshotAttachedAt]),
 		remoteUUIDs:      strings.TrimSpace(ann[constants.MasterAnnotationSnapshotRemoteUUIDs]),
 		crossNode:        isCrossNodeRestore(ann),
+		coldPolicy:       ann[workflow.ColdRecreatePolicy],
 	}
 }
 
@@ -199,6 +219,10 @@ func (b pauseRestoreBinding) applyTo(req *cubebox.RunCubeSandboxRequest) {
 	if req.Annotations == nil {
 		req.Annotations = map[string]string{}
 	}
+	delete(req.Annotations, workflow.ColdRecreatePolicy)
+	if b.coldPolicy != "" {
+		req.Annotations[workflow.ColdRecreatePolicy] = b.coldPolicy
+	}
 	if b.requestID != "" {
 		req.RequestID = b.requestID
 	}
@@ -207,6 +231,9 @@ func (b pauseRestoreBinding) applyTo(req *cubebox.RunCubeSandboxRequest) {
 	}
 	req.Annotations[constants.MasterAnnotationRuntimeSnapshotID] = b.snapshotID
 	req.Annotations[constants.MasterAnnotationPauseSnapshotID] = b.snapshotID
+	// Pause always publishes a CoW catalog, including for cold-created sandboxes.
+	// The legacy template directory is not a valid resume source.
+	req.Annotations[constants.MasterAnnotationAppSnapshotVersion] = "v2"
 	attachedAt := b.attachedAt
 	if attachedAt == "" {
 		attachedAt = time.Now().UTC().Format(time.RFC3339Nano)
@@ -258,6 +285,11 @@ func expandPauseSnapshotPackage(req *cubebox.RunCubeSandboxRequest) error {
 	packed, err := loadPauseSandboxSpec(specDir)
 	if err != nil {
 		return fmt.Errorf("load pause sandbox_spec: %w", err)
+	}
+	if req.Annotations[workflow.ColdRecreatePolicy] != "" {
+		if err := validateColdRecreatePackage(ctx, req, packed, backend, snapID, specDir); err != nil {
+			return err
+		}
 	}
 
 	binding := pauseRestoreBindingFrom(req, snapID, backend)

@@ -12,6 +12,27 @@ import (
 	"golang.org/x/sys/unix"
 )
 
+func TestStateTmpfsMountSetsTrustedRootMode(t *testing.T) {
+	fresh := stateTmpfsMount(256, false)
+	assert.Equal(t, []string{"size=256m", "mode=0755"}, fresh.Options)
+	re := stateTmpfsMount(256, true)
+	assert.Equal(t, []string{"remount", "size=256m", "mode=0755"}, re.Options)
+}
+
+func TestTightenStateTmpfsModeRemovesGroupOtherWrite(t *testing.T) {
+	dir := t.TempDir()
+	require.NoError(t, unix.Chmod(dir, 0o1777))
+	tightenStateTmpfsMode(dir)
+	var st unix.Stat_t
+	require.NoError(t, unix.Stat(dir, &st))
+	assert.Equal(t, uint32(0o755), st.Mode&0o7777)
+	// Already-trusted modes are left untouched.
+	require.NoError(t, unix.Chmod(dir, 0o700))
+	tightenStateTmpfsMode(dir)
+	require.NoError(t, unix.Stat(dir, &st))
+	assert.Equal(t, uint32(0o700), st.Mode&0o7777)
+}
+
 func TestParseTmpfsSizeBytes(t *testing.T) {
 	tests := []struct {
 		name   string

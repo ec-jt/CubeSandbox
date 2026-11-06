@@ -314,20 +314,9 @@ func TestResumer_AutoResumeFalseAllowedWhenAlreadyRunning(t *testing.T) {
 	if got := atomic.LoadInt32(&master.calls); got != 0 {
 		t.Fatalf("master.Resume must NOT be called, got %d", got)
 	}
-	// Success bookkeeping still re-asserts running into the proxy dict so
-	// the local cache converges even if the initial push missed the mark.
-	// The push is performed asynchronously (see pushRunningState), so poll
-	// until the background goroutine records it.
-	if !pollUntil(2*time.Second, func() bool {
-		push.mu.Lock()
-		defer push.mu.Unlock()
-		return len(push.pushed) == 1 && push.pushed[0] == "running"
-	}) {
-		push.mu.Lock()
-		got := append([]string(nil), push.pushed...)
-		push.mu.Unlock()
-		t.Fatalf("proxy push should re-assert running, got %+v", got)
-	}
+ // A no-op has no ownership and must not publish a stale running value.
+ if len(push.pushed) != 0 { t.Fatalf("unowned running push: %v",push.pushed) }
+
 }
 
 func TestResumer_RejectsUnknownSandbox(t *testing.T) {

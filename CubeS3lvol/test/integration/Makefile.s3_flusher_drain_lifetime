@@ -1,0 +1,33 @@
+# Copyright (c) 2026 Tencent Inc.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Standalone ASan/UBSan build for s3_flusher_drain_lifetime_test.c.
+#
+# Links the REAL lib/s3bsdev/s3_flusher.c and s3_overlay.c against fakes in the
+# test for every SPDK symbol they use (poller, ticks, log) and for the WAL. No
+# SPDK archive, DPDK, hugepages or network is needed.
+#
+# Inside the offline builder container the project is at /work:
+#   make -f /work/test/integration/Makefile.s3_flusher_drain_lifetime \
+#        WORK=/work TARGET=/evid/s3_flusher_drain_lifetime_test
+
+CC ?= cc
+WORK ?= /work
+
+CFLAGS ?= -I$(WORK)/include -I$(WORK)/deps/spdk/include \
+	-Wall -Wextra -Wno-unused-parameter -Werror \
+	-DDEBUG -g3 -O1 -D_GNU_SOURCE -fno-strict-aliasing \
+	-fno-omit-frame-pointer -fsanitize=address,undefined \
+	-fno-sanitize-recover=all
+
+SRCS := $(WORK)/lib/s3bsdev/s3_flusher.c $(WORK)/lib/s3bsdev/s3_overlay.c \
+	$(WORK)/test/integration/s3_flusher_drain_lifetime_test.c
+TARGET ?= /tmp/s3_flusher_drain_lifetime_test
+
+all: $(TARGET)
+
+$(TARGET): $(SRCS)
+	$(CC) $(CFLAGS) $(SRCS) -o $(TARGET)
+
+clean:
+	rm -f $(TARGET)

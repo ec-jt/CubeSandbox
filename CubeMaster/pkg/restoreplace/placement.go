@@ -40,6 +40,14 @@ type Input struct {
 	// PinToOrigin forbids cross-node restore even when the snapshot is S3
 	// remote_ready (e.g. host-mount is bound to the origin host path).
 	PinToOrigin bool
+	// SourceSandboxID, SourceCheckpointID and SourceCheckpointDigest are the
+	// expected origin-side identity of the checkpoint being restored. They are
+	// consumed only by the cross-node source-quiesced precondition
+	// (CUBE_CROSSNODE_REQUIRE_SOURCE_QUIESCED, default off). An empty value is
+	// not a wildcard: the precondition refuses instead.
+	SourceSandboxID        string
+	SourceCheckpointID     string
+	SourceCheckpointDigest string
 }
 
 // Placement is the chosen host. CrossNode is true only after origin failed
@@ -106,6 +114,15 @@ func Decide(ctx context.Context, in Input) (*Placement, error) {
 		}
 		return nil, fmt.Errorf("origin node %s cannot schedule %s and snapshot cannot restore cross-node (%s)",
 			originDesc, strings.TrimSpace(in.SnapshotID), reason)
+	}
+
+	// Leaving the origin is only allowed when the origin has already stopped its
+	// runtime and drained the selected checkpoint sources on that node and that
+	// durable record is bound to this exact restore. The gate is default-off; it
+	// never weakens PinToOrigin, the backend/remote_status rule, or origin
+	// preference above.
+	if err := checkCrossNodeSourceQuiesced(ctx, in); err != nil {
+		return nil, err
 	}
 
 	facts := parseOriginHostFacts(in.OriginHostFactsJSON)

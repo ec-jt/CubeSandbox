@@ -29,7 +29,7 @@ ngx.var.access_time = get_currtime()
 -- haven't opted into auto_pause are still cheap to record here — CLM
 -- simply ignores their entries when computing pause decisions.
 local ins_id = ngx.var.ins_id
-if ins_id and ins_id ~= "" then
+if ins_id and ins_id ~= "" and ngx.ctx.cube_traffic_authorized then
     local active = ngx.shared.cube_sandbox_last_active
     if active then
         -- Coalesce sub-second writes: a single sandbox handling 1k QPS would

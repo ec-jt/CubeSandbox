@@ -19,6 +19,7 @@
  *   SPDK_RPC_REGISTER:
  *
  *     rcow_create_lvstore / rcow_attach_lvstore / rcow_delete_lvstore
+ *     rcow_recover_lvstore
  *     rcow_unload_lvstore / rcow_flush_lvstore / rcow_checkpoint_lvstore
  *     rcow_get_lvstores / rcow_add_s3_config
  *     rcow_create_lvol / rcow_delete_lvol / rcow_resize_lvol
@@ -1572,6 +1573,163 @@ SPDK_RPC_REGISTER("rcow_checkpoint_lvstore",
 		  rpc_rcow_checkpoint_lvstore, SPDK_RPC_RUNTIME)
 
 /* ==========================================================================
+ * rcow_recover_lvstore
+ *
+ * Rebuild an lvstore's local state from the remote checkpoint, for the case
+ * attach cannot handle: the local WAL/cache device is gone.
+ *
+ * Deliberately a separate method rather than a flag on attach. Attach opens an
+ * existing layout and replays its journal; recovery *formats* a blank device
+ * and loads a checkpoint. A single entry point that guessed which was meant
+ * would, on a misdetection, format the disk holding the only copy of unflushed
+ * mappings -- which is the exact failure this whole path exists to avoid.
+ *
+ * Parameters are the same shape as attach, minus everything the descriptor
+ * supplies: capacity and chunk_size are *not* accepted, because they come from
+ * the descriptor and a caller-supplied value could only disagree with it.
+ *
+ * There is deliberately no `force`. The owner marker is a
+ * sequential-misoperation guard, not mutual exclusion (see s3_owner.h), so
+ * "take it over anyway" is not a claim this RPC can check. A caller that sends
+ * it gets an error rather than having it silently ignored.
+ *
+ * The reply reports what was restored, including the RPO: the checkpoint LSN
+ * is the newest state this lvstore has, and anything acknowledged after it is
+ * not in the bucket.
+ * ========================================================================== */
+
+struct rpc_recover_lvstore {
+ char *lvs_name;
+ char *ns_name;
+ char *wal_bdev;
+ char *cache_bdev;
+ uint32_t checkpoint_interval_sec;
+};
+
+static void
+free_rpc_recover_lvstore(struct rpc_recover_lvstore *req)
+{
+	free(req->lvs_name);
+	free(req->ns_name);
+	free(req->wal_bdev);
+	free(req->cache_bdev);
+}
+
+static const struct spdk_json_object_decoder rpc_recover_lvstore_decoders[] = {
+	{"lvs_name",   offsetof(struct rpc_recover_lvstore, lvs_name),   spdk_json_decode_string, false},
+	{"namespace",  offsetof(struct rpc_recover_lvstore, ns_name),  spdk_json_decode_string, false},
+	{"wal_bdev",   offsetof(struct rpc_recover_lvstore, wal_bdev),   spdk_json_decode_string, false},
+	{"cache_bdev", offsetof(struct rpc_recover_lvstore, cache_bdev), spdk_json_decode_string, true},
+	{"checkpoint_interval_sec", offsetof(struct rpc_recover_lvstore, checkpoint_interval_sec), spdk_json_decode_uint32, true},
+};
+
+static void
+rpc_recover_lvstore_cb(void *cb_arg, struct s3lvol_lvstore *lvs, int lvserrno)
+{
+	struct spdk_jsonrpc_request *request = cb_arg;
+	struct spdk_json_write_ctx *w;
+	struct spdk_lvol_store *store;
+	struct spdk_lvol *lvol;
+
+	if (lvserrno != 0) {
+		spdk_jsonrpc_send_error_response(request, lvserrno,
+						 spdk_strerror(-lvserrno));
+		return;
+	}
+
+	store = s3lvol_lvstore_get_lvs(lvs);
+
+	w = spdk_jsonrpc_begin_result(request);
+	spdk_json_write_object_begin(w);
+	spdk_json_write_named_string(w, "lvs_name", s3lvol_lvstore_get_name(lvs));
+	spdk_json_write_named_uuid(w, "uuid", &store->uuid);
+	spdk_json_write_named_uint64(w, "cluster_size",
+				     spdk_bs_get_cluster_size(store->blobstore));
+	spdk_json_write_named_uint64(w, "free_clusters",
+				     spdk_bs_free_cluster_count(store->blobstore));
+	/* Stated in the reply, not only in the log: the caller has to know that
+	 * this is the last checkpoint and not every acknowledged write. */
+	spdk_json_write_named_string(w, "restored_from",
+				     "remote checkpoint (last checkpoint only; "
+				     "writes after it are not in the bucket)");
+	spdk_json_write_named_array_begin(w, "lvols");
+	TAILQ_FOREACH(lvol, &store->lvols, link) {
+		spdk_json_write_object_begin(w);
+		spdk_json_write_named_string(w, "name", lvol->name);
+		if (lvol->bdev) {
+			spdk_json_write_named_string(w, "bdev_name", lvol->bdev->name);
+			spdk_json_write_named_uint64(w, "num_blocks",
+						     lvol->bdev->blockcnt);
+		}
+		spdk_json_write_named_uuid(w, "uuid", &lvol->uuid);
+		spdk_json_write_object_end(w);
+	}
+	spdk_json_write_array_end(w);
+	spdk_json_write_object_end(w);
+	spdk_jsonrpc_end_result(request, w);
+}
+
+static void
+rpc_rcow_recover_lvstore(struct spdk_jsonrpc_request *request,
+			 const struct spdk_json_val *params)
+{
+	struct rpc_recover_lvstore req = {0};
+	struct s3_lvs_opts opts = {0};
+	struct spdk_json_val *force_key = NULL;
+	const struct s3_target *tgt;
+	int rc;
+
+	/* spdk_json_decode_object() ignores keys it does not know, so removing
+	 * the decoder alone would make `force` a no-op. Reject it explicitly:
+	 * silently ignoring a takeover request is worse than refusing it. */
+	/* The pinned SPDK lookup API is not const-qualified; it only reads
+	 * the parsed tokens. Do not modify the returned token. */
+	if (spdk_json_find((struct spdk_json_val *)params, "force", &force_key, NULL,
+			   SPDK_JSON_VAL_ANY) == 0) {
+		spdk_jsonrpc_send_error_response(request, -EINVAL,
+			"rcow_recover_lvstore does not accept 'force': the owner "
+			"marker is not mutual exclusion");
+		goto cleanup;
+	}
+
+	if (spdk_json_decode_object(params, rpc_recover_lvstore_decoders,
+				    SPDK_COUNTOF(rpc_recover_lvstore_decoders),
+				    &req)) {
+		spdk_jsonrpc_send_error_response(request,
+						 SPDK_JSONRPC_ERROR_INVALID_PARAMS,
+						 "Invalid parameters");
+		goto cleanup;
+	}
+
+	tgt = rcow_namespace_to_target(req.ns_name);
+	if (!tgt) {
+		spdk_jsonrpc_send_error_response_fmt(request, -ENOENT,
+						     "namespace '%s' not found",
+						     req.ns_name);
+		goto cleanup;
+	}
+
+	opts.target           = *tgt;
+	opts.target.auth_mode = S3_AUTH_ENV;
+	opts.ns_name          = req.ns_name;
+	opts.lvs_name         = req.lvs_name;
+	opts.wal_bdev_name    = req.wal_bdev;
+	opts.cache_bdev_name  = req.cache_bdev;
+	/* opts.force stays false: there is no way to ask recovery for it. */
+	opts.checkpoint_interval_sec = req.checkpoint_interval_sec;
+
+	rc = s3lvol_lvstore_recover(&opts, rpc_recover_lvstore_cb, request);
+	if (rc != 0) {
+		spdk_jsonrpc_send_error_response(request, rc, spdk_strerror(-rc));
+	}
+
+cleanup:
+	free_rpc_recover_lvstore(&req);
+}
+SPDK_RPC_REGISTER("rcow_recover_lvstore", rpc_rcow_recover_lvstore,
+		  SPDK_RPC_RUNTIME)
+
+/* ==========================================================================
  * rcow_add_s3_config
  *
  * Register a namespace that maps to an S3 bucket. Meant to be called by a
@@ -1684,13 +1842,37 @@ rpc_rcow_get_lvstores(struct spdk_jsonrpc_request *request,
 	     lvs = s3lvol_lvstore_next(lvs)) {
 		struct spdk_lvol_store *store = s3lvol_lvstore_get_lvs(lvs);
 		struct s3_bs_dev_stats stats = {0};
+		struct s3lvol_lifecycle_status lifecycle;
 		struct spdk_lvol *lvol;
 
+		s3lvol_lvstore_get_lifecycle(lvs, &lifecycle);
 		spdk_json_write_object_begin(w);
 		spdk_json_write_named_string(w, "lvs_name", s3lvol_lvstore_get_name(lvs));
 		spdk_json_write_named_string(w, "namespace",
 					     s3lvol_lvstore_get_namespace(lvs));
-		spdk_json_write_named_uuid(w, "uuid", &store->uuid);
+		spdk_json_write_named_uuid(w, "uuid", &lifecycle.uuid);
+		spdk_json_write_named_object_begin(w, "lifecycle");
+		spdk_json_write_named_string(w, "state", lifecycle.unload_in_progress ?
+			"unloading" : (lifecycle.native_available ? "loaded" : "unavailable"));
+		spdk_json_write_named_bool(w, "timeout_reported", lifecycle.timeout_reported);
+		spdk_json_write_named_bool(w, "release_pending", lifecycle.release_pending);
+		spdk_json_write_named_bool(w, "owner_claim_local", lifecycle.owner_claim_local);
+		spdk_json_write_named_bool(w, "remote_owner_verified", false);
+		spdk_json_write_named_bool(w, "retry_unload_busy", lifecycle.unload_in_progress);
+		spdk_json_write_object_end(w);
+		spdk_json_write_named_bool(w, "native_available", lifecycle.native_available);
+		spdk_json_write_named_bool(w, "write_path_available", lifecycle.write_path_available);
+		/* NULL (not zero/empty) means not safe to inspect, not zero capacity.
+		 * Unload may have freed native objects even before its callback. */
+		if (!lifecycle.native_available) {
+			spdk_json_write_named_null(w, "cluster_size");
+			spdk_json_write_named_null(w, "total_clusters");
+			spdk_json_write_named_null(w, "free_clusters");
+			spdk_json_write_named_null(w, "write_path");
+			spdk_json_write_named_null(w, "lvols");
+			spdk_json_write_object_end(w);
+			continue;
+		}
 		spdk_json_write_named_uint64(w, "cluster_size",
 					     spdk_bs_get_cluster_size(store->blobstore));
 		spdk_json_write_named_uint64(w, "total_clusters",
@@ -1701,78 +1883,82 @@ rpc_rcow_get_lvstores(struct spdk_jsonrpc_request *request,
 		/* Write-path counters. The test asserts on these: wal_writes > 0
 		 * proves the log was actually used rather than silently bypassed,
 		 * and chunks_flushed > 0 proves the data reached S3. */
-		s3lvol_lvstore_get_stats(lvs, &stats);
-		spdk_json_write_named_object_begin(w, "write_path");
-		spdk_json_write_named_bool(w, "wal_attached", stats.wal_attached);
-		spdk_json_write_named_uint64(w, "wal_writes", stats.wal_writes);
-		spdk_json_write_named_uint64(w, "wal_retries", stats.wal_retries);
-		spdk_json_write_named_uint64(w, "overlay_hits", stats.overlay_hits);
-		spdk_json_write_named_uint64(w, "overlay_bytes", stats.overlay_bytes);
-		spdk_json_write_named_uint64(w, "overlay_chunks",
-					     stats.overlay_live_chunks);
-		spdk_json_write_named_uint64(w, "chunks_flushed", stats.chunks_flushed);
-		spdk_json_write_named_uint64(w, "flush_failures", stats.flush_failures);
-		spdk_json_write_named_uint64(w, "rmw_count", stats.rmw_count);
-		spdk_json_write_named_uint64(w, "allocated_chunks",
-					     stats.allocated_chunks);
-		/* Checkpoint state. journal_used vs journal_capacity is what tells
-		 * an operator whether the lvstore is heading for the -ENOSPC that
-		 * an untruncatable journal ends in. */
-		spdk_json_write_named_uint64(w, "ckpt_done", stats.ckpt_done);
-		spdk_json_write_named_uint64(w, "ckpt_failed", stats.ckpt_failed);
-		spdk_json_write_named_uint64(w, "ckpt_gen", stats.ckpt_gen);
-		spdk_json_write_named_uint64(w, "ckpt_lsn", stats.ckpt_lsn);
-		spdk_json_write_named_uint32(w, "ckpt_interval_sec",
-					     stats.ckpt_interval_sec);
-		spdk_json_write_named_uint64(w, "journal_used",
-					     stats.journal_used_bytes);
-		spdk_json_write_named_uint64(w, "journal_capacity",
-					     stats.journal_capacity_bytes);
+		if (!lifecycle.write_path_available) {
+			spdk_json_write_named_null(w, "write_path");
+		} else {
+			s3lvol_lvstore_get_stats(lvs, &stats);
+			spdk_json_write_named_object_begin(w, "write_path");
+			spdk_json_write_named_bool(w, "wal_attached", stats.wal_attached);
+			spdk_json_write_named_uint64(w, "wal_writes", stats.wal_writes);
+			spdk_json_write_named_uint64(w, "wal_retries", stats.wal_retries);
+			spdk_json_write_named_uint64(w, "overlay_hits", stats.overlay_hits);
+			spdk_json_write_named_uint64(w, "overlay_bytes", stats.overlay_bytes);
+			spdk_json_write_named_uint64(w, "overlay_chunks",
+						     stats.overlay_live_chunks);
+			spdk_json_write_named_uint64(w, "chunks_flushed", stats.chunks_flushed);
+			spdk_json_write_named_uint64(w, "flush_failures", stats.flush_failures);
+			spdk_json_write_named_uint64(w, "rmw_count", stats.rmw_count);
+			spdk_json_write_named_uint64(w, "allocated_chunks",
+						     stats.allocated_chunks);
+			/* Checkpoint state. journal_used vs journal_capacity is what tells
+			 * an operator whether the lvstore is heading for the -ENOSPC that
+			 * an untruncatable journal ends in. */
+			spdk_json_write_named_uint64(w, "ckpt_done", stats.ckpt_done);
+			spdk_json_write_named_uint64(w, "ckpt_failed", stats.ckpt_failed);
+			spdk_json_write_named_uint64(w, "ckpt_gen", stats.ckpt_gen);
+			spdk_json_write_named_uint64(w, "ckpt_lsn", stats.ckpt_lsn);
+			spdk_json_write_named_uint32(w, "ckpt_interval_sec",
+						     stats.ckpt_interval_sec);
+			spdk_json_write_named_uint64(w, "journal_used",
+						     stats.journal_used_bytes);
+			spdk_json_write_named_uint64(w, "journal_capacity",
+						     stats.journal_capacity_bytes);
 
-		/* Why chunks were flushed. Mostly "full" is healthy; a steady
-		 * stream of "forced" says the overlay cap cannot keep up. */
-		spdk_json_write_named_uint64(w, "flushed_full",
-					     stats.overlay_flushed_full);
-		spdk_json_write_named_uint64(w, "flushed_aged",
-					     stats.overlay_flushed_aged);
-		spdk_json_write_named_uint64(w, "flushed_forced",
-					     stats.overlay_flushed_forced);
+			/* Why chunks were flushed. Mostly "full" is healthy; a steady
+			 * stream of "forced" says the overlay cap cannot keep up. */
+			spdk_json_write_named_uint64(w, "flushed_full",
+						     stats.overlay_flushed_full);
+			spdk_json_write_named_uint64(w, "flushed_aged",
+						     stats.overlay_flushed_aged);
+			spdk_json_write_named_uint64(w, "flushed_forced",
+						     stats.overlay_flushed_forced);
 
-		/* Local read cache. hits vs misses is the number that matters: a
-		 * hit is a read that cost a local round trip instead of an S3 one.
-		 * hits_declined is the object being here but not the blocks this
-		 * read wanted, which is what partial residency trades for filling
-		 * from reads at all. Reported inside write_path because that is
-		 * where the flusher counters already are, and the cache is filled
-		 * by the flusher as well as by reads. */
-		spdk_json_write_named_bool(w, "cache_attached",
-					   stats.cache_attached);
-		if (stats.cache_attached) {
-			spdk_json_write_named_uint64(w, "cache_hits",
-						     stats.cache_hits);
-			spdk_json_write_named_uint64(w, "cache_misses",
-						     stats.cache_misses);
-			spdk_json_write_named_uint64(w, "cache_hits_declined",
-						     stats.cache_hits_declined);
-			spdk_json_write_named_uint64(w, "cache_populates",
-						     stats.cache_populates);
-			spdk_json_write_named_uint64(w, "cache_populates_dropped",
-						     stats.cache_populates_dropped);
-			spdk_json_write_named_uint64(w, "cache_evictions",
-						     stats.cache_evictions);
-			spdk_json_write_named_uint64(w, "cache_bytes_served",
-						     stats.cache_bytes_served);
-			spdk_json_write_named_uint64(w, "cache_bytes_populated",
-						     stats.cache_bytes_populated);
-			spdk_json_write_named_uint64(w, "cache_slots_total",
-						     stats.cache_slots_total);
-			spdk_json_write_named_uint64(w, "cache_slots_resident",
-						     stats.cache_slots_resident);
-			spdk_json_write_named_uint64(w, "cache_bytes_resident",
-						     stats.cache_bytes_resident);
+			/* Local read cache. hits vs misses is the number that matters: a
+			 * hit is a read that cost a local round trip instead of an S3 one.
+			 * hits_declined is the object being here but not the blocks this
+			 * read wanted, which is what partial residency trades for filling
+			 * from reads at all. Reported inside write_path because that is
+			 * where the flusher counters already are, and the cache is filled
+			 * by the flusher as well as by reads. */
+			spdk_json_write_named_bool(w, "cache_attached",
+						   stats.cache_attached);
+			if (stats.cache_attached) {
+				spdk_json_write_named_uint64(w, "cache_hits",
+							     stats.cache_hits);
+				spdk_json_write_named_uint64(w, "cache_misses",
+							     stats.cache_misses);
+				spdk_json_write_named_uint64(w, "cache_hits_declined",
+							     stats.cache_hits_declined);
+				spdk_json_write_named_uint64(w, "cache_populates",
+							     stats.cache_populates);
+				spdk_json_write_named_uint64(w, "cache_populates_dropped",
+							     stats.cache_populates_dropped);
+				spdk_json_write_named_uint64(w, "cache_evictions",
+							     stats.cache_evictions);
+				spdk_json_write_named_uint64(w, "cache_bytes_served",
+							     stats.cache_bytes_served);
+				spdk_json_write_named_uint64(w, "cache_bytes_populated",
+							     stats.cache_bytes_populated);
+				spdk_json_write_named_uint64(w, "cache_slots_total",
+							     stats.cache_slots_total);
+				spdk_json_write_named_uint64(w, "cache_slots_resident",
+							     stats.cache_slots_resident);
+				spdk_json_write_named_uint64(w, "cache_bytes_resident",
+							     stats.cache_bytes_resident);
+			}
+			spdk_json_write_object_end(w);
+
 		}
-		spdk_json_write_object_end(w);
-
 		spdk_json_write_named_array_begin(w, "lvols");
 		TAILQ_FOREACH(lvol, &store->lvols, link) {
 			spdk_json_write_object_begin(w);
@@ -1835,6 +2021,51 @@ rpc_rcow_get_lvstores(struct spdk_jsonrpc_request *request,
 	spdk_jsonrpc_end_result(request, w);
 }
 SPDK_RPC_REGISTER("rcow_get_lvstores", rpc_rcow_get_lvstores,
+		  SPDK_RPC_RUNTIME)
+
+static void
+rpc_write_retained_status(void *arg, const char *name,
+			 const struct spdk_uuid *uuid, bool busy,
+			 uint32_t failed_attempts)
+{
+	struct spdk_json_write_ctx *w = arg;
+
+	spdk_json_write_object_begin(w);
+	spdk_json_write_named_string(w, "lvs_name", name);
+	spdk_json_write_named_uuid(w, "uuid", uuid);
+	spdk_json_write_named_string(w, "state", busy ? "retained_attach_busy" :
+				    "retained_attach_ready");
+	spdk_json_write_named_bool(w, "busy", busy);
+	spdk_json_write_named_uint32(w, "failed_attempts", failed_attempts);
+	spdk_json_write_object_end(w);
+}
+
+static void
+rpc_rcow_get_retained_lvstores(struct spdk_jsonrpc_request *request,
+			      const struct spdk_json_val *params)
+{
+	struct spdk_json_write_ctx *w;
+
+	if (params) {
+		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
+					 "method takes no parameters");
+		return;
+	}
+	w = spdk_jsonrpc_begin_result(request);
+	spdk_json_write_object_begin(w);
+	spdk_json_write_named_string(w, "scope", "same_process_retained_attach_records_only");
+	spdk_json_write_named_bool(w, "remote_owner_verified", false);
+	spdk_json_write_named_bool(w, "absence_proves_completion", false);
+	spdk_json_write_named_bool(w, "includes_destroy_after_handoff", false);
+	spdk_json_write_named_string(w, "retry_requirements",
+		"same_process_same_devices_and_remote_claim_verification");
+	spdk_json_write_named_array_begin(w, "records");
+	s3lvol_lvstore_foreach_retained_status(rpc_write_retained_status, w);
+	spdk_json_write_array_end(w);
+	spdk_json_write_object_end(w);
+	spdk_jsonrpc_end_result(request, w);
+}
+SPDK_RPC_REGISTER("rcow_get_retained_lvstores", rpc_rcow_get_retained_lvstores,
 		  SPDK_RPC_RUNTIME)
 
 /* ==========================================================================
@@ -1940,6 +2171,7 @@ SPDK_RPC_REGISTER("rcow_get_lvol", rpc_rcow_get_lvol, SPDK_RPC_RUNTIME)
 
 struct rpc_export_lvol {
 	char *lvs_name;
+	bool release_safe;
 	char *snapshot_name;
 	char *export_id;
 
@@ -1957,6 +2189,7 @@ free_rpc_export_lvol(struct rpc_export_lvol *req)
 }
 
 static const struct spdk_json_object_decoder rpc_export_lvol_decoders[] = {
+	{"release_safe", offsetof(struct rpc_export_lvol, release_safe), spdk_json_decode_bool, true},
 	{"snapshot_name", offsetof(struct rpc_export_lvol, snapshot_name), spdk_json_decode_string, false},
 	{"export_id",     offsetof(struct rpc_export_lvol, export_id),     spdk_json_decode_string, true},
 	{"ttl_sec",    offsetof(struct rpc_export_lvol, ttl_sec),       spdk_json_decode_uint32, true},
@@ -2002,7 +2235,10 @@ rpc_rcow_export_snapshot(struct spdk_jsonrpc_request *request,
 			       "ignored; the export follows the snapshot lifetime\n",
 			       req.snapshot_name);
 	}
-	rc = s3lvol_lvol_export(lvs, lvol, req.export_id, uuid, sizeof(uuid),
+	if (req.release_safe && req.export_id) rc = -EINVAL;
+	else if (req.release_safe)
+		rc = s3lvol_lvol_export_safe(lvs, lvol, uuid, sizeof(uuid), NULL, NULL);
+	else rc = s3lvol_lvol_export(lvs, lvol, req.export_id, uuid, sizeof(uuid),
 				NULL, NULL);
 	if (rc != 0) {
 		/* Named rather than left as a bare errno. The failure reaches the
@@ -2333,6 +2569,51 @@ cleanup:
 SPDK_RPC_REGISTER("rcow_import_lvol", rpc_rcow_import_lvol,
 		  SPDK_RPC_RUNTIME)
 
+/* Independent of activation, the name index, and the decouple registry. */
+static void
+rpc_rcow_get_import_origin(struct spdk_jsonrpc_request *request,
+			   const struct spdk_json_val *params)
+{
+	struct rpc_import_lvol req = {0};
+	const struct spdk_json_object_decoder decoders[] = {
+		{"lvol_name", offsetof(struct rpc_import_lvol, lvol_name), spdk_json_decode_string, false},
+		{"lvs_name", offsetof(struct rpc_import_lvol, lvs_name), spdk_json_decode_string, true},
+	};
+	struct s3lvol_lvstore *lvs;
+	struct spdk_lvol *lvol;
+	struct rpc_json_buf buf;
+	struct spdk_json_write_ctx *w;
+	int rc;
+	if (!params || spdk_json_decode_object(params, decoders, SPDK_COUNTOF(decoders), &req)) {
+		rpc_lvol_respond_err(request, -EINVAL, NULL);
+		goto out;
+	}
+	lvs = rpc_lvstore_for(request, req.lvs_name);
+	if (!lvs) goto out;
+	lvol = s3lvol_lvol_find(lvs, req.lvol_name);
+	if (!lvol) { rpc_lvol_respond_err(request, -ENOENT, NULL); goto out; }
+	w = rpc_json_buf_begin(&buf);
+	if (!w) { rpc_lvol_respond_err(request, -ENOMEM, NULL); goto out; }
+	spdk_json_write_object_begin(w);
+	spdk_json_write_named_string(w, "volume_uuid", lvol->uuid_str);
+	spdk_json_write_name(w, "import_origin");
+	rc = s3lvol_import_origin_write_json(lvol, w);
+	if (rc) spdk_json_write_null(w);
+	spdk_json_write_object_end(w);
+	if (rc && rc != -ENODATA) {
+		spdk_json_write_end(w);
+		free(buf.data);
+		rpc_lvol_respond_err(request, rc, "native import origin is invalid or busy");
+	} else {
+		rpc_json_buf_respond(request, w, &buf);
+	}
+out:
+	free_rpc_import_lvol(&req);
+}
+SPDK_RPC_REGISTER("rcow_get_import_origin", rpc_rcow_get_import_origin, SPDK_RPC_RUNTIME)
+
+#include "checkpoint_commit_rpc.h"
+
 /* Stop an imported volume from reading through to its export.
  *
  * Answers as soon as the copying has started, not when it has finished: it moves
@@ -2533,17 +2814,63 @@ cleanup:
 SPDK_RPC_REGISTER("rcow_release_export", rpc_rcow_release_export,
 		  SPDK_RPC_RUNTIME)
 
-/* Turn a reference export into a copied one, so this node stops owing anybody the
- * snapshot behind it.
- *
- * The counterpart to rcow_release_export, and the choice between them is whose
- * data survives. Release deletes the export and refuses while anything reads it;
- * this keeps the export readable for ever by copying what it references, and the
- * snapshot becomes deletable. It is what a node runs when it wants its space back
- * without waiting for every importer to finish.
- *
- * Importers need not be told: the manifest is replaced in place, and a reader
- * discovers it when the objects it holds stop existing. */
+static void
+rpc_rcow_ack_export_detach(struct spdk_jsonrpc_request *request,
+			   const struct spdk_json_val *params)
+{
+	struct rpc_export_id req = {0};
+	struct rpc_lvol_op_ctx *ctx;
+	struct s3lvol_lvstore *lvs;
+	int rc;
+	if (spdk_json_decode_object(params, rpc_export_id_decoders,
+		SPDK_COUNTOF(rpc_export_id_decoders), &req)) {
+		rpc_lvol_respond_err(request, -EINVAL, NULL);
+		goto out;
+	}
+	lvs = rpc_lvstore_for(request, req.lvs_name);
+	if (!lvs) goto out;
+	ctx = calloc(1, sizeof(*ctx));
+	if (!ctx) { rpc_lvol_respond_err(request, -ENOMEM, NULL); goto out; }
+	ctx->request = request;
+	ctx->lvol_name = strdup(req.export_uuid);
+	if (!ctx->lvol_name) { free(ctx); rpc_lvol_respond_err(request, -ENOMEM, NULL); goto out; }
+	rc = s3lvol_import_detach_ack(lvs, req.export_uuid, rpc_lvol_op_cb, ctx);
+	if (rc) { free(ctx->lvol_name); free(ctx); rpc_lvol_respond_err(request, rc, NULL); }
+out:
+	free(req.lvs_name); free(req.export_uuid);
+}
+SPDK_RPC_REGISTER("rcow_ack_export_detach", rpc_rcow_ack_export_detach, SPDK_RPC_RUNTIME)
+
+static void
+rpc_rcow_reconcile_export(struct spdk_jsonrpc_request *request,
+			   const struct spdk_json_val *params)
+{
+	struct rpc_export_id req = {0};
+	struct rpc_lvol_op_ctx *ctx;
+	struct s3lvol_lvstore *lvs;
+	int rc;
+	if (spdk_json_decode_object(params, rpc_export_id_decoders,
+		SPDK_COUNTOF(rpc_export_id_decoders), &req)) {
+		rpc_lvol_respond_err(request, -EINVAL, NULL);
+		goto out;
+	}
+	lvs = rpc_lvstore_for(request, req.lvs_name);
+	if (!lvs) goto out;
+	ctx = calloc(1, sizeof(*ctx));
+	if (!ctx) { rpc_lvol_respond_err(request, -ENOMEM, NULL); goto out; }
+	ctx->request = request;
+	ctx->lvol_name = strdup(req.export_uuid);
+	if (!ctx->lvol_name) { free(ctx); rpc_lvol_respond_err(request, -ENOMEM, NULL); goto out; }
+	rc = s3lvol_export_reconcile(lvs, req.export_uuid, rpc_lvol_op_cb, ctx);
+	if (rc) { free(ctx->lvol_name); free(ctx); rpc_lvol_respond_err(request, rc, NULL); }
+out:
+	free(req.lvs_name); free(req.export_uuid);
+}
+SPDK_RPC_REGISTER("rcow_reconcile_export", rpc_rcow_reconcile_export, SPDK_RPC_RUNTIME)
+
+/* Publish copies without revoking old references. Direct importers can refetch
+ * the higher generation; derived readers may retain old refs, so REF source
+ * obligations remain pinned and release still fails closed. */
 static void
 rpc_rcow_materialise_export(struct spdk_jsonrpc_request *request,
 			    const struct spdk_json_val *params)
@@ -2662,6 +2989,8 @@ rpc_rcow_get_exports(struct spdk_jsonrpc_request *request,
 			spdk_json_write_named_uint64(w, "expires_at", e.expires_at);
 			/* Always false: snapshot-backed exports no longer TTL-expire. */
 			spdk_json_write_named_bool(w, "expired", false);
+			spdk_json_write_named_bool(w, "source_obligation", e.source_obligation);
+			spdk_json_write_named_bool(w, "publication_pending", e.publication_pending);
 			spdk_json_write_named_bool(w, "lease_aware", e.lease_aware);
 			spdk_json_write_named_bool(w, "lease_checked", e.lease_checked);
 			spdk_json_write_named_bool(w, "lease_absent", e.lease_absent);
@@ -2673,6 +3002,32 @@ rpc_rcow_get_exports(struct spdk_jsonrpc_request *request,
 						     s3lvol_export_pin_str(e.pin));
 			spdk_json_write_named_bool(w, "snapshot_alive", e.snapshot_alive);
 			spdk_json_write_named_bool(w, "reaping", e.reaping);
+			/* Retention disposition. Derived from the entry plus the
+			 * admission state this node last observed; see
+			 * s3lvol_export_disposition(). Descriptive only: no field
+			 * here authorises a deletion. */
+			{
+				struct s3lvol_export_disposition_info d;
+
+				s3lvol_export_disposition_of(exp, &d);
+				spdk_json_write_named_string(w, "disposition",
+					s3lvol_export_disposition_str(d.disposition));
+				spdk_json_write_named_string(w, "admission",
+					s3lvol_export_admission_str(d.admission));
+				spdk_json_write_named_bool(w, "release_supported",
+					d.release_supported);
+				spdk_json_write_named_bool(w, "reconcile_supported",
+					d.reconcile_supported);
+				spdk_json_write_named_bool(w, "migration_supported",
+					d.migration_supported);
+				spdk_json_write_named_string(w, "retention_reason",
+					d.retention_reason ? d.retention_reason : "");
+				spdk_json_write_named_string(w, "required_operator_action",
+					d.required_operator_action ?
+					d.required_operator_action : "");
+				spdk_json_write_named_string(w, "evidence_missing",
+					d.evidence_missing ? d.evidence_missing : "");
+			}
 			spdk_json_write_object_end(w);
 		}
 	}

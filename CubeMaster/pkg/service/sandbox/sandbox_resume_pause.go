@@ -643,6 +643,14 @@ func pauseResumePlacementInput(rec *pausesnap.Record, instanceType string, creat
 		in.OriginNodeID = rec.NodeID
 		in.OriginNodeIP = rec.NodeIP
 		in.OriginHostFactsJSON = rec.OriginHostFactsJSON
+		// The cross-node source-quiesced precondition needs the exact origin
+		// identity of the checkpoint being restored. A pause snapshot is the
+		// sandbox's own selected checkpoint, so the sandbox id is the source
+		// sandbox and the pause snapshot id is the checkpoint id. The digest is
+		// the origin fence binding's digest, which Master cannot derive; it is
+		// left empty so the precondition refuses rather than guesses.
+		in.SourceSandboxID = strings.TrimSpace(rec.SandboxID)
+		in.SourceCheckpointID = strings.TrimSpace(rec.SnapshotID)
 	}
 	if createReq != nil && config.GetConfig() != nil {
 		if reqRes, rerr := checkAndGetReqResource(createReq); rerr == nil {

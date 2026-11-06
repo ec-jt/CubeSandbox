@@ -42,7 +42,9 @@ func (m *S3Cow) Name() string {
 var _ cow.Store = (*S3Cow)(nil)
 
 func (m *S3Cow) CreateDefaultMediumVolume(ctx context.Context, sandboxID, volumeName string, sizeBytes uint64) (*cowVolume, error) {
-	name := fmt.Sprintf("sb-%s-%s", sandboxID, volumeName)
+	// Shared with recovery: freshImageVolumeName is the only place this name is
+	// built, so a recovered source cannot name a volume Create would not mint.
+	name := freshImageVolumeName(sandboxID, volumeName)
 	return m.createInitializedVolume(ctx, name, sizeBytes)
 }
 
@@ -59,23 +61,89 @@ func (m *S3Cow) createInitializedVolume(ctx context.Context, name string, sizeBy
 	return newCowVolume(name, cowKindVolume, 0, devPath), nil
 }
 
+// createOrResolveVolumePath creates the volume, or reuses the one already live
+// in the attached lvstore.
+//
+// SemAlreadyExists from CreateVolume is NOT proof that the object exists. The
+// S3 engine keeps a persisted name index (index.json) that outlives the
+// lvstore and short-circuits CreateVolume before it ever reaches
+// rcow_create_lvol. Booting against a fresh or different lvstore therefore
+// still reports AlreadyExists for a name whose lvol is gone, and blindly
+// resolving that name activates a device the lvstore does not have
+// ("rcow_active_bdev ... no such lvol or snapshot"), which never creates the
+// object and never publishes the S3 handle.
+//
+// Presence is proven against the native store through GetVolumeInfo
+// (rcow_get_lvol); only a proven object is reused. A name proven absent is a
+// stale binding: drop the binding and create the volume in the current
+// lvstore. Dropping it cannot destroy data - the native delete is issued only
+// after the native read reported the object absent (both native deletes
+// tolerate a missing object), and any object in the lvstore it came from is
+// never touched.
 func (m *S3Cow) createOrResolveVolumePath(ctx context.Context, name string, sizeBytes uint64) (string, bool, error) {
 	devPath, err := m.engine.CreateVolume(name, sizeBytes)
 	if err != nil {
 		if !isCowSemantic(err, cubecow.SemAlreadyExists) {
 			return "", false, err
 		}
-		devPath, err = m.ResolveDevPath(ctx, name, cowKindVolume)
+		present, presentErr := cowObjectPresent(m.engine.GetVolumeInfo(name))
+		if presentErr != nil {
+			return "", false, fmt.Errorf("verify existing s3 volume %s: %w", name, presentErr)
+		}
+		if present {
+			devPath, err = m.ResolveDevPath(ctx, name, cowKindVolume)
+			if err != nil {
+				return "", false, err
+			}
+			return devPath, false, nil
+		}
+		CubeLog.Warnf("s3 volume %s is indexed but absent from the attached lvstore; dropping the stale binding and creating it", name)
+		if err := m.DeleteByKind(ctx, name, cowKindVolume); err != nil {
+			return "", false, fmt.Errorf("drop stale s3 volume name %s: %w", name, err)
+		}
+		devPath, err = m.engine.CreateVolume(name, sizeBytes)
 		if err != nil {
 			return "", false, err
 		}
-		return devPath, false, nil
 	}
 	devPath, err = requireS3DevicePath(name, "CreateVolume", devPath)
 	if err != nil {
 		return "", false, err
 	}
 	return devPath, true, nil
+}
+
+// createOrResolveInactiveSnapshot creates snapshotName from sourceName in the
+// attached lvstore without activating it, or confirms it is already there.
+// Returns created=true only when this call minted the native snapshot.
+//
+// It applies the same stale-binding rule as createOrResolveVolumePath: the
+// persisted index can report AlreadyExists for a snapshot whose native object
+// is gone, and treating that as success would leave every later clone from the
+// snapshot failing with "no such lvol or snapshot".
+func (m *S3Cow) createOrResolveInactiveSnapshot(ctx context.Context, sourceName, snapshotName string) (bool, error) {
+	_, err := m.engine.CreateSnapshotFromVolume(sourceName, snapshotName, false)
+	if err == nil {
+		return true, nil
+	}
+	if !isCowSemantic(err, cubecow.SemAlreadyExists) {
+		return false, err
+	}
+	present, presentErr := cowObjectPresent(m.engine.GetVolumeInfo(snapshotName))
+	if presentErr != nil {
+		return false, fmt.Errorf("verify existing s3 snapshot %s: %w", snapshotName, presentErr)
+	}
+	if present {
+		return false, nil
+	}
+	CubeLog.Warnf("s3 snapshot %s is indexed but absent from the attached lvstore; dropping the stale binding and creating it", snapshotName)
+	if err := m.DeleteByKind(ctx, snapshotName, cowKindSnapshot); err != nil {
+		return false, fmt.Errorf("drop stale s3 snapshot name %s: %w", snapshotName, err)
+	}
+	if _, err := m.engine.CreateSnapshotFromVolume(sourceName, snapshotName, false); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 func (m *S3Cow) initializeNewDefaultMediumVolume(ctx context.Context, name, devPath string) error {

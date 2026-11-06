@@ -6,13 +6,16 @@ package storage
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"os"
 	"path/filepath"
 	"testing"
 
 	"github.com/stretchr/testify/require"
 
 	"github.com/tencentcloud/CubeSandbox/Cubelet/pkg/constants"
+	"github.com/tencentcloud/CubeSandbox/Cubelet/pkg/cubecow"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/storage/cow"
 )
 
@@ -164,4 +167,64 @@ func TestSandboxImportFailsWhenImportFails(t *testing.T) {
 
 	_, _, err := imp.Rootfs(context.Background(), 0)
 	require.ErrorContains(t, err, "File exists")
+}
+
+func TestSandboxImportOriginStopsBeforeActivation(t *testing.T) {
+	for _, test := range []string{"wrong-export", "legacy", "source-export-is-not-origin", "wrong-volume", "unknown-version"} {
+		t.Run(test, func(t *testing.T) {
+			engine := &fakeCowEngine{}
+			useTestCowStorageAt(t, engine)
+			name := SandboxRootfsName("sb-1", 0)
+			_, err := engine.ImportLvol(name, "u-root")
+			require.NoError(t, err)
+			info := engine.volumeInfos[name]
+			switch test {
+			case "wrong-export":
+				info.ImportOrigin.ExportUUID = "different"
+			case "legacy":
+				info.ImportOrigin = nil
+			case "source-export-is-not-origin":
+				info.ImportOrigin = nil
+				info.ExportUUID = "u-root"
+			case "wrong-volume":
+				info.ImportOrigin.VolumeUUID = "different"
+			case "unknown-version":
+				info.ImportOrigin.Version = 2
+			}
+			engine.importedLvols = nil
+			imp := CrossNodeSandboxImport(crossNodeAnnotations())
+			_, _, err = imp.Rootfs(context.Background(), 0)
+			require.ErrorContains(t, err, "native import origin")
+			require.Empty(t, engine.activatedVolumes)
+			require.Empty(t, engine.importedLvols)
+			require.Empty(t, engine.deletedVolumes)
+			require.Empty(t, engine.deactivatedVolumes)
+			require.Same(t, info, engine.volumeInfos[name])
+		})
+	}
+}
+
+func TestSandboxImportAlreadyExistsIsNotEvidence(t *testing.T) {
+	engine := &fakeCowEngine{importErr: &cubecow.CowError{Code: cubecow.SemAlreadyExists}}
+	useTestCowStorageAt(t, engine)
+	_, _, err := CrossNodeSandboxImport(crossNodeAnnotations()).Rootfs(context.Background(), 0)
+	require.Error(t, err)
+	require.Empty(t, engine.activatedVolumes)
+	require.Empty(t, engine.deletedVolumes)
+}
+
+func TestSandboxImportNativeFFIJSON(t *testing.T) {
+	path := os.Getenv("ORIGIN_FFI_FIXTURE")
+	if path == "" {
+		t.Skip("optional captured native/Rust FFI fixture")
+	}
+	raw, err := os.ReadFile(path)
+	require.NoError(t, err)
+	var info cubecow.Volume
+	require.NoError(t, json.Unmarshal(raw, &info))
+	require.NoError(t, requireImportedOrigin(&info, "target", "export-a"))
+	require.NotEmpty(t, info.ImportOrigin.SnapshotUUID)
+	require.Equal(t, uint64(1073741824), info.ImportOrigin.SizeBytes)
+	require.Equal(t, "snap-a", info.ImportOrigin.Snapshot)
+	require.Error(t, requireImportedOrigin(&info, "target", "export-b"))
 }

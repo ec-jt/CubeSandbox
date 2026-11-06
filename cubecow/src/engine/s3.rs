@@ -22,7 +22,53 @@ use crate::pkg::metrics::{
     MetricsCollector, METRIC_SNAPSHOT_COUNT, METRIC_TOTAL_BYTES, METRIC_USED_BYTES,
     METRIC_VOLUME_COUNT,
 };
-use crate::{Snapshot, Volume, VolumeBlockInfo};
+use crate::{ImportOrigin, Snapshot, Volume, VolumeBlockInfo};
+
+#[derive(Deserialize)]
+struct NativeImportInfo {
+    volume_uuid: String,
+    import_origin: Option<ImportOrigin>,
+}
+
+#[derive(Deserialize)]
+struct NativeGeometry {
+    name: String,
+    uuid: String,
+    cluster_size: u64,
+    total_clusters: u64,
+}
+
+impl NativeGeometry {
+    fn capacity(&self, name: &str, uuid: &str) -> CubecowResult<u64> {
+        let size = self.cluster_size.checked_mul(self.total_clusters);
+        if self.name != name || self.uuid.is_empty() || self.uuid != uuid
+            || self.cluster_size == 0 || self.cluster_size % S3_BLOCK_SIZE as u64 != 0
+            || size.is_none() || size == Some(0)
+        {
+            return Err(CubecowError::PreconditionFailed(
+                "native capacity is unavailable, invalid, or has changed identity".into(),
+            ));
+        }
+        Ok(size.unwrap())
+    }
+}
+
+impl NativeImportInfo {
+    fn require_origin(&self, export_uuid: &str) -> CubecowResult<&ImportOrigin> {
+        let origin = self.import_origin.as_ref().ok_or_else(|| {
+            CubecowError::PreconditionFailed("native import origin is absent".into())
+        })?;
+        if origin.version != 1 || origin.volume_uuid != self.volume_uuid
+            || self.volume_uuid.is_empty() || origin.lvstore_uuid.is_empty()
+            || origin.export_uuid != export_uuid || origin.size_bytes == 0
+        {
+            return Err(CubecowError::PreconditionFailed(
+                "native import origin does not match destination and requested export".into(),
+            ));
+        }
+        Ok(origin)
+    }
+}
 
 const S3_BLOCK_SIZE: u32 = 512;
 const BYTES_PER_GIB: u64 = 1024 * 1024 * 1024;
@@ -238,7 +284,13 @@ impl S3Engine {
         let whole = size_bytes / BYTES_PER_GIB;
         let rem = size_bytes % BYTES_PER_GIB;
         match self.cfg.size_policy.as_str() {
-            "round_up" => Ok(if rem == 0 { whole } else { whole + 1 }),
+            "round_up" => {
+                let gib = if rem == 0 { whole } else { whole + 1 };
+                gib.checked_mul(BYTES_PER_GIB).ok_or_else(|| {
+                    CubecowError::InvalidArg("rounded capacity overflows u64".into())
+                })?;
+                Ok(gib)
+            }
             "strict" => {
                 if rem == 0 {
                     Ok(whole)
@@ -259,6 +311,42 @@ impl S3Engine {
         persist_index(&self.cfg.state_dir, idx).map_err(CubecowError::from)
     }
 
+    fn native_import_info(&self, name: &str) -> CubecowResult<NativeImportInfo> {
+        let resp = self.rpc.call_raw(
+            "rcow_get_import_origin", &serde_json::json!({"lvol_name": name}),
+        )?;
+        serde_json::from_str(&extract_string_value(&resp)?).map_err(|e| {
+            CubecowError::PreconditionFailed(format!("invalid native import evidence: {e}"))
+        })
+    }
+
+    // The persisted index is only a name/lifecycle index. Older entries contain
+    // requested bytes, not allocated capacity. Never round or trust those bytes.
+    // Closed blobs report zero geometry: fail closed rather than activate them
+    // as a side effect of a read. Require the UUID from both native RPCs to agree.
+    fn native_capacity(&self, name: &str) -> CubecowResult<(u64, NativeImportInfo)> {
+        let resp = self.rpc.call_raw("rcow_get_lvol", &serde_json::json!({"lvol_name": name}))?;
+        let geometry: NativeGeometry = serde_json::from_str(&extract_string_value(&resp)?)
+            .map_err(|e| CubecowError::PreconditionFailed(format!("invalid native geometry: {e}")))?;
+        let native = self.native_import_info(name)?;
+        Ok((geometry.capacity(name, &native.volume_uuid)?, native))
+    }
+
+    fn authoritative_volume(&self, name: &str, entry: &NameKind) -> CubecowResult<Volume> {
+        let (size_bytes, native) = self.native_capacity(name)?;
+        let activated = match entry {
+            NameKind::Volume { activated, .. } | NameKind::Snapshot { activated, .. } => activated,
+        };
+        if activated.as_ref().is_some_and(|b| b.uuid != native.volume_uuid) {
+            return Err(CubecowError::PreconditionFailed("native capacity identity differs from activated device".into()));
+        }
+        let mut view = Self::project_volume(name, entry);
+        view.size_bytes = size_bytes;
+        view.volume_uuid = native.volume_uuid;
+        view.import_origin = native.import_origin;
+        Ok(view)
+    }
+
     fn project_volume(name: &str, entry: &NameKind) -> Volume {
         match entry {
             NameKind::Volume {
@@ -266,6 +354,8 @@ impl S3Engine {
                 created_at,
                 activated,
             } => Volume {
+                volume_uuid: String::new(),
+                import_origin: None,
                 name: name.to_string(),
                 size_bytes: *size_bytes,
                 device_path: activated
@@ -285,6 +375,8 @@ impl S3Engine {
                 export_uuid,
                 ..
             } => Volume {
+                volume_uuid: String::new(),
+                import_origin: None,
                 name: name.to_string(),
                 size_bytes: *size_bytes,
                 device_path: activated
@@ -403,46 +495,17 @@ impl Engine for S3Engine {
             return Err(e);
         }
 
-        // Persist the volume metadata before activation so that a
-        // crash between `rcow_create_lvol` and `rcow_active_bdev`
-        // leaves a consistent (created-but-not-activated) entry on
-        // disk. Activation is idempotent and can be retried by the
-        // caller via `activate_volume` after restart.
-        if let Err(e) = self.persist(&idx) {
-            let _ = self.rpc.call_typed(
-                "rcow_delete_lvol",
-                &serde_json::json!({ "lvol_name": name }),
-            );
-            idx.remove(name);
-            return Err(e);
+        // Native creation may have reused an object after a crash. Capacity
+        // lookup/persistence/activation failures must never delete it by name.
+        let (size_bytes, native) = self.native_capacity(name)?;
+        if let Some(NameKind::Volume { size_bytes: size, .. }) = idx.get_mut(name) {
+            *size = size_bytes;
         }
-
-        // Auto-activate: the design contract is "volume ⇄ device
-        // lifetime". A freshly created volume must therefore be
-        // returned with a usable `device_path`. Activation failure
-        // rolls back the entire create so callers do not observe an
-        // orphan lvol.
-        let bdev = match self.call_activate(name) {
-            Ok(b) => b,
-            Err(e) => {
-                warn!(
-                    volume = name,
-                    error = %e,
-                    "s3 volume created but activation failed; rolling back"
-                );
-                let _ = self.rpc.call_typed(
-                    "rcow_deactive_bdev",
-                    &serde_json::json!({ "device_name": name }),
-                );
-                let _ = self.rpc.call_typed(
-                    "rcow_delete_lvol",
-                    &serde_json::json!({ "lvol_name": name }),
-                );
-                idx.remove(name);
-                let _ = self.persist(&idx);
-                return Err(e);
-            }
-        };
+        self.persist(&idx)?;
+        let bdev = self.call_activate(name)?;
+        if bdev.uuid != native.volume_uuid {
+            return Err(CubecowError::PreconditionFailed("created volume identity changed during activation".into()));
+        }
 
         let entry = NameKind::Volume {
             size_bytes,
@@ -454,7 +517,7 @@ impl Engine for S3Engine {
 
         self.metrics.inc(METRIC_VOLUME_COUNT);
         info!(volume = name, size_bytes, size_gib, "s3 volume created");
-        Ok(Self::project_volume(name, &entry))
+        self.authoritative_volume(name, &entry)
     }
 
     fn delete_volume(&self, name: &str) -> CubecowResult<()> {
@@ -499,21 +562,21 @@ impl Engine for S3Engine {
             .name_index
             .write()
             .expect("s3 name_index lock poisoned");
-        let old_size = match idx.get(name) {
-            Some(NameKind::Volume { size_bytes, .. }) => *size_bytes,
+        match idx.get(name) {
+            Some(NameKind::Volume { .. }) => {}
             Some(NameKind::Snapshot { .. }) => {
-                return Err(CubecowError::InvalidArg(format!(
-                    "'{name}' is a snapshot; cannot resize"
-                )));
+                return Err(CubecowError::InvalidArg(format!("'{name}' is a snapshot; cannot resize")));
             }
             None => return Err(CubecowError::NotFound(format!("volume '{name}'"))),
-        };
-        if new_size_bytes < old_size {
+        }
+        let (old_size, old_native) = self.native_capacity(name)?;
+        let target_size = new_size_gib * BYTES_PER_GIB; // checked by size_bytes_to_gib
+        if target_size < old_size {
             return Err(CubecowError::InvalidArg(format!(
-                "shrinking is not supported (current={old_size}, requested={new_size_bytes})"
+                "shrinking is not supported (current={old_size}, requested={target_size})"
             )));
         }
-        if new_size_bytes == old_size {
+        if target_size == old_size {
             return Ok((old_size, old_size));
         }
 
@@ -533,6 +596,10 @@ impl Engine for S3Engine {
             Err(e) => return Err(e),
         }
 
+        let (new_size_bytes, native) = self.native_capacity(name)?;
+        if native.volume_uuid != old_native.volume_uuid || new_size_bytes < target_size {
+            return Err(CubecowError::PreconditionFailed("resize capacity or identity not verified".into()));
+        }
         if let Some(NameKind::Volume { size_bytes, .. }) = idx.get_mut(name) {
             *size_bytes = new_size_bytes;
         }
@@ -546,6 +613,15 @@ impl Engine for S3Engine {
         Ok((old_size, new_size_bytes))
     }
 
+    fn checkpoint_record(&self, request: &str) -> CubecowResult<String> {
+        if request.len() > 160 * 1024 {
+            return Err(CubecowError::InvalidArg("checkpoint request too large".into()));
+        }
+        let params: serde_json::Value = serde_json::from_str(request)
+            .map_err(|e| CubecowError::InvalidArg(e.to_string()))?;
+        extract_string_value(&self.rpc.call_raw("rcow_checkpoint_record", &params)?)
+    }
+
     fn get_volume_info(&self, name: &str) -> CubecowResult<Volume> {
         // Step 1: build the base projection under the read lock and
         // capture the snapshot's `export_uuid` (if any) so we can
@@ -556,7 +632,7 @@ impl Engine for S3Engine {
                 .get(name)
                 .ok_or_else(|| CubecowError::NotFound(format!("volume or snapshot '{name}'")))?;
 
-            let mut view = Self::project_volume(name, entry);
+            let mut view = self.authoritative_volume(name, entry)?;
             if let NameKind::Volume { .. } = entry {
                 view.snapshot_count = idx
                     .iter()
@@ -650,7 +726,10 @@ impl Engine for S3Engine {
         let mut out = Vec::with_capacity(end.saturating_sub(start));
         for name in &names[start..end] {
             if let Some(entry) = idx.get(name) {
-                let mut v = Self::project_volume(name, entry);
+                let mut v = match self.authoritative_volume(name, entry) {
+                    Ok(v) => v,
+                    Err(e) => { warn!(name, error = %e, "omitting unverifiable native capacity from list"); continue; }
+                };
                 v.snapshot_count = idx
                     .iter()
                     .filter(|(_, k)| {
@@ -676,10 +755,10 @@ impl Engine for S3Engine {
     ) -> CubecowResult<Snapshot> {
         Self::validate_name(snapshot_name, "snapshot")?;
 
-        let (ultimate_origin, size_bytes) = {
+        let ultimate_origin = {
             let idx = self.name_index.read().expect("s3 name_index lock poisoned");
             match idx.get(source_name) {
-                Some(NameKind::Volume { size_bytes, .. }) => (source_name.to_string(), *size_bytes),
+                Some(NameKind::Volume { .. }) => source_name.to_string(),
                 Some(NameKind::Snapshot { .. }) => {
                     return Err(CubecowError::InvalidArg(format!(
                         "'{source_name}' is a snapshot; create_snapshot_from_volume only accepts a volume as source"
@@ -693,6 +772,7 @@ impl Engine for S3Engine {
             }
         };
 
+        let (size_bytes, _) = self.native_capacity(source_name)?;
         // Reserve the snapshot name so a concurrent create cannot race.
         {
             let mut idx = self
@@ -735,9 +815,11 @@ impl Engine for S3Engine {
             return Err(e);
         }
 
+        let (size_bytes, native) = self.native_capacity(snapshot_name)?;
         let bdev = if activate {
             match self.call_activate(snapshot_name) {
-                Ok(b) => Some(b),
+                Ok(b) if b.uuid == native.volume_uuid => Some(b),
+                Ok(_) => return Err(CubecowError::PreconditionFailed("snapshot activation identity changed".into())),
                 Err(e) => {
                     warn!(
                         snapshot = snapshot_name,
@@ -800,8 +882,8 @@ impl Engine for S3Engine {
         // clone the snapshot, so the RPC intent stays honest with
         // the s3lvol `rcow_create_clone` semantics (its `snapshot_name`
         // parameter is required to name an existing snapshot).
-        let size_bytes = match idx.get(source_snapshot) {
-            Some(NameKind::Snapshot { size_bytes, .. }) => *size_bytes,
+        match idx.get(source_snapshot) {
+            Some(NameKind::Snapshot { .. }) => {},
             Some(NameKind::Volume { .. }) => {
                 return Err(CubecowError::InvalidArg(format!(
                     "'{source_snapshot}' is a volume; \
@@ -828,34 +910,11 @@ impl Engine for S3Engine {
             }),
         )?;
 
-        // Auto-activate: mirror `create_volume`'s "volume ⇄ device
-        // lifetime" contract. Activation failure rolls back the whole
-        // create so callers never observe an orphan lvol. Because the
-        // index entry is only inserted after activation succeeds, a
-        // crash between `rcow_create_clone` and `rcow_active_bdev`
-        // leaves an orphan lvol on the s3lvol side — the startup
-        // sweep in `initialize_with_config` is responsible for
-        // reconciling that, same as for `create_volume`.
-        let bdev = match self.call_activate(volume_name) {
-            Ok(b) => b,
-            Err(e) => {
-                warn!(
-                    volume = volume_name,
-                    source_snapshot,
-                    error = %e,
-                    "s3 clone created but activation failed; rolling back"
-                );
-                let _ = self.rpc.call_typed(
-                    "rcow_deactive_bdev",
-                    &serde_json::json!({ "device_name": volume_name }),
-                );
-                let _ = self.rpc.call_typed(
-                    "rcow_delete_lvol",
-                    &serde_json::json!({ "lvol_name": volume_name }),
-                );
-                return Err(e);
-            }
-        };
+        let (size_bytes, native) = self.native_capacity(volume_name)?;
+        let bdev = self.call_activate(volume_name)?;
+        if bdev.uuid != native.volume_uuid {
+            return Err(CubecowError::PreconditionFailed("clone activation identity changed".into()));
+        }
 
         let entry = NameKind::Volume {
             size_bytes,
@@ -870,7 +929,7 @@ impl Engine for S3Engine {
             volume = volume_name,
             source_snapshot, size_bytes, "s3 writable volume derived from snapshot"
         );
-        Ok(Self::project_volume(volume_name, &entry))
+        self.authoritative_volume(volume_name, &entry)
     }
 
     fn delete_snapshot(&self, snapshot_name: &str) -> CubecowResult<()> {
@@ -950,8 +1009,14 @@ impl Engine for S3Engine {
         let mut out = Vec::with_capacity(end.saturating_sub(start));
         for name in &names[start..end] {
             if let Some(entry) = idx.get(name) {
-                if let Ok(s) = Self::project_snapshot(name, entry) {
-                    out.push(s);
+                match self.authoritative_volume(name, entry) {
+                    Ok(v) => {
+                        if let Ok(mut s) = Self::project_snapshot(name, entry) {
+                            s.size_bytes = v.size_bytes;
+                            out.push(s);
+                        }
+                    }
+                    Err(e) => warn!(name, error = %e, "omitting unverifiable snapshot capacity from list"),
                 }
             }
         }
@@ -995,7 +1060,7 @@ impl Engine for S3Engine {
         }
         self.persist(&idx)?;
 
-        let projected = Self::project_volume(name, idx.get(name).expect("just inserted"));
+        let projected = self.authoritative_volume(name, idx.get(name).expect("just inserted"))?;
         debug!(name, device_path = %info.device_path, "s3 volume/snapshot activated");
         Ok(projected)
     }
@@ -1092,9 +1157,9 @@ impl Engine for S3Engine {
             .name_index
             .write()
             .expect("s3 name_index lock poisoned");
-        if idx.contains_key(lvol_name) {
-            return Err(CubecowError::AlreadyExists(format!(
-                "name '{lvol_name}' already exists in s3 namespace"
+        if matches!(idx.get(lvol_name), Some(NameKind::Snapshot { .. })) {
+            return Err(CubecowError::PreconditionFailed(format!(
+                "name '{lvol_name}' is a snapshot, not an imported volume"
             )));
         }
 
@@ -1111,58 +1176,40 @@ impl Engine for S3Engine {
             Err(e) => return Err(e),
         }
 
-        // The imported volume's exact size in bytes is unknown at
-        // this point; record 0 as a sentinel. Persist the (not-yet-
-        // activated) entry first so a crash between `rcow_import_lvol`
-        // and `rcow_active_bdev` still leaves a consistent record on
-        // disk that can be re-activated after restart.
+        // Includes AlreadyExists and the crash-after-RPC/before-index case.
+        // Only the native destination blob can establish origin. Never backfill
+        // it from this request or treat a local index entry as evidence.
+        let (size_bytes, native) = self.native_capacity(lvol_name)?;
+        if size_bytes < native.require_origin(export_uuid)?.size_bytes {
+            return Err(CubecowError::PreconditionFailed("import capacity is smaller than native origin".into()));
+        }
+        let previous = idx.get(lvol_name).cloned();
         let created_at = Utc::now().to_rfc3339();
         idx.insert(
             lvol_name.to_string(),
             NameKind::Volume {
-                size_bytes: 0,
+                size_bytes,
                 created_at: created_at.clone(),
                 activated: None,
             },
         );
         if let Err(e) = self.persist(&idx) {
-            let _ = self.rpc.call_typed(
-                "rcow_delete_lvol",
-                &serde_json::json!({ "lvol_name": lvol_name }),
-            );
-            idx.remove(lvol_name);
+            if let Some(old) = previous { idx.insert(lvol_name.to_string(), old); }
+            else { idx.remove(lvol_name); }
             return Err(e);
         }
 
-        // Auto-activate: the API contract documented in
-        // `docs/design/zh/cubecow-api.md` §import_lvol requires that
-        // the returned Volume be "立即可用、device_path 非空". Mirror
-        // the `create_volume` rollback pattern on activation failure
-        // so callers never observe an orphan imported lvol.
-        let bdev = match self.call_activate(lvol_name) {
-            Ok(b) => b,
-            Err(e) => {
-                warn!(
-                    lvol = lvol_name,
-                    error = %e,
-                    "s3 lvol imported but activation failed; rolling back"
-                );
-                let _ = self.rpc.call_typed(
-                    "rcow_deactive_bdev",
-                    &serde_json::json!({ "device_name": lvol_name }),
-                );
-                let _ = self.rpc.call_typed(
-                    "rcow_delete_lvol",
-                    &serde_json::json!({ "lvol_name": lvol_name }),
-                );
-                idx.remove(lvol_name);
-                let _ = self.persist(&idx);
-                return Err(e);
-            }
-        };
+        // Do not roll back native state by name: it may predate this attempt.
+        // A durable native origin permits a later safe retry after any failure.
+        let bdev = self.call_activate(lvol_name)?;
+        if bdev.uuid != native.volume_uuid {
+            return Err(CubecowError::PreconditionFailed(
+                "activated device identity changed after import verification".into(),
+            ));
+        }
 
         let entry = NameKind::Volume {
-            size_bytes: 0,
+            size_bytes,
             created_at,
             activated: Some(bdev),
         };
@@ -1171,7 +1218,10 @@ impl Engine for S3Engine {
 
         self.metrics.inc(METRIC_VOLUME_COUNT);
         info!(lvol = lvol_name, %export_uuid, "s3 volume imported");
-        Ok(Self::project_volume(lvol_name, &entry))
+        let mut volume = Self::project_volume(lvol_name, &entry);
+        volume.volume_uuid = native.volume_uuid;
+        volume.import_origin = native.import_origin;
+        Ok(volume)
     }
 
     fn reset_node_storage(&self) -> CubecowResult<()> {
@@ -1584,6 +1634,258 @@ fn persist_index(state_dir: &Path, idx: &HashMap<String, NameKind>) -> std::io::
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn capacity_geometry_rejects_invalid_and_identity_mismatch() {
+        let good = serde_json::json!({"name":"v", "uuid":"u", "cluster_size":4194304, "total_clusters":256});
+        let g: NativeGeometry = serde_json::from_value(good.clone()).unwrap();
+        assert_eq!(g.capacity("v", "u").unwrap(), BYTES_PER_GIB);
+        assert!(g.capacity("v", "other").is_err());
+        assert!(g.capacity("other", "u").is_err());
+        for (key, value) in [("total_clusters", serde_json::json!(0)),
+            ("cluster_size", serde_json::json!(513)), ("cluster_size", serde_json::json!(0)),
+            ("total_clusters", serde_json::json!(u64::MAX)), ("uuid", serde_json::json!(""))] {
+            let mut bad = good.clone(); bad[key] = value;
+            assert!(serde_json::from_value::<NativeGeometry>(bad).unwrap().capacity("v", "u").is_err());
+        }
+        for value in [serde_json::json!(-1), serde_json::json!(1.5), serde_json::json!("256")] {
+            let mut bad = good.clone(); bad["total_clusters"] = value;
+            assert!(serde_json::from_value::<NativeGeometry>(bad).is_err());
+        }
+        let mut missing = good; missing.as_object_mut().unwrap().remove("total_clusters");
+        assert!(serde_json::from_value::<NativeGeometry>(missing).is_err());
+    }
+
+    #[test]
+    fn capacity_create_legacy_resize_snapshot_clone_and_failure() {
+        use std::io::{BufRead, BufReader};
+        use std::os::unix::net::UnixListener;
+        let dir = std::env::temp_dir().join(format!("capacity-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&dir).unwrap();
+        let socket = dir.join("rpc.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let failed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let server_failed = failed.clone();
+        let thread = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut sizes = HashMap::from([("old".to_string(), 3 * BYTES_PER_GIB)]);
+            loop {
+                let mut line = String::new();
+                if reader.read_line(&mut line).unwrap() == 0 { break; }
+                let req: serde_json::Value = serde_json::from_str(&line).unwrap();
+                let p = &req["params"]; let method = req["method"].as_str().unwrap();
+                let name = p["lvol_name"].as_str().unwrap_or("");
+                let result = match method {
+                    "rcow_create_lvol" | "rcow_resize_lvol" => {
+                        sizes.insert(name.into(), p["size_gib"].as_u64().unwrap() * BYTES_PER_GIB);
+                        serde_json::json!({"bool_value":true})
+                    }
+                    "rcow_create_snapshot" => {
+                        sizes.insert(p["snapshot_name"].as_str().unwrap().into(), sizes[name]);
+                        serde_json::json!({"bool_value":true})
+                    }
+                    "rcow_create_clone" => {
+                        sizes.insert(p["clone_name"].as_str().unwrap().into(), sizes[p["snapshot_name"].as_str().unwrap()]);
+                        serde_json::json!({"bool_value":true})
+                    }
+                    "rcow_get_lvol" if server_failed.load(Ordering::SeqCst) =>
+                        serde_json::json!({"bool_value":false,"string_value":"native geometry unavailable"}),
+                    "rcow_get_lvol" => serde_json::json!({"bool_value":true,"string_value":serde_json::json!({
+                        "name":name,"uuid":format!("id-{name}"),"cluster_size":4194304,"total_clusters":sizes[name]/4194304
+                    }).to_string()}),
+                    "rcow_get_import_origin" => serde_json::json!({"bool_value":true,"string_value":serde_json::json!({
+                        "volume_uuid":format!("id-{name}"),"import_origin":null
+                    }).to_string()}),
+                    "rcow_active_bdev" | "rcow_get_bdev" => {
+                        let name = p["device_name"].as_str().unwrap();
+                        serde_json::json!({"bool_value":true,"string_value":serde_json::json!({
+                            "device_name":name,"uuid":format!("id-{name}"),"nqn":"test","subsys":1,"nsid":1,"device_path":"/dev/test"
+                        }).to_string()})
+                    }
+                    other => panic!("unexpected destructive or unrelated RPC: {other}"),
+                };
+                writeln!(stream,"{}",serde_json::json!({"jsonrpc":"2.0","id":req["id"],"result":result})).unwrap();
+            }
+        });
+        let index = HashMap::from([("old".into(), NameKind::Volume { size_bytes:8*1024*1024, created_at:"legacy".into(), activated:None })]);
+        persist_index(&dir, &index).unwrap();
+        let engine = S3Engine {
+            cfg:S3Config { state_dir:dir.clone(), size_policy:"round_up".into(), ..Default::default() },
+            rpc:Arc::new(JsonRpcClient::new(socket,Duration::from_secs(2))),
+            name_index:RwLock::new(load_index_file(&dir).unwrap()), metrics:Arc::new(MetricsCollector::new()),
+        };
+        assert!(engine.size_bytes_to_gib(0).is_err());
+        assert!(engine.size_bytes_to_gib(u64::MAX).is_err());
+        for request in [1, 8*1024*1024, 256*1024*1024, BYTES_PER_GIB] {
+            assert_eq!(engine.size_bytes_to_gib(request).unwrap(),1);
+        }
+        assert_eq!(engine.create_volume("memory",268435456).unwrap().size_bytes,BYTES_PER_GIB);
+        assert_eq!(engine.create_volume("metadata",8388608).unwrap().size_bytes,BYTES_PER_GIB);
+        // Deliberately not ceil(old index): the native object is THREE GiB.
+        assert_eq!(engine.get_volume_info("old").unwrap().size_bytes,3*BYTES_PER_GIB);
+        assert_eq!(engine.activate_volume("old").unwrap().size_bytes,3*BYTES_PER_GIB);
+        assert!(engine.resize_volume("old",2*BYTES_PER_GIB).is_err());
+        assert_eq!(engine.resize_volume("memory",512*1024*1024).unwrap(),(BYTES_PER_GIB,BYTES_PER_GIB));
+        assert_eq!(engine.resize_volume("memory",BYTES_PER_GIB+1).unwrap(),(BYTES_PER_GIB,2*BYTES_PER_GIB));
+        assert_eq!(engine.create_snapshot_from_volume("old","snap",false).unwrap().size_bytes,3*BYTES_PER_GIB);
+        assert_eq!(engine.create_volume_from_snapshot("snap","clone").unwrap().size_bytes,3*BYTES_PER_GIB);
+        assert_eq!(engine.list_snapshots("old",0,None).0[0].size_bytes,3*BYTES_PER_GIB);
+        assert_eq!(engine.list_volumes(0,None).0.iter().find(|v|v.name=="old").unwrap().size_bytes,3*BYTES_PER_GIB);
+        assert_eq!(engine.get_volume_block_info("old").unwrap().num_blocks,3*BYTES_PER_GIB/512);
+        failed.store(true,Ordering::SeqCst);
+        assert!(engine.get_volume_info("old").is_err());
+        assert!(engine.resize_volume("old",4*BYTES_PER_GIB).is_err());
+        assert!(engine.create_snapshot_from_volume("old","failed-snap",false).is_err());
+        assert!(engine.create_volume("preserved",1).is_err());
+        assert!(engine.list_volumes(0,None).0.is_empty());
+        assert!(engine.list_snapshots("old",0,None).0.is_empty());
+        assert!(engine.name_index.read().unwrap().contains_key("old"));
+        drop(engine); thread.join().unwrap(); std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    fn origin_fixture() -> serde_json::Value {
+        if let Ok(path) = std::env::var("NATIVE_ORIGIN_FIXTURE") {
+            let mut value: serde_json::Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+            // Keep native UUIDs and geometry; only the expected export label
+            // is normalised for the mock import request below.
+            value["import_origin"]["export_uuid"] = "export-a".into();
+            return value;
+        }
+        serde_json::json!({"volume_uuid":"destination", "import_origin": {
+            "version":1,"volume_uuid":"destination","lvstore_uuid":"store",
+            "export_uuid":"export-a","snapshot_uuid":"snapshot-a","endpoint":"local-minio:9000",
+            "bucket":"test","prefix":"source","lvs_name":"source","snapshot":"checkpoint-a",
+            "manifest_version":4,"generation":1,"cluster_size":4194304,"chunk_size":4194304,
+            "block_size":4096,"blob_id":123,"source_blob_id":456,"size_bytes":1073741824u64
+        }})
+    }
+
+    #[test]
+    fn import_origin_reuse_and_failures_never_delete() {
+        use std::io::{BufRead, BufReader};
+        use std::os::unix::net::UnixListener;
+        for scenario in ["new", "repeat", "race-a", "race-b", "legacy", "persist-fail", "activate-fail"] {
+            let dir = std::env::temp_dir().join(format!("origin-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir(&dir).unwrap();
+            let socket = dir.join("rpc.sock");
+            let listener = UnixListener::bind(&socket).unwrap();
+            let calls = Arc::new(Mutex::new(Vec::<String>::new()));
+            let seen = calls.clone();
+            let thread = std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap() == 0 { break; }
+                    let request: serde_json::Value = serde_json::from_str(&line).unwrap();
+                    let method = request["method"].as_str().unwrap();
+                    seen.lock().unwrap().push(method.to_string());
+                    let result = match method {
+                        "rcow_import_lvol" => serde_json::json!({"bool_value":scenario == "new", "string_value":"name already exists"}),
+                        "rcow_get_lvol" => serde_json::json!({"bool_value":true,"string_value":serde_json::json!({
+                            "name":"target", "uuid":origin_fixture()["volume_uuid"], "cluster_size":4194304, "total_clusters":256
+                        }).to_string()}),
+                        "rcow_get_import_origin" => {
+                            let mut fixture = origin_fixture();
+                            if scenario == "race-b" { fixture["import_origin"]["export_uuid"] = "export-b".into(); }
+                            if scenario == "legacy" { fixture["import_origin"] = serde_json::Value::Null; }
+                            serde_json::json!({"bool_value":true,"string_value":fixture.to_string()})
+                        }
+                        "rcow_active_bdev" | "rcow_get_bdev" => {
+                            if scenario == "activate-fail" {
+                                serde_json::json!({"bool_value":false,"string_value":"activation failed"})
+                            } else {
+                                serde_json::json!({"bool_value":true,"string_value":serde_json::json!({
+                                    "device_name":"target","uuid":origin_fixture()["volume_uuid"],"nqn":"test","subsys":1,"nsid":1,"device_path":"/dev/test"
+                                }).to_string()})
+                            }
+                        }
+                        other => panic!("unexpected destructive or unrelated RPC: {other}"),
+                    };
+                    writeln!(stream, "{}", serde_json::json!({"jsonrpc":"2.0","id":request["id"],"result":result})).unwrap();
+                }
+            });
+            let state_dir = if scenario == "persist-fail" { dir.join("missing") } else { dir.clone() };
+            let mut index = HashMap::new();
+            if scenario == "repeat" {
+                index.insert("target".to_string(), NameKind::Volume {
+                    size_bytes: 0, created_at: "old".into(), activated: None,
+                });
+            }
+            let engine = S3Engine {
+                cfg: S3Config { state_dir, ..Default::default() },
+                rpc: Arc::new(JsonRpcClient::new(socket, Duration::from_secs(2))),
+                name_index: RwLock::new(index),
+                metrics: Arc::new(MetricsCollector::new()),
+            };
+            let result = engine.import_lvol("target", "export-a");
+            let success = matches!(scenario, "new" | "repeat" | "race-a");
+            assert_eq!(result.is_ok(), success, "{scenario}: {result:?}");
+            if let Ok(volume) = result {
+                assert_eq!(volume.import_origin.unwrap().export_uuid, "export-a");
+                assert_eq!(volume.size_bytes, 1073741824);
+            }
+            if success {
+                // Exercise the real ABI JSON path, not a second test serializer.
+                let handle: Box<Box<dyn Engine>> = Box::new(Box::new(engine));
+                let ptr = Box::into_raw(handle) as *mut std::ffi::c_void;
+                let name = std::ffi::CString::new("target").unwrap();
+                let mut out = std::ptr::null_mut();
+                assert_eq!(crate::ffi::cubecow_get_volume_info(ptr, name.as_ptr(), &mut out), 0);
+                let bytes = unsafe { std::ffi::CStr::from_ptr(out) }.to_bytes();
+                let payload: serde_json::Value = serde_json::from_slice(bytes).unwrap();
+                assert_eq!(payload["import_origin"]["export_uuid"], "export-a");
+                assert_eq!(payload["volume_uuid"], payload["import_origin"]["volume_uuid"]);
+                if let Ok(path) = std::env::var("ORIGIN_FFI_OUTPUT") { std::fs::write(path, bytes).unwrap(); }
+                crate::ffi::cubecow_free_string(out);
+                crate::ffi::cubecow_shutdown(ptr);
+            } else { drop(engine); }
+            thread.join().unwrap();
+            let calls = calls.lock().unwrap();
+            assert!(!calls.iter().any(|c| c.contains("delete") || c.contains("deactive")));
+            if matches!(scenario, "race-b" | "legacy" | "persist-fail") {
+                assert!(!calls.iter().any(|c| c == "rcow_active_bdev"));
+            }
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn checkpoint_record_ffi_routes_native_reply() {
+        use std::io::{BufRead, BufReader, Write};
+        use std::os::unix::net::UnixListener;
+        let dir = std::env::temp_dir().join(format!("commit-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&dir).unwrap();
+        let socket = dir.join("rpc.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            let request: serde_json::Value = serde_json::from_str(&line).unwrap();
+            assert_eq!(request["method"], "rcow_checkpoint_record");
+            assert_eq!(request["params"]["action"], "get");
+            writeln!(stream, "{}", serde_json::json!({"jsonrpc":"2.0","id":request["id"],"result":{"string_value":"{\"version\":1}"}})).unwrap();
+        });
+        let engine = S3Engine {
+            cfg: S3Config { state_dir: dir.clone(), ..Default::default() },
+            rpc: Arc::new(JsonRpcClient::new(socket, Duration::from_secs(2))),
+            name_index: RwLock::new(HashMap::new()),
+            metrics: Arc::new(MetricsCollector::new()),
+        };
+        let handle: Box<Box<dyn Engine>> = Box::new(Box::new(engine));
+        let ptr = Box::into_raw(handle) as *mut std::ffi::c_void;
+        let request = std::ffi::CString::new(r#"{"action":"get","key":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}"#).unwrap();
+        let mut out = std::ptr::null_mut();
+        assert_eq!(crate::ffi::cubecow_checkpoint_record(ptr, request.as_ptr(), &mut out), 0);
+        assert_eq!(unsafe { std::ffi::CStr::from_ptr(out) }.to_str().unwrap(), r#"{"version":1}"#);
+        crate::ffi::cubecow_free_string(out);
+        crate::ffi::cubecow_shutdown(ptr);
+        server.join().unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn validate_name_rejects_reserved_prefix() {

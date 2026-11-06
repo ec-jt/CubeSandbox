@@ -120,6 +120,29 @@ local function load_sandbox_proxy_metadata(ins_id)
     return nil, nil
 end
 
+-- Authorize before lifecycle side effects. Do not resolve the serving route
+-- here: resume can change its address or port mapping. The regular resolution
+-- below still checks authorization after resume and uses the fresh route.
+function _M.authorize(ins_id)
+    local cache = ngx.shared.local_cache
+    local allow_public = cache:get(ins_id .. ":AllowPublicTraffic")
+    local traffic_token = cache:get(ins_id .. ":TrafficAccessToken")
+    if allow_public ~= nil and traffic_token ~= nil then
+        enforce_traffic_token(decode_optional_cache_value(allow_public),
+                              decode_optional_cache_value(traffic_token), ins_id)
+    else
+        local metadata, err = load_sandbox_proxy_metadata(ins_id)
+        if not metadata then
+            if err then utils:respond_unavailable() else utils:respond_not_found() end
+            return
+        end
+        local fields = {}
+        for i = 1, #metadata, 2 do fields[metadata[i]] = metadata[i + 1] end
+        enforce_traffic_token(fields["AllowPublicTraffic"], fields["TrafficAccessToken"], ins_id)
+    end
+    ngx.ctx.cube_traffic_authorized = true
+end
+
 -- Read path. Returns host_ip, host_port, mask_request_host on a valid hit,
 -- nil on a miss. Completeness is the presence of every served field (false is
 -- a valid negative-cache sentinel; only nil means missing): a partial fill or

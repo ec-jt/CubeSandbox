@@ -223,17 +223,17 @@ func TestResolvePromotionState(t *testing.T) {
 		shared string
 		want   string
 	}{
-		{"both empty", "", "", ""},
+		{"both empty", "", "", redisstream.UnknownState},
 		{"local only", lifecycle.StatePaused, "", lifecycle.StatePaused},
 		{"shared only", "", lifecycle.StateRunning, lifecycle.StateRunning},
 		{"agree running", lifecycle.StateRunning, lifecycle.StateRunning, lifecycle.StateRunning},
 		{"agree paused", lifecycle.StatePaused, lifecycle.StatePaused, lifecycle.StatePaused},
-		{"disagree prefers paused", lifecycle.StatePaused, lifecycle.StateRunning, lifecycle.StatePaused},
+		{"shared newer than warm local", lifecycle.StatePaused, lifecycle.StateRunning, lifecycle.StateRunning},
 		{"disagree running local", lifecycle.StateRunning, lifecycle.StatePaused, lifecycle.StatePaused},
-		{"skip pausing", lifecycle.StatePaused, "pausing", ""},
-		{"skip resuming", lifecycle.StateRunning, "resuming", ""},
-		{"skip killing", lifecycle.StatePaused, "killing", ""},
-		{"skip killed", lifecycle.StateRunning, lifecycle.StateKilled, ""},
+		{"skip pausing", lifecycle.StatePaused, "pausing", "pausing"},
+		{"skip resuming", lifecycle.StateRunning, "resuming", "resuming"},
+		{"skip killing", lifecycle.StatePaused, "killing", "killing"},
+		{"skip killed", lifecycle.StateRunning, lifecycle.StateKilled, lifecycle.StateKilled},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -245,7 +245,7 @@ func TestResolvePromotionState(t *testing.T) {
 	}
 }
 
-func TestReconcileSharedStateWritesStaleRunningToPaused(t *testing.T) {
+func TestReconcileSharedStatePreservesSharedStateOverWarmLocal(t *testing.T) {
 	server := miniredis.RunT(t)
 	rdb := redis.NewClient(&redis.Options{Addr: server.Addr()})
 	t.Cleanup(func() { _ = rdb.Close() })
@@ -262,11 +262,11 @@ func TestReconcileSharedStateWritesStaleRunningToPaused(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got["sbx"] != lifecycle.StatePaused {
-		t.Fatalf("resolved = %q, want paused", got["sbx"])
+	if got["sbx"] != lifecycle.StateRunning {
+		t.Fatalf("resolved = %q, want running", got["sbx"])
 	}
-	if state, _, err := stream.GetState(ctx, "sbx"); err != nil || state != lifecycle.StatePaused {
-		t.Fatalf("redis state = %q, want paused", state)
+	if state, _, err := stream.GetState(ctx, "sbx"); err != nil || state != lifecycle.StateRunning {
+		t.Fatalf("redis state = %q, want running", state)
 	}
 }
 
@@ -287,9 +287,7 @@ func TestReconcileSharedStateSkipsTransitionMarker(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, ok := got["sbx"]; ok {
-		t.Fatalf("transition marker must be skipped, got %v", got)
-	}
+	if got["sbx"] != "resuming" { t.Fatalf("proxy replay must preserve transition, got %v",got) }
 	if state, _, err := stream.GetState(ctx, "sbx"); err != nil || state != "resuming" {
 		t.Fatalf("redis state = %q, want resuming", state)
 	}
@@ -338,9 +336,7 @@ func TestReconcileSharedStateCASMismatchLeavesRedis(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, ok := got["sbx"]; ok {
-		t.Fatalf("CAS mismatch must drop sid, got %v", got)
-	}
+	if got["sbx"] != "resuming" { t.Fatalf("concurrent owner must be replayed, got %v",got) }
 	if state, _, err := stream.GetState(ctx, "sbx"); err != nil || state != "resuming" {
 		t.Fatalf("redis state = %q, want resuming", state)
 	}
@@ -408,8 +404,8 @@ func TestRebuildRegistryAfterTrimPreservesActivityAndReadsCursorFirst(t *testing
 	if got.LastActiveMs != 42 {
 		t.Fatalf("LastActiveMs = %d, want 42", got.LastActiveMs)
 	}
-	if got.RuntimeState != lifecycle.StatePaused {
-		t.Fatalf("RuntimeState = %q, want paused", got.RuntimeState)
+	if got.RuntimeState != lifecycle.StateRunning {
+		t.Fatalf("RuntimeState = %q, want recovered running", got.RuntimeState)
 	}
 	if !got.FirstSeenAt.Equal(startupTs) {
 		t.Fatalf("FirstSeenAt = %v, want startupTs %v", got.FirstSeenAt, startupTs)
@@ -660,4 +656,14 @@ func TestRestoreIfSameGenerationAfterTrim(t *testing.T) {
 	if !active.IsLeader() {
 		t.Fatal("trim rebuild should restore the same lease generation without draining")
 	}
+}
+
+func TestPromotionRecoversExternalPauseOverOldRunning(t *testing.T) {
+ server:=miniredis.RunT(t);rdb:=redis.NewClient(&redis.Options{Addr:server.Addr()});defer rdb.Close()
+ ctx:=context.Background();stream:=redisstream.New(rdb,zap.NewNop());reg:=registry.New()
+ reg.Upsert(lifecycle.SandboxLifecycleMeta{SandboxID:"sbx"});reg.SetRuntimeState("sbx",lifecycle.StatePaused)
+ stream.SetState(ctx,"sbx",lifecycle.StateRunning,0)
+ rdb.XAdd(ctx,&redis.XAddArgs{Stream:lifecycle.EventStreamKey,Values:map[string]interface{}{"op":"state","sandbox_id":"sbx","payload":`{"state":"paused"}`}})
+ got,err:=reconcileSharedState(ctx,stream,reg,time.Minute,zap.NewNop())
+ if err!=nil || got["sbx"]!=lifecycle.StatePaused { t.Fatalf("%v %v",got,err) }
 }

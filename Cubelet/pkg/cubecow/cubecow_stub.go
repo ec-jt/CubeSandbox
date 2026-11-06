@@ -28,6 +28,10 @@ func InitWithoutLoggingFromJSON(string) (*Engine, error) {
 
 func (e *Engine) Close() {}
 
+func (e *Engine) CheckpointRecord(string) (string, error) {
+	return "", fmt.Errorf(nativeBuildHint)
+}
+
 func (e *Engine) ResetNodeStorage() error {
 	return fmt.Errorf(nativeBuildHint)
 }

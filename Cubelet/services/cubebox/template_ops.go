@@ -9,6 +9,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/tencentcloud/CubeSandbox/Cubelet/pkg/sourcefence"
+	"github.com/tencentcloud/CubeSandbox/Cubelet/plugins/workflow"
 	"os"
 	"path/filepath"
 	"runtime/debug"
@@ -28,11 +30,18 @@ import (
 )
 
 func (s *service) CommitSandbox(ctx context.Context, req *cubebox.CommitSandboxRequest) (*cubebox.CommitSandboxResponse, error) {
+	sourcefence.Barrier.RLock()
+	defer sourcefence.Barrier.RUnlock()
 	rsp := &cubebox.CommitSandboxResponse{
 		RequestID:  req.GetRequestID(),
 		SandboxID:  req.GetSandboxID(),
 		TemplateID: strings.TrimSpace(req.GetTemplateID()),
 		Ret:        &errorcode.Ret{RetCode: errorcode.ErrorCode_Success},
+	}
+	if err := workflow.SourceFences.Any(); err != nil {
+		rsp.Ret.RetCode = errorcode.ErrorCode_PreConditionFailed
+		rsp.Ret.RetMsg = err.Error()
+		return rsp, nil
 	}
 	if rsp.TemplateID == "" {
 		rsp.Ret.RetCode = errorcode.ErrorCode_InvalidParamFormat
@@ -85,6 +94,12 @@ func (s *service) CommitSandbox(ctx context.Context, req *cubebox.CommitSandboxR
 
 	unlock := s.sandboxLifecycleLocks.Lock(rsp.SandboxID)
 	defer unlock()
+	if err := workflow.SourceFences.Check(rsp.SandboxID); err != nil {
+		rsp.Ret.RetCode = errorcode.ErrorCode_PreConditionFailed
+		rsp.Ret.RetMsg = err.Error()
+		return rsp, nil
+	}
+	ctx = workflow.BeginSandboxLifecycle(ctx, rsp.SandboxID)
 
 	cb, err := s.cubeboxMgr.cubeboxManger.Get(ctx, rsp.SandboxID)
 	if err != nil {
@@ -299,7 +314,7 @@ func (s *service) CommitSandbox(ctx context.Context, req *cubebox.CommitSandboxR
 		ComponentVersions: cloneStringMap(cb.ComponentVersions),
 		Kind:              storage.CatalogKindRuntimeSnapshot,
 		Backend:           backend,
-	})
+	}, cb.ID, sourceRootfs.Gen)
 	if err != nil {
 		rsp.Ret.RetCode = errorcode.ErrorCode_Unknown
 		rsp.Ret.RetMsg = err.Error()
@@ -357,25 +372,9 @@ func validateSnapshotSandboxTarget(cb *cubeboxstore.CubeBox, validateHostDeps bo
 			return "", err
 		}
 	}
-	rootVolumeName := ""
-	for _, container := range cb.AllContainers() {
-		if container == nil || container.Config == nil {
-			continue
-		}
-		for _, mount := range container.Config.GetVolumeMounts() {
-			if mount == nil || mount.GetContainerPath() != "/" {
-				continue
-			}
-			if rootVolumeName != "" && rootVolumeName != mount.GetName() {
-				return "", fmt.Errorf("multiple rootfs volume mounts found: %s and %s", rootVolumeName, mount.GetName())
-			}
-			rootVolumeName = mount.GetName()
-		}
-	}
-	if rootVolumeName == "" {
-		return "", fmt.Errorf("sandbox %s has no writable rootfs volume mount", cb.ID)
-	}
-	return rootVolumeName, nil
+	// Shared with recovery admission so the fence and the package paths can
+	// never disagree about which persisted mount is the rootfs.
+	return rootfsVolumeMountName(cb)
 }
 
 func validateCommitVolumeSources(cb *cubeboxstore.CubeBox, rawHostMounts map[string]rawHostMountDeclaration) error {
@@ -632,10 +631,17 @@ var (
 // holds cube.master.pause.snapshot.id is a successful no-op. Cubelet's own
 // next-Pause / Destroy GC passes false.
 func (s *service) cleanupTemplate(ctx context.Context, req *cubebox.CleanupTemplateRequest, honorLivePauseKeep bool) (*cubebox.CleanupTemplateResponse, error) {
+	sourcefence.Barrier.RLock()
+	defer sourcefence.Barrier.RUnlock()
 	rsp := &cubebox.CleanupTemplateResponse{
 		RequestID:  req.GetRequestID(),
 		TemplateID: strings.TrimSpace(req.GetTemplateID()),
 		Ret:        &errorcode.Ret{RetCode: errorcode.ErrorCode_Success},
+	}
+	if err := workflow.SourceFences.Any(); err != nil {
+		rsp.Ret.RetCode = errorcode.ErrorCode_PreConditionFailed
+		rsp.Ret.RetMsg = err.Error()
+		return rsp, nil
 	}
 	if rsp.TemplateID == "" {
 		rsp.Ret.RetCode = errorcode.ErrorCode_InvalidParamFormat

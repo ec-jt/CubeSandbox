@@ -110,11 +110,15 @@ var listCubeboxesForTest func() []*cubeboxstore.CubeBox
 // stamp after Resume / Pause. Master strips the same keys; this is the
 // Cubelet-side guard for cubecli-direct Create.
 func rejectUserCubeMasterLabel(key string) bool {
+	if strings.HasPrefix(strings.TrimSpace(key), "cube.master.recovery.") || strings.HasPrefix(strings.TrimSpace(key), "cube.shim.recovery.") {
+		return true
+	}
 	switch strings.TrimSpace(key) {
 	case constants.MasterAnnotationPauseSnapshotID,
 		constants.MasterAnnotationLaunchMemorySnapshotID,
 		constants.MasterAnnotationRuntimeRestoreSnapshotID,
-		constants.MasterAnnotationRuntimeRestoreSnapshotAttachedAt:
+		constants.MasterAnnotationRuntimeRestoreSnapshotAttachedAt,
+		recoveryModeLabel, recoveryProcessLabel, recoveryFallbackLabel:
 		return true
 	default:
 		return false
@@ -503,7 +507,7 @@ func (s *service) updateWithPauseCow(
 		RootfsSizeBytes: rootfsObject.SizeBytes,
 		Kind:            storage.CatalogKindPauseSnapshot,
 		Backend:         backend,
-	})
+	}, sb.ID, sourceRootfs.Gen)
 	if err != nil {
 		return failPause(errorcode.ErrorCode_Unknown, err.Error())
 	}

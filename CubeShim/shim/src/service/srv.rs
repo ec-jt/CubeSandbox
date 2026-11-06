@@ -54,7 +54,12 @@ impl Shim for Service {
     }
 
     async fn delete_shim(&mut self) -> Result<api::DeleteResponse, Error> {
-        //return Ok(api::DeleteResponse::new());
+        // Fresh containerd reap process: consult durable authority BEFORE the
+        // legacy PID signal or any destructive hook. Lost ACK keeps retention.
+        let retention = crate::common::retained::Guard::host().map_err(Error::Other)?;
+        if retention.reap_retained(&self.id, std::time::Duration::from_secs(10)).map_err(Error::Other)? {
+            return Ok(api::DeleteResponse::new());
+        }
         //kill shim
         if let Ok(shim_pid) = tools::read_number_from_file(SHIM_PID_FILE) {
             if let Ok(()) = tools::signal(shim_pid, None) {
@@ -68,7 +73,7 @@ impl Shim for Service {
 
         // Binary delete: also removes /data/cubelet/log/<id> so a crashed
         // shim does not leak host log files until a later live Task.Delete.
-        utils::Utils::clean_sandbox_resource(&self.id).map_err(Error::Other)?;
+        utils::Utils::clean_sandbox_resource_guarded(&self.id, &retention).map_err(Error::Other)?;
 
         Ok(api::DeleteResponse::new())
     }

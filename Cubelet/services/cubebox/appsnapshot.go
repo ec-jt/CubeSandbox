@@ -9,6 +9,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/tencentcloud/CubeSandbox/Cubelet/pkg/sourcefence"
+	"github.com/tencentcloud/CubeSandbox/Cubelet/plugins/workflow"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -55,10 +57,17 @@ type ResourceSpec struct {
 }
 
 func (s *service) AppSnapshot(ctx context.Context, req *cubebox.AppSnapshotRequest) (*cubebox.AppSnapshotResponse, error) {
+	sourcefence.Barrier.RLock()
+	defer sourcefence.Barrier.RUnlock()
 	rsp := &cubebox.AppSnapshotResponse{
 		Ret: &errorcode.Ret{RetCode: errorcode.ErrorCode_Success},
 	}
 
+	if err := workflow.SourceFences.Any(); err != nil {
+		rsp.Ret.RetCode = errorcode.ErrorCode_PreConditionFailed
+		rsp.Ret.RetMsg = err.Error()
+		return rsp, nil
+	}
 	createReq := req.GetCreateRequest()
 	if createReq == nil {
 		rsp.Ret.RetCode = errorcode.ErrorCode_InvalidParamFormat

@@ -4,4 +4,6 @@
 
 pub mod config;
 pub mod cube_hypervisor;
+pub mod recovery;
 pub mod snapshot;
+pub mod restore_outcome;

@@ -1,0 +1,43 @@
+# Copyright (c) 2026 Tencent Inc.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Standalone ASan/UBSan build for s3_cache_quiesce_test.c.
+#
+# Links the REAL lib/s3bsdev/s3_cache.c against fakes in the test for every
+# SPDK symbol it uses (bdev read/write with parked/inline/-ENOMEM completions,
+# dma alloc, uuid, log, thread). MOCKED device: no real AIO, no SPDK archive,
+# no DPDK, no hugepages, no PCI, no network.
+#
+# malloc/calloc are wrapped so the test can make every allocation fail while
+# teardown is quiescing (proves the quiesce path is allocation-free).
+#
+# Two variants: debug (asserts live) and NDEBUG (exercises the runtime
+# leak-instead-of-free refusal in s3_cache_destroy).
+#
+#   make -f /work/test/integration/Makefile.s3_cache_quiesce \
+#        WORK=/work OUT=/out
+
+CC ?= cc
+WORK ?= /work
+OUT ?= /tmp
+
+BASE := -I$(WORK)/include -I$(WORK)/deps/spdk/include \
+	-Wall -Wextra -Wno-unused-parameter -Werror \
+	-g3 -O1 -D_GNU_SOURCE -fno-strict-aliasing \
+	-fno-omit-frame-pointer -fsanitize=address,undefined \
+	-fno-sanitize-recover=all
+LDWRAP := -Wl,--wrap=malloc -Wl,--wrap=calloc
+
+SRCS := $(WORK)/lib/s3bsdev/s3_cache.c \
+	$(WORK)/test/integration/s3_cache_quiesce_test.c
+
+all: $(OUT)/s3_cache_quiesce_test $(OUT)/s3_cache_quiesce_test_ndebug
+
+$(OUT)/s3_cache_quiesce_test: $(SRCS)
+	$(CC) $(BASE) -DDEBUG $(SRCS) $(LDWRAP) -o $@
+
+$(OUT)/s3_cache_quiesce_test_ndebug: $(SRCS)
+	$(CC) $(BASE) -DNDEBUG $(SRCS) $(LDWRAP) -o $@
+
+clean:
+	rm -f $(OUT)/s3_cache_quiesce_test $(OUT)/s3_cache_quiesce_test_ndebug

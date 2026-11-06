@@ -113,6 +113,7 @@ func (l *gcService) run(ctx context.Context) {
 							defer innerUnlock()
 
 							opts := &workflow.CleanContext{
+								CleanupEvidence: info.CleanupEvidence,
 								BaseWorkflowInfo: workflow.BaseWorkflowInfo{
 									SandboxID: info.SandboxID,
 								},

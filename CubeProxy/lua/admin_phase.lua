@@ -131,7 +131,7 @@ local function handle_backend_cache_delete()
 end
 
 -- POST /admin/state
---   body: {"sandbox_id": "...", "state": "running|pausing|paused|killing|killed"}
+--   body: {"sandbox_id": "...", "state": "running|pausing|paused|resuming|killing|killed|unknown"}
 --   CLM's sweeper pushes "killing" before the timeout-kill RPC; the Lua gate
 --   maps killing/killed to 410 Gone so in-flight requests fail fast.
 local function handle_state()
@@ -142,20 +142,14 @@ local function handle_state()
     local st, e3 = require_string(obj, "state")
     if not st then return reply_error(ngx.HTTP_BAD_REQUEST, e3) end
     if st ~= "running" and st ~= "pausing" and st ~= "paused"
-        and st ~= "killing" and st ~= "killed" then
+        and st ~= "killing" and st ~= "killed" and st ~= "resuming" and st ~= "unknown" then
         return reply_error(ngx.HTTP_BAD_REQUEST,
-            "state must be one of running|pausing|paused|killing|killed")
+            "state must be one of running|pausing|paused|resuming|killing|killed|unknown")
     end
 
-    local ok, set_err, forcible = STATE:set(sid, st)
-    if not ok then
-        return reply_error(ngx.HTTP_INTERNAL_SERVER_ERROR,
-            "state set failed: " .. tostring(set_err))
-    end
-    if forcible then
-        ngx.log(ngx.WARN, "LEVEL_WARN||",
-            "cube_sandbox_state dict full, an entry was evicted")
-    end
+    -- All producers historically send unversioned snapshots, including
+    -- delayed retries and discovery replay. Do not install them as state.
+    -- The traffic gate reads the authoritative Redis key before routing.
     return reply(ngx.HTTP_OK, { ok = true })
 end
 

@@ -1,0 +1,9 @@
+# Real lvstore translation unit included by test for private callback access.
+# External SPDK/S3/device boundaries mocked. No SPDK environment initialization.
+WORK ?= /work
+OUT ?= /tmp
+CC ?= cc
+BASE = -I$(WORK)/include -I$(WORK)/deps/spdk/include -I$(WORK)/module/bdev/s3lvol -I$(WORK)/deps/spdk/module/bdev/lvol -I$(WORK)/deps/spdk/module/bdev -I$(WORK)/deps/aws/include -Wall -Wextra -Wno-unused-parameter -Werror -g3 -O1 -D_GNU_SOURCE -fno-strict-aliasing -ffunction-sections -fdata-sections -fno-omit-frame-pointer -fsanitize=address,undefined -fno-sanitize-recover=all
+all:
+	$(CC) $(BASE) -DDEBUG $(WORK)/test/integration/s3_lvstore_deadline_test.c -Wl,--gc-sections -o $(OUT)/deadline-debug
+	$(CC) $(BASE) -DNDEBUG $(WORK)/test/integration/s3_lvstore_deadline_test.c -Wl,--gc-sections -o $(OUT)/deadline-release

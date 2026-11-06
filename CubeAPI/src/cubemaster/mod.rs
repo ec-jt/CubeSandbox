@@ -43,16 +43,57 @@ const TEMPLATE_ID_LABEL_KEY: &str = "cube.master.appsnapshot.template.id";
 pub struct CubeMasterClient {
     inner: reqwest::Client,
     base_url: String,
+    master_auth: Option<std::sync::Arc<MasterAuth>>,
+}
+
+struct MasterAuth {
+    user: String,
+    secret: String,
+}
+
+fn master_auth_headers(user: &str, secret: &str, timestamp: i64, nonce: &str) -> reqwest::header::HeaderMap {
+    use base64::Engine;
+    let payload = format!("2023.{user}.{timestamp}.{nonce}.sha256");
+    let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, secret.as_bytes());
+    let signature = base64::engine::general_purpose::STANDARD.encode(ring::hmac::sign(&key, payload.as_bytes()).as_ref());
+    let mut headers = reqwest::header::HeaderMap::new();
+    for (name, value) in [("cube_version", "2023".to_owned()), ("cube_user_id", user.to_owned()),
+        ("cube_timestamp", timestamp.to_string()), ("cube_nonce", nonce.to_owned()),
+        ("cube_sgn_method", "sha256".to_owned()), ("cube_signature", signature)] {
+        headers.insert(name, value.parse().expect("validated Master auth header"));
+    }
+    headers
 }
 
 impl CubeMasterClient {
+    /// Optional outbound Master HMAC. Never log these credentials.
+    pub fn with_master_auth(mut self, user: Option<String>, secret: Option<String>) -> Result<Self, &'static str> {
+        match (user, secret) {
+            (None, None) => {},
+            (Some(user), Some(secret)) if !user.is_empty() && !secret.is_empty()
+                && user.bytes().all(|c| c.is_ascii_alphanumeric() || b"_-".contains(&c)) => {
+                self.master_auth = Some(std::sync::Arc::new(MasterAuth { user, secret }));
+            },
+            _ => return Err("CUBE_MASTER_USER_ID and CUBE_MASTER_SECRET must be configured together with a header-safe user ID"),
+        }
+        Ok(self)
+    }
+
+    fn request(&self, method: reqwest::Method, url: impl reqwest::IntoUrl) -> reqwest::RequestBuilder {
+        let request = self.inner.request(method, url);
+        match &self.master_auth {
+            Some(auth) => request.headers(master_auth_headers(&auth.user, &auth.secret,
+                Utc::now().timestamp(), &uuid::Uuid::new_v4().as_u128().to_string())),
+            None => request,
+        }
+    }
+
     /// One bounded attempt. An uncertain result must never become success.
     pub async fn update_sandbox_port(
         &self,
         req: &SandboxPortUpdateRequest,
     ) -> Result<(), CubeMasterError> {
-        let response = self.inner
-            .post(format!("{}/cube/sandbox/update", self.base_url))
+        let response = self.request(reqwest::Method::POST, format!("{}/cube/sandbox/update", self.base_url))
             .timeout(std::time::Duration::from_secs(35))
             .json(req)
             .send().await.map_err(CubeMasterError::Http)?
@@ -73,6 +114,7 @@ impl CubeMasterClient {
         Self {
             inner: http_client,
             base_url: base_url.into().trim_end_matches('/').to_string(),
+            master_auth: None,
         }
     }
 
@@ -84,9 +126,7 @@ impl CubeMasterClient {
         req: &CreateSandboxRequest,
     ) -> Result<CreateSandboxResponse, CubeMasterError> {
         let url = format!("{}/cube/sandbox", self.base_url);
-        let resp = self
-            .inner
-            .post(&url)
+        let resp = self.request(reqwest::Method::POST, &url)
             .json(req)
             .send()
             .await
@@ -100,9 +140,7 @@ impl CubeMasterClient {
         req: &DeleteSandboxRequest,
     ) -> Result<DeleteSandboxResponse, CubeMasterError> {
         let url = format!("{}/cube/sandbox", self.base_url);
-        let resp = self
-            .inner
-            .delete(&url)
+        let resp = self.request(reqwest::Method::DELETE, &url)
             .json(req)
             .send()
             .await
@@ -116,9 +154,7 @@ impl CubeMasterClient {
         req: &ListSandboxRequest,
     ) -> Result<ListSandboxResponse, CubeMasterError> {
         let url = format!("{}/cube/sandbox/list", self.base_url);
-        let resp = self
-            .inner
-            .post(&url)
+        let resp = self.request(reqwest::Method::POST, &url)
             .json(req)
             .send()
             .await
@@ -137,9 +173,7 @@ impl CubeMasterClient {
         instance_type: &str,
     ) -> Result<GetSandboxResponse, CubeMasterError> {
         let url = format!("{}/cube/sandbox/info", self.base_url);
-        let resp = self
-            .inner
-            .get(&url)
+        let resp = self.request(reqwest::Method::GET, &url)
             .query(&[("sandbox_id", sandbox_id), ("instance_type", instance_type)])
             .send()
             .await
@@ -153,9 +187,7 @@ impl CubeMasterClient {
         req: &SandboxUpdateRequest,
     ) -> Result<SandboxUpdateResponse, CubeMasterError> {
         let url = format!("{}/cube/sandbox/update", self.base_url);
-        let resp = self
-            .inner
-            .post(&url)
+        let resp = self.request(reqwest::Method::POST, &url)
             .json(req)
             .send()
             .await
@@ -170,9 +202,7 @@ impl CubeMasterClient {
         req: &SandboxTimeoutRequest,
     ) -> Result<SandboxTimeoutResponse, CubeMasterError> {
         let url = format!("{}/cube/sandbox/timeout", self.base_url);
-        let resp = self
-            .inner
-            .post(&url)
+        let resp = self.request(reqwest::Method::POST, &url)
             .json(req)
             .send()
             .await
@@ -186,9 +216,7 @@ impl CubeMasterClient {
         req: &SandboxNetworkRequest,
     ) -> Result<SandboxNetworkResponse, CubeMasterError> {
         let url = format!("{}/cube/sandbox/network", self.base_url);
-        let resp = self
-            .inner
-            .post(&url)
+        let resp = self.request(reqwest::Method::POST, &url)
             .json(req)
             .send()
             .await
@@ -203,9 +231,7 @@ impl CubeMasterClient {
         req: &SandboxRefreshRequest,
     ) -> Result<SandboxRefreshResponse, CubeMasterError> {
         let url = format!("{}/cube/sandbox/refresh", self.base_url);
-        let resp = self
-            .inner
-            .post(&url)
+        let resp = self.request(reqwest::Method::POST, &url)
             .json(req)
             .send()
             .await
@@ -220,9 +246,7 @@ impl CubeMasterClient {
         req: &SandboxLogsRequest,
     ) -> Result<SandboxLogsResponse, CubeMasterError> {
         let url = format!("{}/cube/sandbox/logs", self.base_url);
-        let resp = self
-            .inner
-            .post(&url)
+        let resp = self.request(reqwest::Method::POST, &url)
             .json(req)
             .send()
             .await
@@ -238,9 +262,7 @@ impl CubeMasterClient {
         req: &CreateSnapshotRequest,
     ) -> Result<CreateSnapshotResponse, CubeMasterError> {
         let url = format!("{}/cube/snapshot", self.base_url);
-        let resp = self
-            .inner
-            .post(&url)
+        let resp = self.request(reqwest::Method::POST, &url)
             .json(req)
             .send()
             .await
@@ -254,9 +276,7 @@ impl CubeMasterClient {
         req: &ListSnapshotsRequest,
     ) -> Result<ListSnapshotsResponse, CubeMasterError> {
         let url = format!("{}/cube/snapshot", self.base_url);
-        let mut builder = self
-            .inner
-            .get(&url)
+        let mut builder = self.request(reqwest::Method::GET, &url)
             .query(&[("request_id", &req.request_id)])
             .query(&[("instance_type", &req.instance_type)]);
         if let Some(sid) = &req.sandbox_id {
@@ -295,7 +315,7 @@ impl CubeMasterClient {
     ) -> Result<SnapshotDetailResponse, CubeMasterError> {
         validate_path_segment("snapshot_id", snapshot_id)?;
         let url = format!("{}/cube/snapshot/{}", self.base_url, snapshot_id);
-        let mut builder = self.inner.get(&url);
+        let mut builder = self.request(reqwest::Method::GET, &url);
         if include_request {
             builder = builder.query(&[("include_request", "true")]);
         }
@@ -311,9 +331,7 @@ impl CubeMasterClient {
     ) -> Result<DeleteSnapshotResponse, CubeMasterError> {
         validate_path_segment("snapshot_id", snapshot_id)?;
         let url = format!("{}/cube/snapshot/{}", self.base_url, snapshot_id);
-        let resp = self
-            .inner
-            .delete(&url)
+        let resp = self.request(reqwest::Method::DELETE, &url)
             .json(req)
             .send()
             .await
@@ -329,9 +347,7 @@ impl CubeMasterClient {
     ) -> Result<RollbackResponse, CubeMasterError> {
         validate_path_segment("sandbox_id", sandbox_id)?;
         let url = format!("{}/cube/sandbox/{}/rollback", self.base_url, sandbox_id);
-        let resp = self
-            .inner
-            .post(&url)
+        let resp = self.request(reqwest::Method::POST, &url)
             .json(req)
             .send()
             .await
@@ -363,7 +379,7 @@ impl CubeMasterClient {
         include_request: bool,
     ) -> Result<TemplateListResponse, CubeMasterError> {
         let url = format!("{}/cube/template", self.base_url);
-        let mut req = self.inner.get(&url);
+        let mut req = self.request(reqwest::Method::GET, &url);
         if let Some(tid) = template_id {
             req = req.query(&[("template_id", tid)]);
         }
@@ -380,9 +396,7 @@ impl CubeMasterClient {
         template_id: &str,
     ) -> Result<TemplateResponse, CubeMasterError> {
         let url = format!("{}/cube/template", self.base_url);
-        let resp = self
-            .inner
-            .get(&url)
+        let resp = self.request(reqwest::Method::GET, &url)
             .query(&[("template_id", template_id), ("include_request", "true")])
             .send()
             .await
@@ -396,9 +410,7 @@ impl CubeMasterClient {
         req: &TemplateDeleteRequest,
     ) -> Result<RetEnvelope, CubeMasterError> {
         let url = format!("{}/cube/template", self.base_url);
-        let resp = self
-            .inner
-            .delete(&url)
+        let resp = self.request(reqwest::Method::DELETE, &url)
             .json(req)
             .send()
             .await
@@ -412,9 +424,7 @@ impl CubeMasterClient {
         req: &CreateTemplateFromImageReq,
     ) -> Result<TemplateJobResponse, CubeMasterError> {
         let url = format!("{}/cube/template/from-image", self.base_url);
-        let resp = self
-            .inner
-            .post(&url)
+        let resp = self.request(reqwest::Method::POST, &url)
             .json(req)
             .send()
             .await
@@ -428,9 +438,7 @@ impl CubeMasterClient {
         req: &RedoTemplateReq,
     ) -> Result<TemplateJobResponse, CubeMasterError> {
         let url = format!("{}/cube/template/redo", self.base_url);
-        let resp = self
-            .inner
-            .post(&url)
+        let resp = self.request(reqwest::Method::POST, &url)
             .json(req)
             .send()
             .await
@@ -449,9 +457,7 @@ impl CubeMasterClient {
         validate_path_segment("template_id", template_id)?;
         let url = format!("{}/cube/template/{}/alias", self.base_url, template_id);
         let body = serde_json::json!({ "alias": alias.unwrap_or("") });
-        let resp = self
-            .inner
-            .put(&url)
+        let resp = self.request(reqwest::Method::PUT, &url)
             .json(&body)
             .send()
             .await
@@ -466,9 +472,7 @@ impl CubeMasterClient {
     ) -> Result<TemplateBuildStatusResponse, CubeMasterError> {
         validate_path_segment("build_id", build_id)?;
         let url = format!("{}/cube/template/build/{}/status", self.base_url, build_id);
-        let resp = self
-            .inner
-            .get(&url)
+        let resp = self.request(reqwest::Method::GET, &url)
             .send()
             .await
             .map_err(CubeMasterError::Http)?;
@@ -478,9 +482,7 @@ impl CubeMasterClient {
     /// GET /cube/template/compat — template compatibility matrix.
     pub async fn get_template_compat(&self) -> Result<TemplateCompatResponse, CubeMasterError> {
         let url = format!("{}/cube/template/compat", self.base_url);
-        let resp = self
-            .inner
-            .get(&url)
+        let resp = self.request(reqwest::Method::GET, &url)
             .send()
             .await
             .map_err(CubeMasterError::Http)?;
@@ -493,9 +495,7 @@ impl CubeMasterClient {
         req: &TemplateCompatAdoptRequest,
     ) -> Result<TemplateCompatAdoptResponse, CubeMasterError> {
         let url = format!("{}/cube/template/compat", self.base_url);
-        let resp = self
-            .inner
-            .post(&url)
+        let resp = self.request(reqwest::Method::POST, &url)
             .json(req)
             .send()
             .await
@@ -511,9 +511,7 @@ impl CubeMasterClient {
         req: &ListVolumesRequest,
     ) -> Result<ListVolumesResponse, CubeMasterError> {
         let url = format!("{}/cube/volume", self.base_url);
-        let resp = self
-            .inner
-            .get(&url)
+        let resp = self.request(reqwest::Method::GET, &url)
             .query(&[("request_id", &req.request_id)])
             .send()
             .await
@@ -527,9 +525,7 @@ impl CubeMasterClient {
         req: &CreateVolumeRequest,
     ) -> Result<CreateVolumeResponse, CubeMasterError> {
         let url = format!("{}/cube/volume", self.base_url);
-        let resp = self
-            .inner
-            .post(&url)
+        let resp = self.request(reqwest::Method::POST, &url)
             .json(req)
             .send()
             .await
@@ -541,9 +537,7 @@ impl CubeMasterClient {
     pub async fn get_volume(&self, volume_id: &str) -> Result<GetVolumeResponse, CubeMasterError> {
         validate_volume_id(volume_id)?;
         let url = format!("{}/cube/volume/{}", self.base_url, volume_id);
-        let resp = self
-            .inner
-            .get(&url)
+        let resp = self.request(reqwest::Method::GET, &url)
             .send()
             .await
             .map_err(CubeMasterError::Http)?;
@@ -557,9 +551,7 @@ impl CubeMasterClient {
     ) -> Result<DeleteVolumeResponse, CubeMasterError> {
         validate_volume_id(volume_id)?;
         let url = format!("{}/cube/volume/{}", self.base_url, volume_id);
-        let resp = self
-            .inner
-            .delete(&url)
+        let resp = self.request(reqwest::Method::DELETE, &url)
             .send()
             .await
             .map_err(CubeMasterError::Http)?;
@@ -1659,17 +1651,16 @@ pub struct SnapshotResource {
     pub updated_at: Option<DateTime<Utc>>,
 }
 
-/// Slimmed mirror of CubeMaster's nested `operation` block returned alongside
-/// snapshot create / rollback / delete responses.  Master populates the full
-/// `templatecenter.SnapshotOperationInfo` (operation, phase, progress, error
-/// message, audit timestamps, …) but CubeAPI only ever reads `operation_id`
-/// (for the `x-operation-id` audit header) and `status` (used by
-/// `ensure_operation_ready` to enforce CubeMaster's synchronous contract).
-/// Anything else is recoverable via `GET /cube/operation/{id}` on master, so
-/// we keep this type intentionally minimal — extra fields here only invite
-/// dead-code drift the next time master adds a new column.
+/// Master job receipt. Rollback must bind the nested job's request/resource
+/// identity, not echo caller values or use the HTTP request ID alone as proof.
 #[derive(Debug, Deserialize, Clone, Default)]
 pub struct SnapshotOperationResource {
+    #[serde(default)]
+    pub request_id: String,
+    #[serde(default)]
+    pub sandbox_id: String,
+    #[serde(default)]
+    pub snapshot_id: String,
     #[serde(default)]
     pub operation_id: String,
     #[serde(default)]
@@ -2632,4 +2623,22 @@ pub struct VolumeSpecExt {
     pub name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub volume_source: Option<VolumeSourceExt>,
+}
+
+#[cfg(test)]
+mod master_hmac_tests {
+    use super::*;
+    #[test]
+    fn master_hmac_vector_and_configuration() {
+        let headers = master_auth_headers("fixture-clm", "test-secret", 1700000000, "12345");
+        assert_eq!(headers["cube_signature"], "iHBDBLLXPcqRHBR98WyKhMTJSL490VGLLexH9nqHM28=");
+        let client = CubeMasterClient::new("http://127.0.0.1", reqwest::Client::new());
+        assert!(client.clone().with_master_auth(Some("user".into()), None).is_err());
+        assert!(client.clone().with_master_auth(Some("bad.user".into()), Some("secret".into())).is_err());
+        assert!(client.clone().with_master_auth(None, None).is_ok());
+        let client = client.with_master_auth(Some("user".into()), Some("secret".into())).unwrap();
+        let a = client.request(reqwest::Method::GET, "http://127.0.0.1").build().unwrap();
+        let b = client.request(reqwest::Method::GET, "http://127.0.0.1").build().unwrap();
+        assert_ne!(a.headers()["cube_nonce"], b.headers()["cube_nonce"]);
+    }
 }

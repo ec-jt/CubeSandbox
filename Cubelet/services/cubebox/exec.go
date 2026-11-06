@@ -68,6 +68,18 @@ func (s *service) Exec(ctx context.Context, req *cubebox.ExecCubeSandboxRequest)
 		return rsp, nil
 	}
 
+	unlock, lockErr := s.sandboxLifecycleLocks.LockContext(ctx, req.SandboxId)
+	if lockErr != nil {
+		rsp.Ret.RetCode = errorcode.ErrorCode_PreConditionFailed
+		rsp.Ret.RetMsg = lockErr.Error()
+		return rsp, nil
+	}
+	defer unlock()
+	if err := workflow.SourceFences.Check(req.SandboxId); err != nil {
+		rsp.Ret.RetCode = errorcode.ErrorCode_PreConditionFailed
+		rsp.Ret.RetMsg = err.Error()
+		return rsp, nil
+	}
 	sb, err := s.cubeboxMgr.cubeboxManger.Get(ctx, req.SandboxId)
 	if err != nil {
 		rsp.Ret.RetMsg = fmt.Sprintf("failed to get sandbox: %v", err)

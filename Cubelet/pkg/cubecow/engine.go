@@ -15,17 +15,42 @@ type Engine struct {
 }
 
 type Volume struct {
-	Name          string `json:"name"`
-	SizeBytes     uint64 `json:"size_bytes"`
-	DevicePath    string `json:"device_path"`
-	SnapshotCount int32  `json:"snapshot_count"`
-	CreatedAt     string `json:"created_at"`
+	VolumeUUID    string        `json:"volume_uuid"`
+	ImportOrigin  *ImportOrigin `json:"import_origin"`
+	Name          string        `json:"name"`
+	SizeBytes     uint64        `json:"size_bytes"`
+	DevicePath    string        `json:"device_path"`
+	SnapshotCount int32         `json:"snapshot_count"`
+	CreatedAt     string        `json:"created_at"`
 	// ExportUUID / ExportStatus / Deletable come from cubecow_get_volume_info
 	// JSON (s3-support). Empty for plain volumes and unexported snapshots.
 	// ExportStatus is one of "", "NONE", "INPROGRESS", "DONE".
 	ExportUUID   string `json:"export_uuid"`
 	ExportStatus string `json:"export_status"`
 	Deletable    *bool  `json:"deletable"`
+}
+
+// ImportOrigin is read live from native destination blob metadata. It does not
+// certify checkpoint commit, current contents, or retention of remote objects.
+type ImportOrigin struct {
+	Version         uint32 `json:"version"`
+	VolumeUUID      string `json:"volume_uuid"`
+	LvstoreUUID     string `json:"lvstore_uuid"`
+	ExportUUID      string `json:"export_uuid"`
+	SnapshotUUID    string `json:"snapshot_uuid"`
+	Endpoint        string `json:"endpoint"`
+	Bucket          string `json:"bucket"`
+	Prefix          string `json:"prefix"`
+	LvsName         string `json:"lvs_name"`
+	Snapshot        string `json:"snapshot"`
+	ManifestVersion uint32 `json:"manifest_version"`
+	Generation      uint32 `json:"generation"`
+	ClusterSize     uint32 `json:"cluster_size"`
+	ChunkSize       uint32 `json:"chunk_size"`
+	BlockSize       uint32 `json:"block_size"`
+	BlobID          uint64 `json:"blob_id"`
+	SourceBlobID    uint64 `json:"source_blob_id"`
+	SizeBytes       uint64 `json:"size_bytes"`
 }
 
 type Snapshot struct {

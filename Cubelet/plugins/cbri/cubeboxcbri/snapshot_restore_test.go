@@ -334,3 +334,19 @@ func TestRestorePathsFromMetadataMountUsesReturnedDir(t *testing.T) {
 		t.Fatalf("empty mount must keep template paths, got %q %q", fallbackBase, fallbackSpec)
 	}
 }
+
+func TestResolveSnapshotRuntimeArtifactsPrefersBuiltinOS(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir, "snapshot"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	data := []byte(`{"payload":{"kernel":"/kernel"},"pmem":[{"id":"pmem-cubebox-image-0","file":"/business"},{"id":"pmem-cube-os-image","file":"/os"}]}`)
+	if err := os.WriteFile(filepath.Join(dir, "snapshot", "config.json"), data, 0644); err != nil {
+		t.Fatal(err)
+	}
+	p := &cubeboxInstancePlugin{}
+	kernel, image, err := p.resolveSnapshotRuntimeArtifacts(dir, nil)
+	if err != nil || kernel != "/kernel" || image != "/os" {
+		t.Fatalf("kernel=%q image=%q err=%v", kernel, image, err)
+	}
+}

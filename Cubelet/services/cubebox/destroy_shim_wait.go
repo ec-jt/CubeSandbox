@@ -6,6 +6,7 @@ package cubebox
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
@@ -16,6 +17,7 @@ import (
 	"github.com/tencentcloud/CubeSandbox/Cubelet/pkg/log"
 	cubeboxstore "github.com/tencentcloud/CubeSandbox/Cubelet/pkg/store/cubebox"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/pkg/utils"
+	"github.com/tencentcloud/CubeSandbox/Cubelet/plugins/workflow"
 )
 
 const (
@@ -153,7 +155,7 @@ func readPidFile(path string) int {
 // after delete_lvol.
 func waitSandboxRuntimeGone(ctx context.Context, sandboxID string, pids []int) error {
 	if len(pids) == 0 {
-		return nil
+		return requireRuntimeCleanupEvidence(ctx, sandboxID)
 	}
 	start := time.Now()
 	for _, pid := range pids {
@@ -168,4 +170,11 @@ func waitSandboxRuntimeGone(ctx context.Context, sandboxID string, pids []int) e
 			sandboxID, waited.Round(time.Millisecond), pids)
 	}
 	return nil
+}
+
+func requireRuntimeCleanupEvidence(ctx context.Context, sandboxID string) error {
+	if workflow.RuntimeCleanupProven(ctx) {
+		return nil
+	}
+	return fmt.Errorf("sandbox %s: runtime ownership unknown; preserve storage until reconciled", sandboxID)
 }

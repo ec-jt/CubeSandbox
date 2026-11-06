@@ -6,6 +6,7 @@ package storage
 import (
 	"context"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -106,6 +107,18 @@ func FinalizeS3PackageSnapshots(ctx context.Context, backend, snapshotID string)
 	if err != nil {
 		return err
 	}
+	if entry.DiskBinding != nil && entry.DiskBinding.NativeRootfsUUID != "" {
+		// Pre-existing named snapshots are not proof of capture after a partial
+		// seal crash. Retain them, but require reconciliation without a receipt.
+		_, sealErr := os.Stat(filepath.Join(entry.SnapshotPath, checkpointSealFile))
+		memKind, kindErr := m.finalizationKind(ctx, volumes, memorySnap)
+		if kindErr != nil {
+			return kindErr
+		}
+		if sealErr != nil && (metaKind == cowKindSnapshot || memKind == cowKindSnapshot) {
+			return fmt.Errorf("ambiguous prior seal without native capture receipt")
+		}
+	}
 	if (prepared || (!base && metaKind == cowKindSnapshot)) && changed {
 		return fmt.Errorf("sealed/prepared catalog does not contain final package references")
 	}
@@ -158,6 +171,9 @@ func FinalizeS3PackageSnapshots(ctx context.Context, backend, snapshotID string)
 		if err := m.requireFinalizationKind(ctx, volumes, name, cowKindSnapshot); err != nil {
 			return err
 		}
+	}
+	if err := m.recordCheckpointSeal(ctx, entry); err != nil {
+		return fmt.Errorf("record native sealed capture: %w", err)
 	}
 	for _, name := range sealed {
 		if err := deactivateS3Object(ctx, m, name, cowKindSnapshot); err != nil {

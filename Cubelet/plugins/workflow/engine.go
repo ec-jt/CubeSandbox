@@ -123,6 +123,9 @@ type VolumeRefEvent struct {
 type CreateContext struct {
 	BaseWorkflowInfo
 
+	// CleanupEvidence is copied into deferred GC jobs, never inferred from ID.
+	CleanupEvidence *LifecycleCleanup
+
 	ReqInfo *cubebox.RunCubeSandboxRequest
 
 	NetworkInfo provider.NetworkProvider
@@ -168,6 +171,9 @@ func (b *CreateContext) IsCreateSnapshot() bool {
 }
 
 func (b *CreateContext) IsRetoreSnapshot() bool {
+	if b.IsColdRecreate() {
+		return false
+	}
 	_, ok := b.GetSnapshotTemplateID()
 	if !ok {
 		return false
@@ -193,7 +199,7 @@ func (b *CreateContext) IsPauseResume() bool {
 // Create-from-template only has appsnapshot.template.id — that memory is a
 // clean template and still needs virtio_rw mounted for newly attached volumes.
 func (b *CreateContext) IsGuestMountRestore() bool {
-	if b == nil || b.ReqInfo == nil {
+	if b == nil || b.ReqInfo == nil || b.IsColdRecreate() {
 		return false
 	}
 	if b.IsPauseResume() {
@@ -303,6 +309,7 @@ func (b *DestroyContext) GetInstanceType() string {
 
 type CleanContext struct {
 	BaseWorkflowInfo
+	CleanupEvidence *LifecycleCleanup
 }
 
 const (
@@ -422,7 +429,7 @@ func (e *Engine) run(do string, ctx context.Context, opts ReqContext) error {
 				if flow_create == do {
 					rOpts := opts.(*CreateContext)
 					if rOpts.Failover {
-						go e.failover(ctx, opts)
+						e.failover(ctx, opts)
 					}
 				}
 
@@ -439,7 +446,7 @@ func (e *Engine) run(do string, ctx context.Context, opts ReqContext) error {
 					if flow_create == do {
 						rOpts := opts.(*CreateContext)
 						if rOpts.Failover {
-							go e.failover(ctx, opts)
+							e.failover(ctx, opts)
 						}
 					}
 					return ctx.Err()
@@ -467,6 +474,10 @@ func (e *Engine) cleanUp(ctx context.Context, opts ReqContext) {
 	ctxTmp = log.ReNewLogger(ctxTmp)
 	rOpts := &CreateContext{}
 	rOpts.SandboxID = opts.GetSandboxID()
+	if evidence := LifecycleCleanupFrom(ctx); evidence != nil {
+		copy := *evidence
+		rOpts.CleanupEvidence = &copy
+	}
 	if err := e.cleanupFlow.Create(ctxTmp, rOpts); err != nil {
 
 		CubeLog.WithContext(ctxTmp).Fatalf("cleanupFlow.Create fatal error:%v", err)
@@ -537,6 +548,15 @@ func (e *Engine) parallelRunSteps(do string, ctx context.Context, opts ReqContex
 }
 
 func (e *Engine) failover(ctx context.Context, opts ReqContext) {
+	// Complete rollback before the caller releases the service lifecycle lock.
+	// Failed rollback may enqueue work, but that work carries this epoch.
+	evidence := LifecycleCleanupFrom(ctx)
+	if evidence == nil {
+		evidence = &LifecycleCleanup{}
+	}
+	evidence.NeverStarted = !opts.(*CreateContext).CubeBoxCreated
+	evidence.RuntimeMayExist = opts.(*CreateContext).CubeBoxCreated
+	evidence.PreserveStorage = opts.(*CreateContext).PreserveStorageOnFailure()
 	sandboxID := opts.GetSandboxID()
 	namespace, err := namespaces.NamespaceRequired(ctx)
 	if err != nil {
@@ -557,6 +577,7 @@ func (e *Engine) failover(ctx context.Context, opts ReqContext) {
 	failoverRt.InstanceID = sandboxID
 
 	ctx = namespaces.WithNamespace(context.Background(), namespace)
+	ctx = WithLifecycleCleanup(ctx, evidence)
 	ctx, cancel := context.WithTimeout(ctx, config.GetCommon().CommonTimeout)
 	defer cancel()
 
@@ -611,6 +632,11 @@ func (e *Engine) Create(ctx context.Context, opts *CreateContext) error {
 }
 
 func (e *Engine) Destroy(ctx context.Context, opts *DestroyContext) error {
+	if opts != nil {
+		if err := SourceFences.Check(opts.SandboxID); err != nil {
+			return err
+		}
+	}
 	err := e.run(flow_destroy, ctx, opts)
 	return err
 }
@@ -619,5 +645,31 @@ func (e *Engine) CleanUp(ctx context.Context, opts *CleanContext) error {
 	if opts == nil {
 		return e.run(flow_cleanup, ctx, nil)
 	}
+	// Debug cleanup already holds the service lock and supplies evidence in ctx.
+	if LifecycleCleanupFrom(ctx) == nil {
+		unlock, err := SandboxLifecycleLocks.LockContext(ctx, opts.SandboxID)
+		if err != nil {
+			return err
+		}
+		defer unlock()
+		if err := CheckCleanupEpoch(opts.SandboxID, opts.CleanupEvidence); err != nil {
+			return err
+		}
+		if opts.CleanupEvidence != nil && opts.CleanupEvidence.Epoch != "" {
+			// Use current process evidence so completed runtime cleanup survives
+			// a later storage failure and explicit delete retry.
+			ctx = ContinueSandboxLifecycle(ctx, opts.SandboxID)
+		} else {
+			ctx = WithLifecycleCleanup(ctx, &LifecycleCleanup{})
+		}
+	}
+	if err := SourceFences.Check(opts.SandboxID); err != nil {
+		return err
+	}
 	return e.run(flow_cleanup, ctx, opts)
+}
+
+func (b *CreateContext) PreserveStorageOnFailure() bool {
+	_, snapshot := b.GetSnapshotTemplateID()
+	return (snapshot && !b.IsCreateSnapshot()) || b.IsPauseResume()
 }

@@ -172,6 +172,7 @@ func (l *local) Create(ctx context.Context, opts *workflow.CreateContext) error 
 		}
 	}
 	opts.CubeBoxCreated = true
+	workflow.MarkRuntimeStarting(ctx)
 	if err := l.createContainers(ctx, opts); err != nil {
 		return err
 	}
@@ -277,6 +278,12 @@ func (l *local) createContainers(ctx context.Context, flowOpts *workflow.CreateC
 
 	l.storeNumaQueues(ctx, sandBox, flowOpts)
 	stampLaunchMemoryAncestorOnce(sandBox, resolveLaunchAncestorSnapshotID(sandBox))
+	if flowOpts.IsColdRecreate() {
+		if sandBox.Labels == nil {
+			sandBox.Labels = map[string]string{}
+		}
+		sandBox.Labels[constants.MasterAnnotationPauseSnapshotID] = realReq.GetAnnotations()[constants.MasterAnnotationPauseSnapshotID]
+	}
 	if snapshotID, ok := flowOpts.GetSnapshotTemplateID(); ok && flowOpts.IsRetoreSnapshot() {
 		now := time.Now().UTC()
 		setRuntimeSnapshotBindingLabels(sandBox, snapshotID, now)
@@ -308,6 +315,20 @@ func (l *local) createContainers(ctx context.Context, flowOpts *workflow.CreateC
 	sandBox.Metadata.AddLabels(l.genListFilterLabels(ctx, realReq, sandBox))
 	if err = l.createCubeboxContainer(ctx, flowOpts, realReq, sandBox); err != nil {
 		return err
+	}
+
+	var receipt *recoveryReceipt
+	if flowOpts.IsRetoreSnapshot() {
+		receipt, err = newRecoveryReceipt(sandBox.ID)
+		if err != nil {
+			return fmt.Errorf("prepare recovery receipt: %w", err)
+		}
+		defer receipt.close()
+		// Observation is made after storage allocation, against the imported
+		// metadata actually used by cross-node restore, not request UUIDs. It
+		// never authorizes boot and is not reused after runtime mutation.
+		checkpoint, _ := flowOpts.GetSnapshotTemplateID()
+		sandBox.Metadata.AddLabels(observeRestoreDiskAdmission(ctx, flowOpts.ReqInfo.GetAnnotations(), checkpoint, receipt.attempt))
 	}
 
 	additionalSandboxOpt, err := l.genSandboxOptions(ctx, realReq, sandBox, flowOpts)
@@ -361,6 +382,11 @@ func (l *local) createContainers(ctx context.Context, flowOpts *workflow.CreateC
 			return err
 		}
 
+		var requestReceipt *recoveryReceipt
+		if ci.IsPod {
+			requestReceipt = receipt
+		}
+		additionalOpt = append(additionalOpt, withRecoveryRequest(requestReceipt))
 		cOpts, err := l.containerSpec(ctxTmp, sandBox, cntrReq, flowOpts, ci, additionalOpt)
 		cOpts = append(cOpts,
 			containerd.WithImageName(ci.Config.Image.Image),
@@ -385,13 +411,28 @@ func (l *local) createContainers(ctx context.Context, flowOpts *workflow.CreateC
 		})
 	}
 
-	if err := func() error {
+	if err := func() (createErr error) {
 		sandBox.Lock()
 		defer func() {
 			if err := l.cubeboxManger.Save(ctx, sandBox); err != nil {
 				log.G(ctx).Warnf("saveSandBoxInfo failed.%s", err.Error())
 			}
 			sandBox.Unlock()
+		}()
+		// Finalize before Save (defer order). Do not advertise restored memory
+		// merely because the requested snapshot bindings were stamped above.
+		finishRecovery := beginSnapshotRecovery(flowOpts.IsRetoreSnapshot(), func(labels map[string]string) {
+			sandBox.Metadata.AddLabels(labels)
+			sanboxlog.Infof("snapshot recovery: mode=%s process_state=%s disk_only_fallback=%s",
+				labels[recoveryModeLabel], labels[recoveryProcessLabel], labels[recoveryFallbackLabel])
+		}, receipt)
+		recoveryComplete := false
+		defer func() {
+			// An unwinding panic must not be persisted as successful recovery.
+			if flowOpts.IsRetoreSnapshot() && createErr == nil && !recoveryComplete {
+				createErr = fmt.Errorf("snapshot recovery interrupted before completion")
+			}
+			createErr = finishRecovery(createErr)
 		}()
 
 		for _, param := range params {
@@ -440,6 +481,7 @@ func (l *local) createContainers(ctx context.Context, flowOpts *workflow.CreateC
 			}
 		}
 		CaptureForCubeBox(sandBox)
+		recoveryComplete = true
 		return nil
 	}(); err != nil {
 		return err
@@ -583,6 +625,9 @@ func (l *local) createCubeboxContainer(ctx context.Context, flowOpts *workflow.C
 	for i, cntrReq := range realReq.Containers {
 		isPod := i == 0
 		_, cid := l.generateContainerID(ctx, flowOpts, i)
+		if flowOpts.IsColdRecreate() && cntrReq.GetId() != cid {
+			return fmt.Errorf("cold recreate cannot change retained container identity")
+		}
 
 		if len(cntrReq.Annotations) == 0 {
 			cntrReq.Annotations = make(map[string]string)
@@ -1257,6 +1302,9 @@ func (l *local) prepareWritableRootfs(ctx context.Context, flowOpts *workflow.Cr
 	annotations := make(map[string]string)
 	annotations[constants.AnnotationsRootfsWritableKey] = blkPath
 	annotations[constants.AnnotationsRootfsWlayerSubdir] = "disk/" + containerReq.GetId()
+	if flowOpts.IsColdRecreate() {
+		annotations[workflow.RetainedRootfsRequired] = "true"
+	}
 	log.G(ctx).Debugf("writable rootfs:%+v", blkPath)
 
 	return oci.WithAnnotations(annotations), nil

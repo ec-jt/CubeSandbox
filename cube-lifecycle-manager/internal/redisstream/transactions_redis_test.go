@@ -104,7 +104,7 @@ func TestAcquireKillAndResumeAreMutuallyExclusive(t *testing.T) {
 	}
 
 	state, acquired, err = client.AcquireKill(ctx, "sbx-empty", 10*time.Second)
-	if err != nil || !acquired || state != "" {
+	if err != nil || acquired || state != "" {
 		t.Fatalf("AcquireKill(empty) = (%q, %v, %v)", state, acquired, err)
 	}
 }

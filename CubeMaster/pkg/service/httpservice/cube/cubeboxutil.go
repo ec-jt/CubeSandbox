@@ -648,6 +648,13 @@ func fromSnapshotPlacement(ctx context.Context, snapshotID string, reqInOut *typ
 		ReqRes:              reqRes,
 		RequestedScope:      requestedScope,
 		PinToOrigin:         pinToOrigin,
+		// Cross-node source-quiesced precondition identity. A from-snapshot
+		// restore of a sandbox's own checkpoint uses the sandbox id as the
+		// source sandbox and the snapshot id as the checkpoint id. The origin
+		// fence digest is not derivable here, so it stays empty and the
+		// precondition refuses instead of guessing.
+		SourceSandboxID:    strings.TrimSpace(reqInOut.SandboxID),
+		SourceCheckpointID: strings.TrimSpace(src.SnapshotID),
 	})
 }
 

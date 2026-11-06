@@ -10,15 +10,20 @@ package cubemasterclient
 import (
 	"bytes"
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/tencentcloud/CubeSandbox/cube-lifecycle-manager/internal/lifecycle"
 )
 
 // CubeMaster ret_code constants CLM reasons about. The full set
@@ -99,8 +104,39 @@ func (e *APIError) IsAlreadyInState() bool {
 
 // Client is a thin wrapper around http.Client + base URL. Concurrency-safe.
 type Client struct {
-	baseURL string
-	httpc   *http.Client
+	baseURL   string
+	httpc     *http.Client
+	userID    string
+	secretKey string
+}
+
+// WithAuth configures CubeMaster HMAC signing before the client is shared.
+// The wire format matches CubeMaster's version 2023 signature protocol.
+func (c *Client) WithAuth(userID, secretKey string) *Client {
+	c.userID, c.secretKey = userID, secretKey
+	return c
+}
+
+func (c *Client) sign(req *http.Request) error {
+	if c.userID == "" && c.secretKey == "" {
+		return nil
+	}
+	if c.userID == "" || c.secretKey == "" {
+		return errors.New("incomplete CubeMaster authentication credentials")
+	}
+	nonce, err := uuid.NewRandom()
+	if err != nil {
+		return fmt.Errorf("generate authentication nonce: %w", err)
+	}
+	values := []string{"2023", c.userID, strconv.FormatInt(time.Now().Unix(), 10), nonce.String(), "sha256"}
+	keys := []string{"cube_version", "cube_user_id", "cube_timestamp", "cube_nonce", "cube_sgn_method"}
+	for i, key := range keys {
+		req.Header.Set(key, values[i])
+	}
+	mac := hmac.New(sha256.New, []byte(c.secretKey))
+	_, _ = mac.Write([]byte(strings.Join(values, ".")))
+	req.Header.Set("cube_signature", base64.StdEncoding.EncodeToString(mac.Sum(nil)))
+	return nil
 }
 
 func New(baseURL string, timeout time.Duration) *Client {
@@ -172,6 +208,9 @@ func (c *Client) Kill(ctx context.Context, sandboxID, instanceType, reason strin
 		return err
 	}
 	req.Header.Set("Content-Type", "application/json")
+	if err := c.sign(req); err != nil {
+		return err
+	}
 
 	resp, err := c.httpc.Do(req)
 	if err != nil {
@@ -202,8 +241,12 @@ func (c *Client) update(ctx context.Context, sandboxID, instanceType, action str
 		return errors.New("sandbox_id and instance_type are required")
 	}
 
+	requestID := lifecycle.OperationID(ctx)
+	if requestID == "" {
+		requestID = uuid.NewString()
+	}
 	body, err := json.Marshal(updateRequest{
-		RequestID:    uuid.NewString(),
+		RequestID:    requestID,
 		SandboxID:    sandboxID,
 		InstanceType: instanceType,
 		Action:       action,
@@ -218,6 +261,9 @@ func (c *Client) update(ctx context.Context, sandboxID, instanceType, action str
 		return err
 	}
 	req.Header.Set("Content-Type", "application/json")
+	if err := c.sign(req); err != nil {
+		return err
+	}
 
 	resp, err := c.httpc.Do(req)
 	if err != nil {

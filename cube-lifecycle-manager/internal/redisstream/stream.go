@@ -231,17 +231,14 @@ func (c *Client) Read(ctx context.Context, cursor string, block time.Duration, c
 	return out, next, nil
 }
 
-// AcquireState performs a SET NX EX on the per-sandbox lifecycle state key with
-// the supplied desired state. Returns true on success. Used to coordinate
-// concurrent pause/resume across CLM replicas: whoever wins the SETNX owns the
-// transition.
+// AcquireState atomically claims a pause from terminal running. Unknown or
+// absent state is not proof that an idle destructive operation is safe.
 func (c *Client) AcquireState(ctx context.Context, sandboxID, state string, ttl time.Duration) (bool, error) {
-	key := lifecycle.StateKey(sandboxID)
-	ok, err := c.rdb.SetNX(ctx, key, state, ttl).Result()
-	if err != nil {
-		return false, fmt.Errorf("setnx %s: %w", key, err)
+	if state != "pausing" {
+		return false, fmt.Errorf("unsupported transition %q", state)
 	}
-	return ok, nil
+	_, ok, err := c.acquireIf(ctx, sandboxID, state, ttl, func(v string) bool { return v == lifecycle.StateRunning })
+	return ok, err
 }
 
 // AcquireResume atomically changes an absent or paused state to resuming using
@@ -253,18 +250,14 @@ func (c *Client) AcquireResume(ctx context.Context, sandboxID string, ttl time.D
 	return c.acquireIf(ctx, sandboxID, "resuming", ttl, allowEmptyOrPaused)
 }
 
-// AcquireKill atomically changes an absent or paused state to killing. It is
-// the timeout-kill counterpart of AcquireResume: the two CAS transitions
-// are mutually exclusive, so a concurrent resume wins or this kill does,
-// but neither overwrites an in-flight resuming / pausing / running lock.
-// state is the pre-CAS observation (paused or empty when acquired) so a
-// failed kill can restore the proxy to the right prior state.
+// AcquireKill claims only known running/paused terminal state. Unknown is not
+// permission to destroy. Resume, pause and kill owners exclude one another.
 func (c *Client) AcquireKill(ctx context.Context, sandboxID string, ttl time.Duration) (state string, acquired bool, err error) {
-	return c.acquireIf(ctx, sandboxID, "killing", ttl, allowEmptyOrPaused)
+	return c.acquireIf(ctx, sandboxID, "killing", ttl, func(v string) bool { return v == lifecycle.StatePaused || v == lifecycle.StateRunning })
 }
 
 func allowEmptyOrPaused(current string) bool {
-	return current == "" || current == lifecycle.StatePaused
+	return current == "" || current == UnknownState || current == lifecycle.StatePaused
 }
 
 // acquireIf CAS-writes dest when allow(current) still holds under WATCH.
@@ -289,13 +282,13 @@ func (c *Client) acquireIf(
 				return getErr
 			}
 
-			state = current
-			if !allow(current) {
+			state = stateValue(current)
+			if !allow(state) {
 				return nil
 			}
 
 			_, txErr := tx.TxPipelined(ctx, func(pipe redis.Pipeliner) error {
-				pipe.Set(ctx, key, dest, ttl)
+				pipe.Set(ctx, key, transitionValue(ctx, dest), ttl)
 				return nil
 			})
 			if txErr == nil {
@@ -314,19 +307,18 @@ func (c *Client) acquireIf(
 	return "", false, fmt.Errorf("acquire %s %s: transaction conflicted after %d attempts", dest, key, maxAttempts)
 }
 
-// SetState forces the state value (overwriting any existing). Used to
-// transition pausing → paused or resuming → running once the underlying
-// operation has actually completed.
+// SetState is an unconditional setup primitive. Runtime transitions use
+// owner-fenced WriteState; terminal values never receive a coordination TTL.
 func (c *Client) SetState(ctx context.Context, sandboxID, state string, ttl time.Duration) error {
 	key := lifecycle.StateKey(sandboxID)
-	return c.rdb.Set(ctx, key, state, ttl).Err()
+	return c.rdb.Set(ctx, key, state, terminalTTL(state, ttl)).Err()
 }
 
-// ClearState drops the key altogether. Used on rollback (operation failed)
-// and on sandbox delete.
+// ClearState writes a bounded deletion tombstone. Owners cannot complete over
+// it; normal rollback uses the owner-fenced ClearStateNotify instead.
 func (c *Client) ClearState(ctx context.Context, sandboxID string) error {
 	key := lifecycle.StateKey(sandboxID)
-	return c.rdb.Del(ctx, key).Err()
+	return c.rdb.Set(ctx, key, lifecycle.StateKilled, time.Minute).Err()
 }
 
 // GetState returns the current state and whether the key exists.
@@ -339,7 +331,7 @@ func (c *Client) GetState(ctx context.Context, sandboxID string) (string, bool, 
 	if err != nil {
 		return "", false, err
 	}
-	return v, true, nil
+	return stateValue(v), true, nil
 }
 
 // getStatesChunk bounds MGET so a large registry does not send one giant
@@ -371,7 +363,7 @@ func (c *Client) GetStates(ctx context.Context, sandboxIDs []string) (map[string
 			if !ok || s == "" {
 				continue
 			}
-			out[chunk[i]] = s
+			out[chunk[i]] = stateValue(s)
 		}
 	}
 	return out, nil
@@ -384,6 +376,17 @@ func (c *Client) GetStates(ctx context.Context, sandboxIDs []string) (map[string
 // write is the source of truth. Waiters degrade to fallback polling and
 // still converge.
 func (c *Client) WriteState(ctx context.Context, sandboxID, state string, ttl time.Duration) error {
+	if owner(ctx) != "" {
+		ok, err := c.finishOwned(ctx, sandboxID, state, ttl)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			return fmt.Errorf("lifecycle transition ownership lost for %s", sandboxID)
+		}
+		c.publishNotify(sandboxID)
+		return nil
+	}
 	if err := c.SetState(ctx, sandboxID, state, ttl); err != nil {
 		return err
 	}
@@ -397,6 +400,15 @@ func (c *Client) WriteState(ctx context.Context, sandboxID, state string, ttl ti
 func (c *Client) WriteStateCAS(
 	ctx context.Context, sandboxID, expected, state string, ttl time.Duration,
 ) (bool, error) {
+	return c.writeStateCAS(ctx, sandboxID, expected, state, ttl, "")
+}
+
+// ApplyStateEvent rejects stream entries at or below a completed operation's
+// high-water. A late pause event cannot reverse an already completed resume.
+func (c *Client) ApplyStateEvent(ctx context.Context, sid, expected, state, eventID string, ttl time.Duration) (bool, error) {
+	return c.writeStateCAS(ctx, sid, expected, state, ttl, eventID)
+}
+func (c *Client) writeStateCAS(ctx context.Context, sandboxID, expected, state string, ttl time.Duration, eventID string) (bool, error) {
 	const maxAttempts = 3
 	key := lifecycle.StateKey(sandboxID)
 	for attempt := 0; attempt < maxAttempts; attempt++ {
@@ -408,11 +420,28 @@ func (c *Client) WriteStateCAS(
 			} else if getErr != nil {
 				return getErr
 			}
-			if current != expected {
+			// Never overwrite an owner token, even when its public state matches.
+			if stateValue(current) != expected || strings.Contains(current, ":") {
 				return nil
 			}
+			_, watermark, _ := strings.Cut(current, "|")
+			if eventID != "" && watermark != "" {
+				cmp, err := CompareStreamIDs(eventID, watermark)
+				if err != nil {
+					return err
+				}
+				if cmp <= 0 {
+					return nil
+				}
+			}
+			value := state
+			if eventID != "" {
+				value += "|" + eventID
+			} else if watermark != "" {
+				value += "|" + watermark
+			}
 			_, txErr := tx.TxPipelined(ctx, func(pipe redis.Pipeliner) error {
-				pipe.Set(ctx, key, state, ttl)
+				pipe.Set(ctx, key, value, terminalTTL(state, ttl))
 				return nil
 			})
 			if txErr == nil {
@@ -436,6 +465,11 @@ func (c *Client) WriteStateCAS(
 
 // ClearStateNotify is the ClearState + Pub/Sub companion used on rollback.
 func (c *Client) ClearStateNotify(ctx context.Context, sandboxID string) error {
+	if owner(ctx) != "" {
+		// A failed/disabled resume has not proved running. Preserve unknown rather
+		// than deleting the only state and silently routing to a paused guest.
+		return c.WriteState(ctx, sandboxID, UnknownState, 0)
+	}
 	if err := c.ClearState(ctx, sandboxID); err != nil {
 		return err
 	}
@@ -521,4 +555,115 @@ func decodeEvent(msg redis.XMessage) *Event {
 		}
 	}
 	return ev
+}
+
+// finishOwned fences completion by owner and reconciles a bounded stream window.
+// Only an event carrying this operation's Master request ID proves its outcome.
+// The newest event at/after that receipt wins, not the caller's stale RPC result.
+// WATCH includes the stream: an event cannot be consumed behind a token between
+// the scan and EXEC. Missing/trimmed/old-producer receipts become unknown.
+func (c *Client) finishOwned(ctx context.Context, sid, state string, ttl time.Duration) (bool, error) {
+	key := lifecycle.StateKey(sid)
+	for attempt := 0; attempt < 3; attempt++ {
+		done := false
+		resolved := state
+		err := c.rdb.Watch(ctx, func(tx *redis.Tx) error {
+			raw, err := tx.Get(ctx, key).Result()
+			if errors.Is(err, redis.Nil) {
+				return nil
+			}
+			if err != nil {
+				return err
+			}
+			if !owned(raw, owner(ctx)) {
+				return nil
+			}
+			value := state
+			if state == lifecycle.StateRunning || state == lifecycle.StatePaused || state == UnknownState {
+				var cursor string
+				resolved, cursor, err = c.completionEvidence(ctx, tx, sid, owner(ctx))
+				if err != nil {
+					return err
+				}
+				value = resolved
+				if cursor != "" {
+					value += "|" + cursor
+				}
+			}
+			if state == "pausing" || state == "resuming" || state == "killing" {
+				value = transitionValue(ctx, state)
+			}
+			_, err = tx.TxPipelined(ctx, func(p redis.Pipeliner) error {
+				p.Set(ctx, key, value, terminalTTL(resolved, ttl))
+				return nil
+			})
+			done = err == nil
+			return err
+		}, key, lifecycle.EventStreamKey)
+		if errors.Is(err, redis.TxFailedErr) {
+			continue
+		}
+		if err != nil {
+			return false, err
+		}
+		if done && resolved != state {
+			c.publishNotify(sid)
+			return true, fmt.Errorf("lifecycle completion reconciled %s to %s, not %s", sid, resolved, state)
+		}
+		return done, nil
+	}
+	return false, errors.New("lifecycle completion conflicted with concurrent events")
+}
+
+func (c *Client) completionEvidence(ctx context.Context, tx *redis.Tx, sid, requestID string) (string, string, error) {
+	upper := "+"
+	newestState, newestID, tail := "", "", ""
+	for scanned := 0; scanned < lifecycle.EventStreamMaxLen; {
+		count := min(int64(128), int64(lifecycle.EventStreamMaxLen-scanned))
+		messages, err := tx.XRevRangeN(ctx, lifecycle.EventStreamKey, upper, "-", count).Result()
+		if err != nil {
+			return "", "", err
+		}
+		if len(messages) == 0 {
+			break
+		}
+		for _, msg := range messages {
+			scanned++
+			if tail == "" {
+				tail = msg.ID
+			}
+			ev := decodeEvent(msg)
+			if ev == nil {
+				// Preserve identity even when the event envelope cannot decode.
+				// A newer malformed event for this sandbox invalidates older
+				// receipts; unrelated or unidentified events are not ours.
+				if rawSID, ok := msg.Values[lifecycle.FieldSandboxID].(string); ok && rawSID == sid {
+					return UnknownState, msg.ID, nil
+				}
+				continue
+			}
+			if ev.SandboxID != sid {
+				continue
+			}
+			if ev.Op == lifecycle.OpDelete {
+				return UnknownState, msg.ID, nil
+			}
+			if ev.Op != lifecycle.OpState {
+				continue
+			}
+			if ev.State == nil || (ev.State.State != lifecycle.StateRunning && ev.State.State != lifecycle.StatePaused) {
+				return UnknownState, msg.ID, nil
+			}
+			if newestID == "" {
+				newestState, newestID = ev.State.State, msg.ID
+			}
+			if ev.State.RequestID == requestID {
+				return newestState, newestID, nil
+			}
+		}
+		upper = "(" + messages[len(messages)-1].ID
+	}
+	// Fence observed old history while retaining a safe reconciliation state.
+	// An absent receipt never means that the requested RPC outcome occurred.
+	return UnknownState, tail, nil
 }

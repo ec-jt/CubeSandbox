@@ -160,8 +160,9 @@ func (l *local) Create(ctx context.Context, opts *workflow.CreateContext) error 
 		return ret.Err(errorcode.ErrorCode_InvalidParamFormat, err.Error())
 	}
 	info := &sandBoxInfo{
-		SandboxID: opts.SandboxID,
-		Namespace: ns,
+		SandboxID:       opts.SandboxID,
+		Namespace:       ns,
+		CleanupEvidence: opts.CleanupEvidence,
 	}
 	if err := l.saveSandBoxInfo(info); err != nil {
 		log.G(ctx).Warnf("saveSandBoxInfo failed:%s", err.Error())
@@ -204,8 +205,9 @@ func (l *local) CleanUp(ctx context.Context, opts *workflow.CleanContext) error 
 }
 
 type sandBoxInfo struct {
-	SandboxID string
-	Namespace string
+	CleanupEvidence *workflow.LifecycleCleanup `json:",omitempty"`
+	SandboxID       string
+	Namespace       string
 }
 
 func (l *local) saveSandBoxInfo(info *sandBoxInfo) error {

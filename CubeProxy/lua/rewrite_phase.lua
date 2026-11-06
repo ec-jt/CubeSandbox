@@ -34,6 +34,7 @@ end
 ngx.var.ins_id = ins_id
 
 -- Auto-pause gate. See sandbox_state.lua for failure-mode semantics.
+sb.authorize(ins_id)
 state.gate(ins_id)
 
 local host_ip, host_port, mask_request_host = sb.resolve_backend(ins_id, container_port)

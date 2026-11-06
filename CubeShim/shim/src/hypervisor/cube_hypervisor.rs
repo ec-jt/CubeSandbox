@@ -47,6 +47,8 @@ pub struct CubeHypervisor {
     ch: Option<Arc<Mutex<cube_hypervisor::VmmInstance>>>,
     ev_receiver: Option<Arc<Mutex<Receiver<NotifyEvent>>>>,
     log: Log,
+    retained_vm_deleted: bool,
+    retained_vmm_stopped: bool,
 }
 
 impl CubeHypervisor {
@@ -57,6 +59,8 @@ impl CubeHypervisor {
             config: config.clone(),
             ev_receiver: None,
             log,
+            retained_vm_deleted: false,
+            retained_vmm_stopped: false,
         }
     }
 
@@ -234,6 +238,26 @@ impl CubeHypervisor {
     }
 
     pub async fn stop_vm(&self) -> CResult<()> {
+        Ok(())
+    }
+
+    /// Recovery-only native v28 teardown, after durable host authorization.
+    /// No snapshot, disk unlink or guest DestroySandbox request is performed.
+    pub async fn stop_retained_runtime(&mut self) -> CResult<()> {
+        if self.retained_vmm_stopped { return Ok(()); }
+        let instance = self.ch.as_ref().ok_or("retained stop: missing VMM instance")?;
+        let mut ch = instance.lock().await;
+        if !self.retained_vm_deleted {
+            ch.send_request(ApiRequest::VmDelete)
+                .map_err(|e| format!("retained VmDelete transport: {e}"))?
+                .map_err(|e| format!("retained VmDelete: {e}"))?;
+            self.retained_vm_deleted = true;
+        }
+        ch.send_request(ApiRequest::VmmShutdown)
+            .map_err(|e| format!("retained VmmShutdown transport: {e}"))?
+            .map_err(|e| format!("retained VmmShutdown: {e}"))?;
+        ch.join().map_err(|e| format!("retained VMM join: {e}"))?;
+        self.retained_vmm_stopped = true;
         Ok(())
     }
 

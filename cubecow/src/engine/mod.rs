@@ -34,6 +34,11 @@ use crate::{Snapshot, Volume, VolumeBlockInfo};
 /// expected to model them with explicit prefixes in the volume name
 /// rather than re-introducing a pool concept here.
 pub trait Engine: Send + Sync {
+    /// Bounded native checkpoint record/evidence operation. Not boot authority.
+    fn checkpoint_record(&self, _request: &str) -> CubecowResult<String> {
+        Err(CubecowError::PreconditionFailed("checkpoint records require S3".into()))
+    }
+
     // -----------------------------------------------------------------------
     // Volume operations
     // -----------------------------------------------------------------------

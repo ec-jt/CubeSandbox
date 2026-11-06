@@ -1278,13 +1278,14 @@ func TestRestoreFromTemplateMemoryPrefetchDoesNotDeleteTemplateMemoryOnRootfsFai
 	assert.Empty(t, fakeManager.deactivateCalls)
 }
 
-func TestCreateRollbackCleansCreatedCowVolumeWhenMetadataWriteFails(t *testing.T) {
+func TestRestoreLifecycleStorageReadFailureStopsAllocation(t *testing.T) {
 	cfg := makeTestConfig(t)
 	cfg.StorageBackend = "cubecow"
 	fakeManager := &fakeCowVolumeManager{}
 
 	s := &local{config: cfg, cowManager: fakeManager}
-	assert.NoError(t, s.init(&plugin.InitContext{Context: context.Background()}))
+	require.NoError(t, s.initDb())
+	t.Cleanup(func() { _ = s.db.Close(); _ = s.rcDB.Close() })
 	require.NoError(t, s.db.Close())
 	s.config.RootPath = filepath.Join(t.TempDir(), "missing-root")
 
@@ -1302,18 +1303,18 @@ func TestCreateRollbackCleansCreatedCowVolumeWhenMetadataWriteFails(t *testing.T
 
 	err := s.Create(ctx, opts)
 	require.Error(t, err)
-	require.Len(t, fakeManager.createDefaultCalls, 1)
-	require.Len(t, fakeManager.deleteCalls, 1)
-	assert.Equal(t, fakeCowDeleteCall{name: "sb-write-fail-sb-test", kind: cowKindVolume}, fakeManager.deleteCalls[0])
+	require.Empty(t, fakeManager.createDefaultCalls)
+	require.Empty(t, fakeManager.deleteCalls)
 }
 
-func TestCreateRollbackDeletesPersistedMetadataWhenPostPersistUpdateFails(t *testing.T) {
+func TestRestoreLifecyclePreservesPersistedMetadataAfterFailure(t *testing.T) {
 	cfg := makeTestConfig(t)
 	cfg.StorageBackend = "cubecow"
 	fakeManager := &fakeCowVolumeManager{}
 
 	s := &local{config: cfg, cowManager: fakeManager}
-	assert.NoError(t, s.init(&plugin.InitContext{Context: context.Background()}))
+	require.NoError(t, s.initDb())
+	t.Cleanup(func() { _ = s.db.Close(); _ = s.rcDB.Close() })
 
 	templateID := "tpl-" + uuid.NewString()
 	require.NoError(t, s.db.Set(bucketName, templateID, []byte("{bad-json")))
@@ -1338,10 +1339,12 @@ func TestCreateRollbackDeletesPersistedMetadataWhenPostPersistUpdateFails(t *tes
 
 	err := s.Create(ctx, opts)
 	require.Error(t, err)
-	require.Len(t, fakeManager.deleteCalls, 1)
-	assert.Equal(t, fakeCowDeleteCall{name: "sb-post-persist-fail-sb-rootfs-gen0", kind: cowKindSnapshot}, fakeManager.deleteCalls[0])
+	require.Empty(t, fakeManager.deleteCalls)
 	_, err = s.readBackendFileInfoRaw(ctx, "post-persist-fail-sb")
-	assert.ErrorIs(t, err, utils.ErrorKeyNotFound)
+	require.NoError(t, err)
+	// A retry may not overwrite this persisted record.
+	require.Error(t, s.Create(ctx, opts))
+	require.Empty(t, fakeManager.deleteCalls)
 }
 
 func TestCleanupCreateResultRemovesHostDirSandboxPath(t *testing.T) {

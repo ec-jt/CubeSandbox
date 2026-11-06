@@ -1,0 +1,73 @@
+# Copyright (c) 2026 Tencent Inc.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Standalone build for s3_recovery_validity_test.c.
+#
+# Links TWO real translation units:
+#
+#   lib/s3bsdev/s3_local_dev.c   staged format, commit, open, super block,
+#                                CRC, layout, close/adoption order
+#   lib/s3bsdev/s3_recovery.c    claim open / release, needed because
+#                                s3_local_dev.c references the claim API even
+#                                on paths this test does not exercise
+#
+# Compiled with function/data sections and linked with --gc-sections, so the
+# unrelated recovery helpers are discarded, and every SPDK bdev / channel /
+# DMA / flush symbol is redirected with --wrap to the mock in the test. No
+# SPDK archive, bdev module, hugepages, PCI device or hardware is required.
+#
+# Inside the offline builder container the project is at /work:
+#   make -f /work/test/integration/Makefile.s3_recovery_validity \
+#        WORK=/work TARGET=/evid/s3_recovery_validity_test
+#
+# Defaults build into /tmp.
+
+CC ?= cc
+WORK ?= /work
+
+CFLAGS ?= -I$(WORK)/include -I$(WORK)/deps/spdk/include \
+	-Wall -Wextra -Wno-unused-parameter -Werror \
+	-DDEBUG -g3 -O0 -D_GNU_SOURCE -fno-strict-aliasing \
+	-ffunction-sections -fdata-sections
+
+RECOVERY_SRC ?= $(WORK)/lib/s3bsdev/s3_recovery.c
+LOCALDEV_SRC ?= $(WORK)/lib/s3bsdev/s3_local_dev.c
+TEST_SRC ?= $(WORK)/test/integration/s3_recovery_validity_test.c
+TARGET ?= /tmp/s3_recovery_validity_test
+OBJ_RECOVERY := $(TARGET).recovery.o
+OBJ_LOCALDEV := $(TARGET).local_dev.o
+
+WRAPS := \
+	-Wl,--wrap=spdk_bdev_open_ext \
+	-Wl,--wrap=spdk_bdev_close \
+	-Wl,--wrap=spdk_bdev_desc_get_bdev \
+	-Wl,--wrap=spdk_bdev_get_block_size \
+	-Wl,--wrap=spdk_bdev_get_num_blocks \
+	-Wl,--wrap=spdk_bdev_get_name \
+	-Wl,--wrap=spdk_bdev_get_io_channel \
+	-Wl,--wrap=spdk_put_io_channel \
+	-Wl,--wrap=spdk_bdev_read \
+	-Wl,--wrap=spdk_bdev_write \
+	-Wl,--wrap=spdk_bdev_flush \
+	-Wl,--wrap=spdk_bdev_free_io \
+	-Wl,--wrap=spdk_dma_zmalloc \
+	-Wl,--wrap=spdk_dma_free \
+	-Wl,--wrap=spdk_bdev_claim_opts_init \
+	-Wl,--wrap=spdk_bdev_module_claim_bdev_desc \
+	-Wl,--wrap=spdk_bdev_module_release_bdev \
+	-Wl,--wrap=spdk_strerror \
+	-Wl,--wrap=spdk_log \
+	-Wl,--wrap=spdk_crc32c_update \
+	-Wl,--wrap=spdk_get_thread \
+	-Wl,--wrap=spdk_uuid_copy
+
+all: $(TARGET)
+
+$(TARGET): $(RECOVERY_SRC) $(LOCALDEV_SRC) $(TEST_SRC)
+	$(CC) $(CFLAGS) -c $(RECOVERY_SRC) -o $(OBJ_RECOVERY)
+	$(CC) $(CFLAGS) -c $(LOCALDEV_SRC) -o $(OBJ_LOCALDEV)
+	$(CC) $(CFLAGS) $(TEST_SRC) $(OBJ_RECOVERY) $(OBJ_LOCALDEV) \
+		$(WRAPS) -Wl,--gc-sections -o $(TARGET)
+
+clean:
+	rm -f $(OBJ_RECOVERY) $(OBJ_LOCALDEV) $(TARGET)

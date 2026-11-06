@@ -8,6 +8,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"github.com/tencentcloud/CubeSandbox/Cubelet/plugins/workflow"
 	"net"
 	"path/filepath"
 	"strings"
@@ -70,14 +71,20 @@ func (s *service) RollbackSandbox(ctx context.Context, req *cubebox.RollbackSand
 		rsp.Ret.RetMsg = err.Error()
 		return rsp, nil
 	}
+
+	unlock := s.sandboxLifecycleLocks.Lock(req.GetSandboxID())
+	defer unlock()
+	if err := workflow.SourceFences.Check(rsp.SandboxID); err != nil {
+		rsp.Ret.RetCode = errorcode.ErrorCode_PreConditionFailed
+		rsp.Ret.RetMsg = err.Error()
+		return rsp, nil
+	}
 	if !storage.IsCowBackend() {
 		rsp.Ret.RetCode = errorcode.ErrorCode_PreConditionFailed
 		rsp.Ret.RetMsg = "RollbackSandbox requires storage_backend=cubecow"
 		return rsp, nil
 	}
-
-	unlock := s.sandboxLifecycleLocks.Lock(req.GetSandboxID())
-	defer unlock()
+	ctx = workflow.BeginSandboxLifecycle(ctx, req.GetSandboxID())
 
 	stepLog := log.G(ctx).WithFields(CubeLog.Fields{
 		"step":       "rollbackSandbox",

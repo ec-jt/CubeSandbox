@@ -71,9 +71,10 @@ S3BSDEV_DIR = ../../lib/s3bsdev
 MODULE_DIR   = ../../module/bdev/s3lvol
 
 APPS = s3_client_test s3_spawner_test s3_thread_bounce_test s3_bs_dev_test \
-       s3_journal_test s3_wal_test s3_cache_test s3_flush_test s3_export_test \
+       s3_journal_test s3_wal_test s3_wal_geometry_test s3_cache_test s3_flush_test s3_export_test \
        s3_statefile_test s3_local_dev_test s3_checkpoint_test s3_export_swap_test \
-       s3_copy_xml_test s3_pending_persist_test
+       s3_copy_xml_test s3_pending_persist_test s3_recovery_test \
+       s3_put_etag_test s3_put_etag_request_test
 
 # (a) minimal library set for the stubbed path
 STUB_SRCS      = spdk_thread_stub.c
@@ -159,6 +160,17 @@ s3_export_swap_test: s3_export_swap_test.c $(S3BSDEV_DIR)/libs3bsdev.a
 s3_copy_xml_test: s3_copy_xml_test.c $(S3BSDEV_DIR)/s3_copy_xml.h
 	$(CC) $(COMMON_CFLAGS) -I$(S3BSDEV_DIR) s3_copy_xml_test.c -o $@
 
+s3_put_etag_test: s3_put_etag_test.c $(S3BSDEV_DIR)/s3_put_etag.h
+	$(CC) $(COMMON_CFLAGS) -I$(S3BSDEV_DIR) s3_put_etag_test.c -o $@
+
+# Includes the production client TU, intercepting only client/submission and
+# header-failure boundaries. Real CRT messages, no network or DPDK init.
+s3_put_etag_request_test: s3_put_etag_request_test.c $(STUB_SRCS) \
+                        $(S3BSDEV_DIR)/s3_client_aws.c $(S3BSDEV_DIR)/s3_put_etag.h
+	$(CC) $(COMMON_CFLAGS) s3_put_etag_request_test.c $(STUB_SRCS) \
+	    $(AWS_LIBS) -Wl,--start-group $(STUB_SPDK_LIBS) -Wl,--end-group \
+	    $(TEST_SYS_LIBS) -o $@
+
 # Pending-delete registry PUT coalescing. Header-only, no S3, no SPDK.
 s3_pending_persist_test: s3_pending_persist_test.c $(MODULE_DIR)/pending_persist_ctl.h
 	$(CC) $(COMMON_CFLAGS) -I$(MODULE_DIR) s3_pending_persist_test.c -o $@
@@ -200,6 +212,16 @@ s3_journal_test: s3_journal_test.c $(S3BSDEV_DIR)/libs3bsdev.a
 
 s3_wal_test: s3_wal_test.c $(S3BSDEV_DIR)/libs3bsdev.a
 	$(CC) $(COMMON_CFLAGS) $(JOURNAL_CFLAGS) s3_wal_test.c \
+	    $(S3BSDEV_DIR)/libs3bsdev.a \
+	    $(AWS_LIBS) \
+	    -Wl,--whole-archive \
+	        -Wl,--start-group $(JOURNAL_SPDK_LIBS) -Wl,--end-group \
+	    -Wl,--no-whole-archive \
+	    $(JOURNAL_DPDK_ARGS) \
+	    $(SYS_LIBS) $(TEST_SYS_LIBS) -o $@
+
+s3_wal_geometry_test: s3_wal_geometry_test.c s3_wal_test.c $(S3BSDEV_DIR)/libs3bsdev.a
+	$(CC) $(COMMON_CFLAGS) $(JOURNAL_CFLAGS) s3_wal_geometry_test.c \
 	    $(S3BSDEV_DIR)/libs3bsdev.a \
 	    $(AWS_LIBS) \
 	    -Wl,--whole-archive \
@@ -295,15 +317,28 @@ s3_checkpoint_test: s3_checkpoint_test.c $(S3BSDEV_DIR)/libs3bsdev.a
 	    $(EXPORT_DPDK_ARGS) \
 	    $(SYS_LIBS) $(TEST_SYS_LIBS) -o $@
 
+# Recovery descriptor validation: no S3, no DPDK init. Same link as the
+# checkpoint test -- it stubs the four s3_client entry points, and the objects
+# it pulls in (s3_recovery.o, s3_checkpoint.o, s3_chunk_map.o) reference bdev /
+# thread / env symbols that are linked to satisfy them but never initialised.
+s3_recovery_test: s3_recovery_test.c $(S3BSDEV_DIR)/libs3bsdev.a
+	$(CC) $(COMMON_CFLAGS) s3_recovery_test.c \
+	    $(S3BSDEV_DIR)/libs3bsdev.a \
+	    $(AWS_LIBS) \
+	    -Wl,--start-group $(EXPORT_SPDK_LIBS) -Wl,--end-group \
+	    $(EXPORT_DPDK_ARGS) \
+	    $(SYS_LIBS) $(TEST_SYS_LIBS) -o $@
+
 # Run only the tests that need no S3 credentials
-check: s3_spawner_test s3_thread_bounce_test s3_journal_test s3_wal_test s3_cache_test \
+check: s3_spawner_test s3_thread_bounce_test s3_journal_test s3_wal_test s3_wal_geometry_test s3_cache_test \
        s3_flush_test s3_export_test s3_statefile_test s3_local_dev_test \
        s3_checkpoint_test s3_export_swap_test s3_copy_xml_test \
-       s3_pending_persist_test
+       s3_pending_persist_test s3_recovery_test s3_put_etag_test s3_put_etag_request_test
 	./s3_spawner_test
 	./s3_thread_bounce_test
 	./s3_journal_test
 	./s3_wal_test
+	./s3_wal_geometry_test
 	./s3_cache_test
 	./s3_flush_test
 	./s3_export_test
@@ -312,7 +347,10 @@ check: s3_spawner_test s3_thread_bounce_test s3_journal_test s3_wal_test s3_cach
 	./s3_checkpoint_test
 	./s3_export_swap_test
 	./s3_copy_xml_test
+	./s3_put_etag_test
+	./s3_put_etag_request_test
 	./s3_pending_persist_test
+	./s3_recovery_test
 
 .PHONY: $(S3BSDEV_DIR)/libs3bsdev.a
 $(S3BSDEV_DIR)/libs3bsdev.a:
@@ -324,3 +362,13 @@ $(S3BSDEV_DIR)/libs3bsdev.a:
 
 clean:
 	rm -f $(APPS) *.o *.d
+
+# Scoped source correctness gate only. Does not run the broad integration suite.
+.PHONY: check-source-drain
+check-source-drain:
+	$(MAKE) -f Makefile.source-drain ROOT=../.. OUT="$(SOURCE_DRAIN_OUT)" build
+	ASAN_OPTIONS=detect_leaks=1:abort_on_error=1 UBSAN_OPTIONS=halt_on_error=1 "$(SOURCE_DRAIN_OUT)/source_drain_path_test"
+	@set -e; for mode in null validation controls control-failure multi lifetime race; do \
+	  ASAN_OPTIONS=detect_leaks=1:abort_on_error=1 UBSAN_OPTIONS=halt_on_error=1 "$(SOURCE_DRAIN_OUT)/scoped_source_path_test" $$mode; \
+	done
+SOURCE_DRAIN_OUT ?= /tmp

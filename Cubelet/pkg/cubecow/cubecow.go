@@ -11,6 +11,7 @@ package cubecow
 #cgo LDFLAGS: ${SRCDIR}/../../third_party/cubecow/lib/libcubecow.a -ldl -lpthread -lm -lrt
 #include "cubecow.h"
 #include <stdlib.h>
+extern int32_t cubecow_checkpoint_record(CubecowEngineHandle engine, const char* request, char** out_json);
 
 static inline int32_t cubecow_create_snapshot_from_volume_go(
     CubecowEngineHandle engine,
@@ -433,6 +434,23 @@ func (e *Engine) ExportSnapshot(snapshotName string) (string, error) {
 		return "", makeError(rc)
 	}
 	return takeCString(cUUID), nil
+}
+
+func (e *Engine) CheckpointRecord(request string) (string, error) {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+	ptr, err := e.openHandle()
+	if err != nil {
+		return "", err
+	}
+	defer e.mu.RUnlock()
+	cRequest := C.CString(request)
+	defer C.free(unsafe.Pointer(cRequest))
+	var result *C.char
+	if rc := C.cubecow_checkpoint_record(C.CubecowEngineHandle(ptr), cRequest, &result); rc != 0 {
+		return "", makeError(rc)
+	}
+	return takeCString(result), nil
 }
 
 func (e *Engine) ImportLvol(lvolName, exportUUID string) (string, error) {

@@ -410,6 +410,10 @@ static bool
 pending_lvol_deletable(struct s3lvol_lvstore *lvs, struct spdk_lvol *lvol,
 		       const char **why)
 {
+	if (!s3lvol_lvstore_xfer_allowed(lvs)) {
+		*why = "export registry unknown or store unloading";
+		return false;
+	}
 	/* A mounted namespace is never touched from here. The delete would block
 	 * in bdev unregister until the host disconnects, and the host did not ask
 	 * for that -- the caller has to deactivate first. */
@@ -426,14 +430,14 @@ pending_lvol_deletable(struct s3lvol_lvstore *lvs, struct spdk_lvol *lvol,
 		return false;
 	}
 
-	/* A stale or missing lease, and a pre-lease export, let the pending
-	 * delete proceed: the recorded intent is the revocation. */
+	/* A recorded delete intent cannot revoke a remote dependency. */
 	switch (s3lvol_export_pin_state(lvs, lvol->name)) {
+	case S3LVOL_EXPORT_PIN_OBLIGATION:
+	case S3LVOL_EXPORT_PIN_LEGACY:
+	case S3LVOL_EXPORT_PIN_STALE:
 	case S3LVOL_EXPORT_PIN_LEASE:
 		*why = "an importer may still be reading an export of it";
 		return false;
-	case S3LVOL_EXPORT_PIN_LEGACY:
-	case S3LVOL_EXPORT_PIN_STALE:
 	case S3LVOL_EXPORT_PIN_NONE:
 	default:
 		break;
@@ -858,6 +862,23 @@ pending_persist(const struct spdk_uuid *lvs_uuid)
 	}
 }
 
+/* True while a registry PUT for this lvstore is in flight or still owed.
+ *
+ * The unload asks this before it releases the S3 owner marker: the PUT writes
+ * `<lvstore>/meta/pending-deletes.json`, and one landing after the release
+ * would be this process writing to a prefix it has just declared free. */
+bool
+s3lvol_pending_persist_busy(const struct spdk_uuid *lvs_uuid)
+{
+	struct pending_persist *p;
+
+	if (!lvs_uuid) {
+		return false;
+	}
+	p = pending_persist_find(lvs_uuid);
+	return p && (p->ctl.in_flight || p->ctl.dirty);
+}
+
 /* ---- load ---- */
 
 struct pending_entry_json {
@@ -1086,6 +1107,8 @@ pending_load_park(struct pending_load_ctx *ctx, int status, uint64_t bytes,
 static void
 pending_load_done(struct pending_load_ctx *ctx, int status)
 {
+	struct s3lvol_lvstore *live = pending_load_live_lvs(ctx);
+	if (live) s3lvol_source_pending_loaded(live, status);
 	if (status != 0) {
 		SPDK_WARNLOG("pending-delete registry of '%s' was not loaded (%s); "
 			     "queued deletes have to be asked for again\n",

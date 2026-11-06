@@ -1,0 +1,50 @@
+# Copyright (c) 2026 Tencent Inc.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Standalone ASan/UBSan build for s3_bsdev_cache_teardown_test.c.
+#
+# Compiles the REAL production sources of the s3_bs_dev destroy chain:
+#   lib/s3bsdev/s3_bs_dev.c  s3_cache.c  s3_flusher.c  s3_overlay.c
+#   s3_chunk_map.c
+# against fakes in the test for every external symbol they reach (SPDK
+# thread/poller/io_device/log/uuid/dma/ticks, the local bdev, the S3 client,
+# WAL, journal, local_dev, checkpoint and recovery publish). No SPDK archive,
+# no DPDK, no hugepages, no PCI, no network, no S3.
+#
+# malloc/calloc are wrapped so the test can make every allocation fail while
+# teardown is parked on the cache.
+#
+# Two variants: debug (asserts live) and NDEBUG (release-like).
+#
+#   make -f /work/test/integration/Makefile.s3_bsdev_cache_teardown \
+#        WORK=/work OUT=/out
+
+CC ?= cc
+WORK ?= /work
+OUT ?= /tmp
+
+BASE := -I$(WORK)/include -I$(WORK)/deps/spdk/include \
+	-Wall -Wextra -Wno-unused-parameter -Werror \
+	-g3 -O1 -D_GNU_SOURCE -fno-strict-aliasing \
+	-fno-omit-frame-pointer -fsanitize=address,undefined \
+	-fno-sanitize-recover=all
+LDWRAP := -Wl,--wrap=malloc -Wl,--wrap=calloc
+
+SRCS := $(WORK)/lib/s3bsdev/s3_bs_dev.c \
+	$(WORK)/lib/s3bsdev/s3_cache.c \
+	$(WORK)/lib/s3bsdev/s3_flusher.c \
+	$(WORK)/lib/s3bsdev/s3_overlay.c \
+	$(WORK)/lib/s3bsdev/s3_chunk_map.c \
+	$(WORK)/test/integration/s3_bsdev_cache_teardown_test.c
+
+all: $(OUT)/s3_bsdev_cache_teardown_test $(OUT)/s3_bsdev_cache_teardown_test_ndebug
+
+$(OUT)/s3_bsdev_cache_teardown_test: $(SRCS)
+	$(CC) $(BASE) -DDEBUG $(SRCS) $(LDWRAP) -o $@
+
+$(OUT)/s3_bsdev_cache_teardown_test_ndebug: $(SRCS)
+	$(CC) $(BASE) -DNDEBUG $(SRCS) $(LDWRAP) -o $@
+
+clean:
+	rm -f $(OUT)/s3_bsdev_cache_teardown_test \
+	      $(OUT)/s3_bsdev_cache_teardown_test_ndebug

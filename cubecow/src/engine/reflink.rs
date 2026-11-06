@@ -278,6 +278,8 @@ impl ReflinkEngine {
         let snapshot_count = count_snapshots_on_disk(&self.vol_dir(volume_name), volume_name)?;
 
         Ok(Volume {
+                    volume_uuid: String::new(),
+                    import_origin: None,
             name: volume_name.to_string(),
             size_bytes: meta.size(),
             device_path: main.to_string_lossy().into_owned(),
@@ -572,6 +574,8 @@ impl Engine for ReflinkEngine {
                 drop(idx);
                 let snap = self.project_snapshot(name)?;
                 Ok(Volume {
+                    volume_uuid: String::new(),
+                    import_origin: None,
                     name: snap.name,
                     size_bytes: snap.size_bytes,
                     device_path: snap.device_path,
@@ -982,6 +986,8 @@ impl Engine for ReflinkEngine {
                 // re-exposed here: it is already available via
                 // `list_snapshots` / `Snapshot::origin_volume`.
                 Ok(Volume {
+                    volume_uuid: String::new(),
+                    import_origin: None,
                     name: snap.name,
                     size_bytes: snap.size_bytes,
                     device_path: snap.device_path,

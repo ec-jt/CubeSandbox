@@ -757,7 +757,7 @@ func (l *local) CreateCubeboxBaseStorage(ctx context.Context, opts *workflow.Cre
 	}
 
 	result := &StorageInfo{Namespace: ns, SandboxID: opts.GetSandboxID(), Volumes: make(map[string]*BackendFileInfo),
-		TemplateID: templateID, InstanceType: opts.GetInstanceType(), Backend: optionalCreateContextBackend(opts)}
+		TemplateID: templateID, InstanceType: opts.GetInstanceType(), Backend: optionalCreateContextBackend(opts), preserveOnCreateFailure: opts.PreserveStorageOnFailure()}
 	defer func() {
 		start := time.Now()
 		var errs error
@@ -857,8 +857,15 @@ func (l *local) Create(ctx context.Context, opts *workflow.CreateContext) (retEr
 		return ret.Err(errorcode.ErrorCode_InvalidParamFormat, err.Error())
 	}
 
+	// Never overwrite a prior attempt's metadata. Restore resources may be
+	// reused by native name, but that does not transfer cleanup ownership.
+	if _, readErr := l.readBackendFileInfoRaw(ctx, opts.SandboxID); readErr == nil {
+		return ret.Err(errorcode.ErrorCode_PreConditionFailed, "storage metadata already exists; reconcile before retry")
+	} else if !errors.Is(readErr, utils.ErrorKeyNotFound) && !errors.Is(readErr, utils.ErrorBucketNotFound) {
+		return ret.Err(errorcode.ErrorCode_CreateStorageFailed, readErr.Error())
+	}
 	result := &StorageInfo{Namespace: ns, SandboxID: opts.SandboxID, Volumes: make(map[string]*BackendFileInfo),
-		Backend: optionalCreateContextBackend(opts)}
+		Backend: optionalCreateContextBackend(opts), preserveOnCreateFailure: opts.PreserveStorageOnFailure()}
 	defer func() {
 		if retErr == nil {
 			return
@@ -951,6 +958,11 @@ func (l *local) cleanupCreateResult(ctx context.Context, result *StorageInfo) er
 	if result == nil {
 		return nil
 	}
+	if result.preserveOnCreateFailure {
+		// No created-versus-reused ledger exists for clone/import. Preserve root,
+		// memory, metadata and any persisted result instead of guessing ownership.
+		return nil
+	}
 	cleanupOpts := &workflow.DestroyContext{
 		BaseWorkflowInfo: workflow.BaseWorkflowInfo{
 			SandboxID:  result.SandboxID,
@@ -977,7 +989,7 @@ func (l *local) cleanupCreateResult(ctx context.Context, result *StorageInfo) er
 // its own (cross-node import or same-node S3 pause-resume clone) rather
 // than pointing at the package's shared image.
 func (l *local) prefetchRestoreMemoryVolURL(ctx context.Context, opts *workflow.CreateContext) (string, string, error) {
-	if opts == nil || opts.ReqInfo == nil || opts.IsCreateSnapshot() {
+	if opts == nil || opts.ReqInfo == nil || opts.IsCreateSnapshot() || opts.IsColdRecreate() {
 		return "", "", nil
 	}
 	// Emptydir / file pools do not use the cubecow snapshot catalog.
@@ -1476,6 +1488,13 @@ func (l *local) dealDefaultMedium(ctx context.Context, opts *workflow.CreateCont
 			log.G(ctx).Errorf("allocate storage fail:%v", err)
 			return ret.Errorf(errorcode.ErrorCode_CreateStorageFailed, "allocate storage fail:%v", err)
 		}
+		// A default-medium volume minted here is a fresh image: no template and
+		// no selected snapshot produced it. Record that ownership class, so
+		// recovery admission can name this cohort from authoritative records
+		// instead of requiring a LocalRunTemplate the S3 backend cannot create.
+		if storageBackendFromInfo(result) == cow.BackendS3 {
+			result.OwnershipMode = OwnershipModeFreshImageS3
+		}
 		result.Volumes[name] = newDefaultMediumBackendInfo(name, volume.FilePath, size, sizes, volume)
 		return nil
 	}
@@ -1516,6 +1535,9 @@ func (l *local) getDevInfo(ctx context.Context, q resource.Quantity) (*devInfo, 
 func (l *local) Destroy(ctx context.Context, opts *workflow.DestroyContext) (err error) {
 	if opts == nil {
 		return ret.Err(errorcode.ErrorCode_InvalidParamFormat, "workflow.DestroyContext nil")
+	}
+	if workflow.PreserveRestoreStorage(ctx) {
+		return fmt.Errorf("restore storage retained: attempt ownership is unproven; explicit reconciled Destroy required")
 	}
 	log.G(ctx).Debugf("Destroy doing")
 	start := time.Now()
@@ -1754,7 +1776,7 @@ func (l *local) readBackendFileInfoRaw(ctx context.Context, id string) (*Storage
 				return nil, utils.ErrorKeyNotFound
 			}
 		} else {
-			return nil, utils.ErrorKeyNotFound
+			return nil, err
 		}
 	}
 	bf := &StorageInfo{}
@@ -1917,7 +1939,8 @@ type BackendFileInfo struct {
 }
 
 type StorageInfo struct {
-	Namespace string
+	preserveOnCreateFailure bool
+	Namespace               string
 
 	SandboxID string
 	Volumes   map[string]*BackendFileInfo
@@ -1931,6 +1954,11 @@ type StorageInfo struct {
 	Backend      string    `json:"backend,omitempty"`
 	CreateAt     time.Time `json:"createAt,omitempty"`
 	UpdateAt     time.Time `json:"updateAt,omitempty"`
+
+	// OwnershipMode is the node-decided storage ownership class of this
+	// sandbox. Create writes it; no request field or annotation can set it.
+	// See OwnershipModeFreshImageS3 in source_fresh_image.go.
+	OwnershipMode string `json:"ownershipMode,omitempty"`
 
 	HostDirBackendInfos map[string]*HostDirBackendInfo `json:"hostDirBackendInfos,omitempty"`
 

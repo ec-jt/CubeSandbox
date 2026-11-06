@@ -79,6 +79,7 @@ use uevent::watch_uevents;
 
 pub mod passfd_io;
 mod rpc;
+mod retained_rootfs;
 mod tracer;
 
 const NAME: &str = "cube-agent";

@@ -37,6 +37,7 @@ import (
 	"github.com/tencentcloud/CubeSandbox/Cubelet/pkg/utils"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/plugins/cube/internals/cubes"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/plugins/workflow"
+	"github.com/tencentcloud/CubeSandbox/Cubelet/storage"
 	"github.com/tencentcloud/CubeSandbox/pkgs/CubeLog"
 	"github.com/tencentcloud/CubeSandbox/pkgs/proto/services/cubebox/v1"
 	"github.com/tencentcloud/CubeSandbox/pkgs/proto/services/errorcode/v1"
@@ -156,7 +157,7 @@ func init() {
 				config:                config,
 				events:                ep.(*exchange.Exchange),
 				numaNodeIndex:         0,
-				sandboxLifecycleLocks: utils.NewResourceLocks(),
+				sandboxLifecycleLocks: workflow.SandboxLifecycleLocks,
 				otherRuntime: &ociRuntime{
 					cubeboxMgr: cb,
 				},
@@ -237,10 +238,55 @@ func safePrint(req *cubebox.RunCubeSandboxRequest) string {
 }
 func (s *service) Create(ctx context.Context, req *cubebox.RunCubeSandboxRequest) (*cubebox.RunCubeSandboxResponse, error) {
 	rsp := &cubebox.RunCubeSandboxResponse{
-		RequestID: req.RequestID,
+		RequestID: req.GetRequestID(),
 		Ret:       &errorcode.Ret{RetCode: errorcode.ErrorCode_Success},
 		ExtInfo:   map[string][]byte{},
 	}
+
+	if err := validateColdRecreateRequest(req); err != nil {
+		rsp.Ret.RetCode = errorcode.ErrorCode_PreConditionFailed
+		rsp.Ret.RetMsg = err.Error()
+		return rsp, nil
+	}
+	// Set identity and lock before metadata import or package reads. This also
+	// covers normal snapshot creates, not only pause resume.
+	sid, idErr := createLifecycleSandboxID(req)
+	if idErr != nil {
+		rsp.Ret.RetCode = errorcode.ErrorCode_InvalidParamFormat
+		rsp.Ret.RetMsg = idErr.Error()
+		return rsp, nil
+	}
+	unlock, lockErr := s.sandboxLifecycleLocks.LockContext(ctx, sid)
+	if lockErr != nil {
+		rsp.Ret.RetCode = errorcode.ErrorCode_TaskStateInvalid
+		rsp.Ret.RetMsg = "sandbox lifecycle operation is in progress; retry Create"
+		return rsp, nil
+	}
+	defer unlock()
+	if err := workflow.SourceFences.Check(sid); err != nil {
+		rsp.Ret.RetCode = errorcode.ErrorCode_PreConditionFailed
+		rsp.Ret.RetMsg = err.Error()
+		return rsp, nil
+	}
+	// Reject an existing live runtime before importing, cloning or replacing
+	// storage. The later runtime-step check is too late for those effects.
+	if existing, err := s.cubeboxMgr.cubeboxManger.Get(ctx, sid); err == nil && existing != nil {
+		if existing.GetStatus() == nil || existing.GetStatus().Get().State() != cubebox.ContainerState_CONTAINER_PAUSED {
+			rsp.Ret.RetCode = errorcode.ErrorCode_PreConditionFailed
+			rsp.Ret.RetMsg = "sandbox already exists"
+			return rsp, nil
+		}
+	} else if err != nil && !errors.Is(err, utils.ErrorKeyNotFound) && !errors.Is(err, utils.ErrorBucketNotFound) {
+		rsp.Ret.RetCode = errorcode.ErrorCode_PreConditionFailed
+		rsp.Ret.RetMsg = err.Error()
+		return rsp, nil
+	}
+	if err := workflow.CheckCreateRuntimeOwnership(sid); err != nil {
+		rsp.Ret.RetCode = errorcode.ErrorCode_PreConditionFailed
+		rsp.Ret.RetMsg = err.Error()
+		return rsp, nil
+	}
+	ctx = workflow.BeginSandboxLifecycle(ctx, sid)
 
 	for _, box := range s.listCubeboxes() {
 		if box.ID == strings.TrimSpace(req.GetAnnotations()[constants.MasterAnnotationDesiredSandboxID]) {
@@ -268,6 +314,15 @@ func (s *service) Create(ctx context.Context, req *cubebox.RunCubeSandboxRequest
 	}
 	// Cross-node restore: the disk describing what to run is not on this
 	// node yet, and the reads below expect it.
+	if isCrossNodeRestore(req.GetAnnotations()) {
+		retentionCtx, err := storage.WithRestoreRetentionAttempt(ctx)
+		if err != nil {
+			rsp.Ret.RetMsg = err.Error()
+			rsp.Ret.RetCode = errorcode.ErrorCode_CreateStorageFailed
+			return rsp, nil
+		}
+		ctx = retentionCtx
+	}
 	if err := prepareCrossNodeRestore(ctx, req); err != nil {
 		rsp.Ret.RetMsg = err.Error()
 		rsp.Ret.RetCode = errorcode.ErrorCode_CreateStorageFailed
@@ -279,16 +334,6 @@ func (s *service) Create(ctx context.Context, req *cubebox.RunCubeSandboxRequest
 		rsp.Ret.RetMsg = err.Error()
 		rsp.Ret.RetCode = errorcode.ErrorCode_InvalidParamFormat
 		return rsp, nil
-	}
-	// Serialize Create-from-pause with Pause/Destroy (same per-sandbox lock).
-	if sid := resumeFromPauseSandboxID(req); sid != "" {
-		unlock, lockErr := s.sandboxLifecycleLocks.LockContext(ctx, sid)
-		if lockErr != nil {
-			rsp.Ret.RetMsg = "sandbox lifecycle operation is in progress; retry Resume after 2 seconds"
-			rsp.Ret.RetCode = errorcode.ErrorCode_TaskStateInvalid
-			return rsp, nil
-		}
-		defer unlock()
 	}
 	if err := checkParam(ctx, req); err != nil {
 		rerr, _ := ret.FromError(err)
@@ -385,7 +430,7 @@ func (s *service) Create(ctx context.Context, req *cubebox.RunCubeSandboxRequest
 		createErr = s.engine.Create(ctx, createInfo)
 	} else {
 
-		createInfo.SandboxID = utils.GenerateID()
+		createInfo.SandboxID = sid
 		createErr = s.otherRuntime.Create(ctx, createInfo)
 	}
 
@@ -430,6 +475,14 @@ func setCubeExtKey(rsp *cubebox.RunCubeSandboxResponse, createInfo *workflow.Cre
 	// so the net node transition is zero and nothing should be reported.
 	if !ret.IsSuccessCode(rsp.GetRet().GetRetCode()) {
 		return
+	}
+	if createInfo.IsColdRecreate() {
+		if rsp.ExtInfo == nil {
+			rsp.ExtInfo = map[string][]byte{}
+		}
+		rsp.ExtInfo["recreate_mode"] = []byte("cold_retained_disk")
+		rsp.ExtInfo["process_state"] = []byte("discarded")
+		rsp.ExtInfo["retained_source_snapshot"] = []byte(createInfo.ReqInfo.GetAnnotations()[constants.MasterAnnotationPauseSnapshotID])
 	}
 	if data := marshalVolumeRefEvents(createInfo.VolumeRefEvents); data != nil {
 		if rsp.ExtInfo == nil {
@@ -634,6 +687,35 @@ func (s *service) Destroy(ctx context.Context, req *cubebox.DestroyCubeSandboxRe
 		return rsp, nil
 	}
 
+	lockDeadline, ok := deleteLifecycleLockDeadline(ctx, time.Now())
+	if !ok {
+		rsp.Ret.RetCode = errorcode.ErrorCode_TaskStateInvalid
+		rsp.Ret.RetMsg = "insufficient time for delete; retry DELETE"
+		return rsp, nil
+	}
+	lockCtx, lockCancel := context.WithDeadline(ctx, lockDeadline)
+	defer lockCancel()
+	unlock, lockErr := s.sandboxLifecycleLocks.LockContext(lockCtx, req.SandboxID)
+	if lockErr != nil {
+		rsp.Ret.RetCode = errorcode.ErrorCode_TaskStateInvalid
+		rsp.Ret.RetMsg = "sandbox lifecycle operation is in progress; retry DELETE after 2 seconds"
+		return rsp, nil
+	}
+	defer unlock()
+	if err := workflow.SourceFences.Check(req.SandboxID); err != nil {
+		rsp.Ret.RetCode = errorcode.ErrorCode_PreConditionFailed
+		rsp.Ret.RetMsg = err.Error()
+		return rsp, nil
+	}
+	ctx = workflow.ContinueSandboxLifecycle(ctx, req.SandboxID)
+	// Never-started evidence covers only the failed attempt, not any disks
+	// it reused. Require runtime reconciliation before explicit deletion there.
+	evidence := workflow.LifecycleCleanupFrom(ctx)
+	if evidence.PreserveStorage && !evidence.RuntimeGone {
+		evidence.NeverStarted = false
+	}
+	evidence.PreserveStorage = false
+
 	ns := namespaces.Default
 	sb, getErr := s.cubeboxMgr.cubeboxManger.Get(ctx, req.SandboxID)
 	if getErr == nil {
@@ -667,9 +749,7 @@ func (s *service) Destroy(ctx context.Context, req *cubebox.DestroyCubeSandboxRe
 			ctx = constants.WithCollectMemory(ctx)
 		}
 		if set := req.GetAnnotations()["cube.debug.cleanup"]; set == "true" {
-			// Preserve the existing debug-cleanup contract: it marks the sandbox
-			// before the early return and is not subject to the normal destroy
-			// deadline or lifecycle lock.
+			// Debug cleanup shares the lifecycle lock and operation evidence.
 			if getErr == nil && sb.UserMarkDeletedTime == nil {
 				now := time.Now()
 				sb.UserMarkDeletedTime = &now
@@ -697,29 +777,6 @@ func (s *service) Destroy(ctx context.Context, req *cubebox.DestroyCubeSandboxRe
 	destroyCtx := ctx
 	sb, ctx, getErr = s.loadDestroySandboxRuntime(destroyCtx, req.SandboxID)
 	ctx = log.WithLogger(ctx, stepLog)
-
-	if getErr == nil && constants.IsCubeRuntime(ctx) {
-		// Serialize Destroy with Pause/Resume. CoW Pause already exited the shim;
-		// Destroy never wakes a paused sandbox (no resume-before-delete).
-		lockDeadline, ok := deleteLifecycleLockDeadline(ctx, time.Now())
-		if !ok {
-			rsp.Ret.RetMsg = "cannot start delete: insufficient time remains for the Cubelet RPC response; retry DELETE after 5 seconds"
-			rsp.Ret.RetCode = errorcode.ErrorCode_TaskStateInvalid
-			return rsp, nil
-		}
-		lockCtx, lockCancel := context.WithDeadline(ctx, lockDeadline)
-		defer lockCancel()
-		unlock, lockErr := s.sandboxLifecycleLocks.LockContext(lockCtx, req.SandboxID)
-		if lockErr != nil {
-			rsp.Ret.RetMsg = "sandbox lifecycle operation is in progress; retry DELETE after 2 seconds"
-			rsp.Ret.RetCode = errorcode.ErrorCode_TaskStateInvalid
-			return rsp, nil
-		}
-		defer unlock()
-
-		sb, ctx, getErr = s.loadDestroySandboxRuntime(destroyCtx, req.SandboxID)
-		ctx = log.WithLogger(ctx, stepLog)
-	}
 
 	if getErr == nil {
 		// Marker-before-destroy for storage CDP hooks. Pause keep-tombstone
@@ -1117,6 +1174,9 @@ func scanDeadContainer(ctx context.Context, dc []*cubeboxstore.CubeBox, client *
 		stepLog := log.G(ctx).WithFields(CubeLog.Fields{
 			string(CubeLog.KeyInstanceId): cb.ID,
 		})
+		if workflow.SourceFences.Check(cb.ID) != nil {
+			continue
+		}
 		if cb.GetPublicationHold() != nil {
 			continue
 		}

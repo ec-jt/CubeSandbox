@@ -1495,7 +1495,9 @@ func snapshotCreateRequestMatches(raw, requestID, sandboxID, nodeID, nodeIP, dis
 
 func snapshotRollbackRequestMatches(raw, requestID, sandboxID, snapshotID string) bool {
 	if strings.TrimSpace(raw) == "" {
-		return true
+		// A legacy job without a durable payload is not evidence that this
+		// caller selected the same checkpoint. Require reconciliation.
+		return false
 	}
 	var existing snapshotRollbackJobRequest
 	if err := json.Unmarshal([]byte(raw), &existing); err != nil {

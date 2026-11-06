@@ -114,9 +114,10 @@ func TestUploadSnapshotExportsRealUUIDs(t *testing.T) {
 	require.Equal(t, "export-tpl-snap-1-memory", uuids.Memory)
 	require.Equal(t, []string{"tpl-snap-1-rootfs", "tpl-snap-1-memory"}, engine.exportSnapshots)
 
+	engine.volumeInfos["tpl-snap-1-memory"].ExportStatus = cow.ExportStatusInProgress
 	st, err = SnapshotUploadStatus(context.Background(), cow.BackendS3, "snap-1")
 	require.NoError(t, err)
-	// Volumes exist but export_status is empty → still running until DONE.
+	// The last role is accepted but does not have to finish inside Upload.
 	require.Equal(t, cow.RemoteStateRunning, st.State)
 	require.Equal(t, "snap-1", st.SnapshotID)
 	require.Equal(t, uuids.Rootfs, st.RemoteUUIDs.Rootfs)

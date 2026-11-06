@@ -96,7 +96,7 @@ func (s *Store) PublishDelete(ctx context.Context, sandboxID string) {
 // Only the two terminal states are broadcast — transition markers
 // ("pausing", "resuming") stay private to the CLM. Invalid values are
 // warned and dropped rather than propagated.
-func (s *Store) PublishState(ctx context.Context, sandboxID, state, source string) {
+func (s *Store) PublishState(ctx context.Context, sandboxID, state, source string, requestID ...string) {
 	if s == nil || !s.enabled.Load() || s.doer == nil || sandboxID == "" {
 		return
 	}
@@ -105,10 +105,15 @@ func (s *Store) PublishState(ctx context.Context, sandboxID, state, source strin
 			sandboxID, state)
 		return
 	}
+	rid := ""
+	if len(requestID) > 0 {
+		rid = requestID[0]
+	}
 	payload, err := json.Marshal(StatePayload{
-		State:  state,
-		Actor:  ActorCubeMaster,
-		Source: source,
+		RequestID: rid,
+		State:     state,
+		Actor:     ActorCubeMaster,
+		Source:    source,
 	})
 	if err != nil {
 		log.G(ctx).Warnf("lifecycle: marshal state payload sandbox=%s: %v", sandboxID, err)

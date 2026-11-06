@@ -307,6 +307,15 @@ impl Utils {
     }
 
     pub fn clean_sandbox_resource(sandbox_id: &String) -> CResult<()> {
+        let retention = crate::common::retained::Guard::host()?;
+        Self::clean_sandbox_resource_guarded(sandbox_id, &retention)
+    }
+
+    pub(crate) fn clean_sandbox_resource_guarded(
+        sandbox_id: &String,
+        retention: &crate::common::retained::Guard,
+    ) -> CResult<()> {
+        retention.require_absent(sandbox_id)?;
         //delete vmm workdir
         let vm_dir = PathBuf::from(VM_PATH).join(sandbox_id);
         let ret_vmdir: Result<(), String> = match fs::remove_dir_all(&vm_dir) {
@@ -345,7 +354,7 @@ impl Utils {
         // /data/log/template and never create this dir, so this is a no-op
         // for app_snapshot_create. Task.Delete on a live shim is not enough:
         // after a crash containerd reaps via the delete subcommand.
-        let ret_logdir = crate::container::remove_sandbox_log_dir_sync(sandbox_id);
+        let ret_logdir = crate::container::remove_sandbox_log_dir_unchecked(sandbox_id);
 
         let mut err_msg = String::new();
         if let Err(e) = ret_vmdir {

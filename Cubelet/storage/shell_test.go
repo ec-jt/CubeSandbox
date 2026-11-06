@@ -157,3 +157,29 @@ func TestDescribeStorageFailure_Format(t *testing.T) {
 	assert.Truef(t, strings.HasSuffix(got, "B]"),
 		"suffix: %q", got)
 }
+
+func TestInitExt4RegularFileWithoutMount(t *testing.T) {
+	file := filepath.Join(t.TempDir(), "volume.ext4")
+	f, err := os.Create(file)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Truncate(16 * 1024 * 1024); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := initExt4BlockDevice(file); err != nil {
+		t.Fatal(err)
+	}
+	for _, dir := range []string{emptyDirInnerSourcePath, "containerd"} {
+		out, stderr, err := utils.ExecV([]string{"debugfs", "-R", "stat /" + dir, file}, 3*time.Second)
+		if err != nil {
+			t.Fatalf("debugfs: %s: %v", stderr, err)
+		}
+		if !strings.Contains(out, "Type: directory") {
+			t.Fatalf("missing %s: %s %s", dir, out, stderr)
+		}
+	}
+}

@@ -138,8 +138,16 @@ func (e *cubeboxInstancePlugin) CreateSandbox(ctx context.Context, flowOpts *wor
 	specOpts = append(specOpts, replaceDevMounts()...)
 	realReq := flowOpts.ReqInfo
 
-	for _, c := range realReq.Containers {
+	for index, c := range realReq.Containers {
 		if c.GetImage().GetStorageMedia() == cubeimages.ImageStorageMediaType_ext4.String() {
+			if flowOpts.IsColdRecreate() || os.Getenv("CUBELET_ENABLE_RETAINED_DISK_COLD_RECREATE") == "true" {
+				if err := e.bindRetainedLower(c, flowOpts.IsColdRecreate()); err != nil {
+					return nil, err
+				}
+				if index == 0 {
+					specOpts = append(specOpts, oci.WithAnnotations(map[string]string{workflow.RetainedLowerSHA256: c.Annotations[workflow.RetainedLowerSHA256]}))
+				}
+			}
 			specOpts = append(specOpts, e.genPmemOpt(ctx, c.GetImage().GetImage()))
 		}
 	}
@@ -179,7 +187,7 @@ func (e *cubeboxInstancePlugin) CreateSandbox(ctx context.Context, flowOpts *wor
 		}
 		specOpts = append(specOpts, oci.WithAnnotations(virtiofsAnnotations))
 
-	} else if templateID, ok := flowOpts.GetSnapshotTemplateID(); ok {
+	} else if templateID, ok := flowOpts.GetSnapshotTemplateID(); ok && !flowOpts.IsColdRecreate() {
 
 		var snapBasePath, snapSpecPath string
 
@@ -353,6 +361,16 @@ func (e *cubeboxInstancePlugin) CreateSandbox(ctx context.Context, flowOpts *wor
 
 func (e *cubeboxInstancePlugin) CreateContainer(ctx context.Context, cubeBox *cubeboxstore.CubeBox, c *cubeboxstore.Container) ([]oci.SpecOpts, error) {
 	var specOpts []oci.SpecOpts
+	flow := workflow.GetCreateContext(ctx)
+	if c.Config.GetImage().GetStorageMedia() == cubeimages.ImageStorageMediaType_ext4.String() &&
+		((flow != nil && flow.IsColdRecreate()) || os.Getenv("CUBELET_ENABLE_RETAINED_DISK_COLD_RECREATE") == "true") {
+		if err := e.bindRetainedLower(c.Config, flow != nil && flow.IsColdRecreate()); err != nil {
+			return nil, err
+		}
+	}
+	if digest := c.Config.GetAnnotations()[workflow.RetainedLowerSHA256]; digest != "" {
+		specOpts = append(specOpts, oci.WithAnnotations(map[string]string{workflow.RetainedLowerSHA256: digest}))
+	}
 	if cubeBox.InstanceType != e.config.instanceType {
 		return specOpts, nil
 	}
@@ -367,7 +385,7 @@ func (e *cubeboxInstancePlugin) CreateContainer(ctx context.Context, cubeBox *cu
 
 				constants.AnnotationPropagationContainerMounts: virtiofs.GenPropagationContainerDirs(),
 			}))
-		} else if templateID, ok := flowOpts.GetSnapshotTemplateID(); ok {
+		} else if templateID, ok := flowOpts.GetSnapshotTemplateID(); ok && !flowOpts.IsColdRecreate() {
 
 			snapshotContainerID := templateID
 			if innerIndex, ok := ctx.Value(constants.KCubeIndexContext).(string); ok {
@@ -532,6 +550,16 @@ func (e *cubeboxInstancePlugin) resolveSnapshotRuntimeArtifacts(
 
 	if kernelPath == "" {
 		kernelPath = strings.TrimSpace(cfg.Payload.Kernel)
+	}
+	if imagePath == "" {
+		// Current snapshots separate the guest OS from business rootfs PMEMs.
+		// Match CubeShim's HYP_OS_IMAGE_ID before the legacy image prefix.
+		for _, p := range cfg.Pmem {
+			if p.ID == "pmem-cube-os-image" && strings.TrimSpace(p.File) != "" {
+				imagePath = strings.TrimSpace(p.File)
+				break
+			}
+		}
 	}
 	if imagePath == "" {
 		for _, p := range cfg.Pmem {

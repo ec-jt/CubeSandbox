@@ -72,6 +72,16 @@ typedef void (*s3_get_cb)(void *cb_arg, uint64_t bytes_read, int status);
  * Process-level CRT initialisation. Called once at SPDK subsystem init.
  * Creates the event_loop_group / host_resolver / client_bootstrap / tls_ctx
  * internally and hooks the aws_allocator onto SPDK's memory pool.
+ *
+ * S3LVOL_PUT_IF_MATCH_BARE_ETAG: unset or "0" preserves conditional PUT
+ * ETags verbatim (default). "1" removes one surrounding strong-ETag quote
+ * pair from the outgoing If-Match only, for explicitly qualified backends.
+ * Other values fail initialization with -EINVAL. The mode is frozen until
+ * global fini, applies to ALL pooled clients, and ignores later environment
+ * changes. Do not mix endpoints requiring different formats in one process.
+ * No hostname detection, format-switch retry, or unconditional fallback.
+ * Returned/stored ETags and conditional DELETE are unchanged. Strict owner
+ * capability probing remains mandatory and is not bypassed by this setting.
  */
 int s3_crt_global_init(uint32_t event_loop_threads);
 
@@ -80,9 +90,9 @@ void s3_crt_global_fini(void);
 /**
  * Create (or reuse from the pool) an S3 client.
  *
- * Clients are pooled by **endpoint** and are independent of bucket
- * -- lvstores pointing at the same endpoint with different
- * buckets share one aws_s3_client. A refcnt is maintained internally,
+ * Clients are pooled by endpoint, bucket and path style. PUT ETag wire mode
+ * is process-wide and frozen at global initialization, not a target setting.
+ * A refcnt is maintained internally,
  * decremented on detach, and only at zero is the client really destroyed.
  */
 int s3_client_get_or_create(const struct s3_target *target, struct s3_client **out);
@@ -103,6 +113,14 @@ void s3_client_get(struct s3_client *client);
  * separately; this is the destination.
  */
 const char *s3_client_bucket(const struct s3_client *client);
+
+/**
+ * Endpoint this client was created for. Used by the strict-ownership
+ * capability record so a result probed against one endpoint can never be
+ * reused against another (see s3_owner.h). Never NULL; empty for a client
+ * created without one.
+ */
+const char *s3_client_endpoint(const struct s3_client *client);
 
 /* ==========================================================================
  * Object operations
@@ -128,6 +146,24 @@ int s3_get_range(struct s3_client *client, const char *key,
 		 s3_get_cb cb, void *cb_arg);
 
 /**
+ * As s3_get_range(), but also returns the object's ETag from the response.
+ *
+ * The ETag is what makes a later conditional DELETE meaningful ("delete only
+ * the exact version I read"). It is copied into \c etag_out as a NUL-terminated
+ * string including the surrounding quotes, exactly as the server sent it.
+ * \c etag_out is set to "" when the response carried no ETag or the request
+ * failed, so a caller that needs one must test for an empty string rather than
+ * assume it.
+ *
+ * \param etag_out  may be NULL; otherwise must stay alive until the callback
+ * \param etag_len  capacity of \c etag_out, including the NUL
+ */
+int s3_get_range_ex(struct s3_client *client, const char *key,
+		    uint64_t offset, uint64_t len, void *buf,
+		    char *etag_out, size_t etag_len,
+		    s3_get_cb cb, void *cb_arg);
+
+/**
  * Write an object. Internally uses CRT's auto-MPU; large objects are uploaded
  * in multiple parts automatically.
  *
@@ -135,22 +171,49 @@ int s3_get_range(struct s3_client *client, const char *key,
  * \param if_none_match  when true, adds `If-None-Match: *`, i.e. "write only if
  *               the key does not exist". A rejection returns -EEXIST.
  *
- *   **Do not treat this as a mutual-exclusion mechanism.** It is a
- *   "nice to have" extra check, not a correctness dependency:
- *   - Tencent COS is measured to **ignore the header outright**: it returns
- *     200 for an existing key and overwrites the object (CRT trace confirmed
- *     the header made it into the request and SigV4 SignedHeaders; the server
- *     just does not support it). AWS S3 only returns 412 since 2024-11.
- *   - Object uniqueness is guaranteed by **naming**: blobstore names carry a
- *     uuid attribute, so simultaneous creation on different nodes cannot
- *     collide.
+ *   The data path (chunks, checkpoints) must **not** treat this as a
+ *   mutual-exclusion mechanism. Object uniqueness there is guaranteed by
+ *   naming: blobstore names carry a uuid attribute, so simultaneous creation
+ *   on different nodes cannot collide. A caller in that path passing
+ *   if_none_match=true must tolerate a return of 0 and must not infer "I am
+ *   the first creator" from it, because Tencent COS is measured to ignore the
+ *   header outright (200 for an existing key; CRT trace confirmed the header
+ *   reached the server) and AWS S3 only returns 412 since 2024-11.
  *
- *   So a caller passing if_none_match=true **must tolerate a return of 0** and
- *   must not infer "I am the first creator" from it.
+ *   Ownership (`s3_owner.c` strict mode) is the one caller allowed to depend
+ *   on it, and only after `s3_owner_probe()` has proved against the actual
+ *   endpoint, bucket and prefix that a duplicate conditional PUT is rejected
+ *   with the original bytes left unchanged. Without that probe the strict path
+ *   is refused with -ENOTSUP; it never falls back to treating 0 as a win.
  */
 int s3_put(struct s3_client *client, const char *key,
 	   struct iovec *iov, int iovcnt, bool if_none_match,
 	   s3_op_cb cb, void *cb_arg);
+
+/**
+ * Replace an object only if it is still the version named by \c etag
+ * (`PUT` with `If-Match: <etag>`), i.e. a compare-and-swap on the whole object.
+ *
+ * A rejected precondition maps to -EEXIST (412) or -EBUSY (409), and -ENOENT
+ * when the object no longer exists; the object is then untouched. A backend
+ * that ignores `If-Match` on PUT returns 0 and overwrites anyway, so strict
+ * ownership only relies on this after `s3_owner_probe()` has proved, against
+ * the actual endpoint/bucket/prefix, that a wrong and a stale ETag are both
+ * rejected with the stored bytes unchanged.
+ *
+ * The data path must not use this: it is the strict-ownership marker
+ * primitive only.
+ *
+ * \param etag  one strong quoted or bare ETag, at most 127 bytes including
+ *              quotes. Empty/NULL, wildcard, weak, list, malformed, whitespace,
+ *              non-ASCII or control-containing values return -EINVAL; oversized
+ *              values return -ENAMETOOLONG. No request is submitted on error.
+ *              Valid input is copied unchanged unless the global bare-PUT mode
+ *              removes its outer quotes. The caller's ETag is never modified.
+ */
+int s3_put_if_match(struct s3_client *client, const char *key,
+		    struct iovec *iov, int iovcnt, const char *etag,
+		    s3_op_cb cb, void *cb_arg);
 
 /**
  * Query whether an object exists and its size.
@@ -181,6 +244,22 @@ int s3_head(struct s3_client *client, const char *key,
  */
 int s3_delete(struct s3_client *client, const char *key,
 	      s3_op_cb cb, void *cb_arg);
+
+/**
+ * Delete an object only if it is still the version named by \c etag
+ * (`If-Match`). This is the conditional release primitive used by strict
+ * ownership: without it a retried DELETE could remove a marker that a new
+ * owner wrote after the first attempt succeeded (ABA).
+ *
+ * A rejected precondition maps to -EEXIST (412) or -EBUSY (409); the object is
+ * then untouched. A backend that does not implement `If-Match` returns 0 and
+ * deletes the object anyway, which is why strict mode probes this capability
+ * before relying on it and fails closed when it is absent.
+ *
+ * \param etag  the quoted ETag from s3_get_range_ex(); must outlive the call
+ */
+int s3_delete_if_match(struct s3_client *client, const char *key,
+		       const char *etag, s3_op_cb cb, void *cb_arg);
 
 /**
  * Batch delete. Used by GC.

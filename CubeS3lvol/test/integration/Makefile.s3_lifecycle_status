@@ -1,0 +1,9 @@
+include $(WORK)/test/integration/Makefile.s3_lvstore_deadline
+# Link the existing JSON library, not a mocked writer. No dependency rebuild.
+JSON = $(WORK)/deps/spdk/build/lib/libspdk_json.a $(WORK)/deps/spdk/build/lib/libspdk_util.a
+lifecycle:
+	$(CC) $(BASE) -Wno-unused-function -DDEBUG $(WORK)/test/integration/s3_lifecycle_status_test.c $(JSON) -luuid -Wl,--gc-sections -o $(OUT)/lifecycle-debug
+	$(CC) $(BASE) -Wno-unused-function -DNDEBUG $(WORK)/test/integration/s3_lifecycle_status_test.c $(JSON) -luuid -Wl,--gc-sections -o $(OUT)/lifecycle-release
+objects:
+	$(CC) $(BASE) -DNDEBUG -c $(WORK)/module/bdev/s3lvol/vbdev_s3lvol_lvstore.c -o $(OUT)/vbdev_s3lvol_lvstore.o
+	$(CC) $(BASE) -DNDEBUG -c $(WORK)/module/bdev/s3lvol/vbdev_s3lvol_rpc.c -o $(OUT)/vbdev_s3lvol_rpc.o

@@ -68,7 +68,8 @@ func run() error {
 	defer func() { _ = rdb.Close() }()
 
 	stream := redisstream.New(rdb, logger.Named("redis"))
-	masterClient := cubemasterclient.New(cfg.CubeMasterURL, cfg.HTTPTimeout)
+	masterClient := cubemasterclient.New(cfg.CubeMasterURL, cfg.HTTPTimeout).
+		WithAuth(cfg.CubeMasterUserID, cfg.CubeMasterSecretKey)
 	reg := registry.New()
 
 	// The eventbus carries best-effort cross-replica wakeup hints. Redis
@@ -379,8 +380,19 @@ func replayRegistryTo(ctx context.Context, push *proxypush.Client, states map[st
 				zap.String("sandbox_id", e.Meta.SandboxID), zap.Error(err))
 			continue
 		}
-		state := resolvePromotionState(e.RuntimeState, states[e.Meta.SandboxID])
-		if state == lifecycle.StatePaused || state == lifecycle.StateRunning {
+		current := reg.Get(e.Meta.SandboxID)
+		if current == nil {
+			_ = push.DeleteMeta(ctx, e.Meta.SandboxID)
+			continue
+		}
+		state := resolvePromotionState(current.RuntimeState, states[e.Meta.SandboxID])
+		// The captured replay map can predate an event applied during hydration.
+		// A conservative paused replay invokes Master rather than routing to a
+		// potentially stopped guest. Never replace a captured transition marker.
+		if current.RuntimeState == lifecycle.StatePaused && state == lifecycle.StateRunning {
+			state = lifecycle.StatePaused
+		}
+		if state != "" {
 			if err := push.SetStateTo(ctx, ep.AdminURL, e.Meta.SandboxID, state); err != nil {
 				failed++
 				log.Warn("replay state push failed",
@@ -503,17 +515,15 @@ func catchUpGeneration(ctx context.Context, generation uint64, lease *leader.Lea
 // Shared markers (pausing/resuming/killing/killed) return empty so the
 // in-flight owner keeps the key.
 func resolvePromotionState(local, shared string) string {
-	switch shared {
-	case "pausing", "resuming", "killing", lifecycle.StateKilled:
-		return ""
-	}
-	if local == "" {
+	// Shared state includes active ownership and is fresher than a warm replica.
+	// Missing shared state is never proof of running.
+	if shared != "" {
 		return shared
 	}
-	if shared == "" || local == shared {
+	if local == lifecycle.StatePaused {
 		return local
 	}
-	return lifecycle.StatePaused
+	return redisstream.UnknownState
 }
 
 func loadSharedStates(
@@ -553,7 +563,11 @@ func reconcileSharedState(
 	ttl time.Duration, log *zap.Logger,
 ) (map[string]string, error) {
 	entries := reg.Snapshot()
-	shared, err := loadSharedStates(ctx, stream, entries)
+	ids := make([]string, 0, len(entries))
+	for _, e := range entries {
+		ids = append(ids, e.Meta.SandboxID)
+	}
+	shared, err := stream.RecoverStates(ctx, ids)
 	if err != nil {
 		return nil, err
 	}
@@ -561,7 +575,7 @@ func reconcileSharedState(
 	for _, e := range entries {
 		sid := e.Meta.SandboxID
 		from, next := shared[sid], resolved[sid]
-		if next == "" || next == from {
+		if next == "" || next == "pausing" || next == "resuming" || next == "killing" || next == lifecycle.StateKilled {
 			continue
 		}
 		updated, err := stream.WriteStateCAS(ctx, sid, from, next, ttl)
@@ -633,10 +647,19 @@ func bootstrapRegistry(ctx context.Context, stream *redisstream.Client,
 	if err != nil {
 		return err
 	}
+	ids := make([]string, 0, len(metas))
+	for id := range metas {
+		ids = append(ids, id)
+	}
+	states, err := stream.RecoverStates(ctx, ids)
+	if err != nil {
+		return err
+	}
 	reg.Reset()
 	for _, m := range metas {
 		reg.Upsert(m)
 		reg.SetFirstSeenAt(m.SandboxID, startupTs)
+		reg.SetRuntimeState(m.SandboxID, states[m.SandboxID])
 	}
 	log.Info("bootstrap complete", zap.Int("entries", len(metas)))
 	return nil
@@ -724,9 +747,7 @@ func rebuildRegistryAfterTrim(ctx context.Context, stream *redisstream.Client,
 		if p.lastActive > 0 {
 			reg.MergeLastActive(sid, p.lastActive)
 		}
-		if p.runtime != "" {
-			reg.SetRuntimeState(sid, p.runtime)
-		}
+		// Recovered shared/history state supersedes the pre-gap local value.
 	}
 	progress.Reset(cursor)
 	return nil
@@ -755,6 +776,13 @@ func handleEvent(ctx context.Context, ev redisstream.Event, push *proxypush.Clie
 			return
 		}
 		reg.Upsert(*ev.Meta)
+		reg.SetRuntimeState(ev.SandboxID, lifecycle.StateRunning)
+		if canWrite {
+			// Creation is evidence of running, but must not overwrite later ownership.
+			if _, err := ssDeps.Redis.WriteStateCAS(ctx, ev.SandboxID, "", lifecycle.StateRunning, 0); err != nil {
+				log.Warn("create state write failed", zap.Error(err))
+			}
+		}
 		// Log every create at info level: this is the heartbeat that
 		// proves CubeMaster -> Redis -> CLM is wired correctly. The
 		// volume is bounded by sandbox creation rate (≪ QPS) so this is
@@ -773,6 +801,13 @@ func handleEvent(ctx context.Context, ev redisstream.Event, push *proxypush.Clie
 		}
 	case lifecycle.OpDelete:
 		reg.Delete(ev.SandboxID)
+		if cleaner, ok := ssDeps.Redis.(interface {
+			ClearState(context.Context, string) error
+		}); ok {
+			if err := cleaner.ClearState(ctx, ev.SandboxID); err != nil {
+				log.Warn("delete state cleanup failed", zap.Error(err))
+			}
+		}
 		log.Info("delete event applied",
 			zap.String("sandbox_id", ev.SandboxID),
 			zap.Int("registry_size", reg.Len()))

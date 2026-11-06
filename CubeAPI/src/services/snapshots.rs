@@ -170,8 +170,9 @@ impl SnapshotService {
         sandbox_id: &str,
         snapshot_id: &str,
         backend: Option<String>,
+        request_id: Option<String>,
     ) -> AppResult<RollbackResponse> {
-        let req_id = new_request_id();
+        let req_id = rollback_request_id(request_id)?;
         let req = MasterRollbackRequest {
             request_id: req_id.clone(),
             snapshot_id: snapshot_id.to_string(),
@@ -193,10 +194,14 @@ impl SnapshotService {
                 })?;
                 let status =
                     ensure_operation_ready(resp.status(), "snapshot rollback", snapshot_id)?;
+                // Do not echo the caller token as pretend evidence. It must be
+                // returned by the Master job route, with exact resource binding.
+                ensure_rollback_binding(&resp, &req_id, sandbox_id, snapshot_id)?;
 
                 Ok(RollbackResponse {
-                    sandbox_id: owned_or_fallback(resp.sandbox_id, sandbox_id),
-                    snapshot_id: owned_or_fallback(resp.snapshot_id, snapshot_id),
+                    request_id: resp.request_id,
+                    sandbox_id: resp.operation.as_ref().unwrap().sandbox_id.clone(),
+                    snapshot_id: resp.operation.as_ref().unwrap().snapshot_id.clone(),
                     operation_id,
                     status,
                 })
@@ -213,6 +218,36 @@ impl SnapshotService {
 
 fn new_request_id() -> String {
     Uuid::new_v4().to_string()
+}
+
+fn rollback_request_id(value: Option<String>) -> AppResult<String> {
+    match value {
+        None => Ok(new_request_id()),
+        Some(value) => match Uuid::parse_str(&value) {
+            Ok(id) if id.to_string() == value => Ok(value),
+            _ => Err(AppError::BadRequest("requestID must be a canonical UUID".into())),
+        },
+    }
+}
+
+fn ensure_rollback_binding(
+    receipt: &crate::cubemaster::RollbackResponse,
+    request_id: &str,
+    sandbox_id: &str,
+    snapshot_id: &str,
+) -> AppResult<()> {
+    let job = receipt.operation.as_ref()
+        .ok_or_else(|| internal_error("rollback receipt has no Master job"))?;
+    if receipt.request_id != request_id || job.request_id != request_id
+        || job.sandbox_id != sandbox_id || job.snapshot_id != snapshot_id
+        || job.operation_id.trim().is_empty() || job.status != "READY"
+        || (!receipt.sandbox_id.is_empty() && receipt.sandbox_id != job.sandbox_id)
+        || (!receipt.snapshot_id.is_empty() && receipt.snapshot_id != job.snapshot_id)
+        || (!receipt.operation_id.is_empty() && receipt.operation_id != job.operation_id)
+    {
+        return Err(internal_error("rollback receipt identity mismatch"));
+    }
+    Ok(())
 }
 
 /// Normalise a pagination cursor coming from the request URL.  CubeMaster
@@ -389,6 +424,42 @@ fn owned_or_fallback(value: String, fallback: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rollback_operation_id_is_preserved_or_rejected_never_replaced() {
+        let token = "01234567-89ab-cdef-0123-456789abcdef";
+        assert_eq!(rollback_request_id(Some(token.into())).unwrap(), token);
+        for invalid in ["", " token ", "0123456789abcdef0123456789abcdef"] {
+            assert!(rollback_request_id(Some(invalid.into())).is_err());
+        }
+        assert!(Uuid::parse_str(&rollback_request_id(None).unwrap()).is_ok());
+        let req: crate::models::RollbackRequest = serde_json::from_str(
+            &format!(r#"{{"snapshotID":"snap-selected","requestID":"{token}"}}"#)
+        ).unwrap();
+        assert_eq!(req.request_id.as_deref(), Some(token));
+        assert_eq!(req.snapshot_id, "snap-selected");
+    }
+
+    #[test]
+    fn rollback_receipt_must_bind_the_master_job_to_exact_selection() {
+        let mut value = serde_json::json!({
+            "requestID": "attempt", "ret": {"ret_code": 200, "ret_msg": "success"},
+            "operation": {"request_id": "attempt", "sandbox_id": "source",
+                "snapshot_id": "selected", "status": "READY", "operation_id": "job"}
+        });
+        let receipt = serde_json::from_value(value.clone()).unwrap();
+        assert!(ensure_rollback_binding(&receipt, "attempt", "source", "selected").is_ok());
+        for field in ["request_id", "sandbox_id", "snapshot_id", "status"] {
+            let saved = value["operation"][field].clone();
+            value["operation"][field] = serde_json::json!("foreign");
+            let receipt = serde_json::from_value(value.clone()).unwrap();
+            assert!(ensure_rollback_binding(&receipt, "attempt", "source", "selected").is_err());
+            value["operation"][field] = saved;
+        }
+        value.as_object_mut().unwrap().remove("operation");
+        let receipt = serde_json::from_value(value).unwrap();
+        assert!(ensure_rollback_binding(&receipt, "attempt", "source", "selected").is_err());
+    }
 
     fn sample_snapshot(status: &str) -> SnapshotResource {
         SnapshotResource {

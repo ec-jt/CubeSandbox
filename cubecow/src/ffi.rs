@@ -570,6 +570,8 @@ pub extern "C" fn cubecow_get_volume_info(
                     "export_uuid": vol.export_uuid,
                     "export_status": vol.export_status,
                     "deletable": vol.deletable,
+                    "volume_uuid": vol.volume_uuid,
+                    "import_origin": vol.import_origin,
                 });
                 let json_str = serde_json::to_string(&payload).unwrap_or_else(|_| "{}".to_string());
 
@@ -1053,6 +1055,31 @@ pub extern "C" fn cubecow_export_snapshot(
             set_last_error("panic during cubecow_export_snapshot");
             COW_ERR_PANIC
         }
+    }
+}
+
+/// Additive checkpoint record API. Inputs/outputs are bounded native JSON.
+#[no_mangle]
+pub extern "C" fn cubecow_checkpoint_record(
+    engine: *mut std::ffi::c_void,
+    request: *const c_char,
+    out_json: *mut *mut c_char,
+) -> i32 {
+    let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+        let eng = unsafe { engine_ref(engine) }?;
+        let request = unsafe { c_str_to_str(request) }?;
+        match eng.checkpoint_record(request) {
+            Ok(body) => {
+                if !out_json.is_null() { unsafe { *out_json = rust_string_to_c(&body) }; }
+                Ok(COW_OK)
+            }
+            Err(e) => Err(handle_cow_error(&e)),
+        }
+    }));
+    match result {
+        Ok(Ok(code)) => code,
+        Ok(Err(code)) => code,
+        Err(_) => { set_last_error("panic during cubecow_checkpoint_record"); COW_ERR_PANIC }
     }
 }
 

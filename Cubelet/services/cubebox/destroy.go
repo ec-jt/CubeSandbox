@@ -44,7 +44,14 @@ func (l *local) Destroy(ctx context.Context, opts *workflow.DestroyContext) (err
 		return ret.Err(errorcode.ErrorCode_InvalidParamFormat, "workflow.DestroyContext nil")
 	}
 
+	if err := workflow.SourceFences.Check(opts.SandboxID); err != nil {
+		return err
+	}
 	sandBoxID := opts.SandboxID
+	if evidence := workflow.LifecycleCleanupFrom(ctx); evidence != nil && evidence.NeverStarted {
+		// The runtime step was never entered. Do not delete a prior paused row.
+		return nil
+	}
 	keepPausedTombstone := shouldKeepPausedTombstone(opts)
 	defer func() {
 		if err != nil {
@@ -64,7 +71,7 @@ func (l *local) Destroy(ctx context.Context, opts *workflow.DestroyContext) (err
 	if err != nil {
 
 		if errors.Is(err, utils.ErrorKeyNotFound) {
-			return nil
+			return requireRuntimeCleanupEvidence(ctx, sandBoxID)
 		}
 		return err
 	}
@@ -116,6 +123,11 @@ func (l *local) Destroy(ctx context.Context, opts *workflow.DestroyContext) (err
 	// while the shim process may still hold the guest disks; storage Destroy
 	// is the next workflow step and must not delete those volumes yet.
 	runtimePIDs := l.collectSandboxRuntimePIDs(ctx, sb)
+	if len(runtimePIDs) == 0 {
+		if err := requireRuntimeCleanupEvidence(ctx, sandBoxID); err != nil {
+			return err
+		}
+	}
 	err = l.cbriManager.DestroySandbox(ctx, sb.SandboxID)
 	if err != nil {
 		log.G(ctx).Errorf("faild to destroy cbri sandbox %s", err.Error())
@@ -203,6 +215,7 @@ func (l *local) Destroy(ctx context.Context, opts *workflow.DestroyContext) (err
 	if er := result.ErrorOrNil(); er != nil {
 		return ret.Errorf(errorcode.ErrorCode_RemoveContainerFailed, "%s", er.Error())
 	}
+	workflow.MarkRuntimeGone(ctx)
 	return nil
 }
 

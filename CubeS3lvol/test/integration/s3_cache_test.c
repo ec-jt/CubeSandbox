@@ -199,6 +199,29 @@ read_cb(void *cb_arg, int status)
 	async_int_cb(cb_arg, status);
 }
 
+/* Teardown quiesce probe. Records what was true at the moment the cache
+ * reported idle; the real owner would close the descriptor right here. */
+struct q_ctx {
+	struct s3_cache *cache;
+	bool done;
+	int  calls;
+	bool idle_at_cb;
+	bool read_done_at_cb;
+};
+
+static struct async_ctx *g_q_rd;
+
+static void
+q_done_cb(void *arg)
+{
+	struct q_ctx *q = arg;
+
+	q->calls++;
+	q->done = true;
+	q->idle_at_cb = s3_cache_is_quiesced(q->cache);
+	q->read_done_at_cb = g_q_rd ? g_q_rd->done : true;
+}
+
 /* spdk_bdev_open_ext rejects a NULL event callback, so there has to be one even
  * though nothing here removes or resizes the bdev under the test. */
 static void
@@ -412,6 +435,7 @@ main(int argc, char **argv)
 	env_opts.opts_size = sizeof(env_opts);
 	spdk_env_opts_init(&env_opts);
 	env_opts.name     = "s3_cache_test";
+	env_opts.no_pci   = true;
 	env_opts.no_huge  = true;
 	env_opts.mem_size = 512;
 	if (spdk_env_init(&env_opts) < 0) {
@@ -972,12 +996,76 @@ main(int argc, char **argv)
 			   NULL);
 	}
 
+	printf("\n[Q] teardown quiesce over REAL aio: fill + read in flight\n");
+	{
+		struct q_ctx q = {0};
+		struct async_ctx rd = {0};
+		struct spdk_uuid uuid_q, uuid_r;
+		struct s3_cache_stats before, after;
+		int qrc;
+
+		spdk_uuid_generate(&uuid_q);
+		spdk_uuid_generate(&uuid_r);
+		fill_pattern(src, 40, TEST_CHUNK_SIZE, 9);
+		populate_sync(cache, 41, &uuid_r, src, TEST_CHUNK_SIZE);
+
+		/* Neither is waited on: both are outstanding real aio when
+		 * quiesce starts. */
+		s3_cache_populate(cache, 40, &uuid_q, 0, src, TEST_CHUNK_SIZE,
+				  TEST_CHUNK_SIZE);
+		rc = s3_cache_read(cache, 41, &uuid_r, 0, TEST_CHUNK_SIZE, dst,
+				   read_cb, &rd);
+		check_u64("read submitted against a resident object",
+			  (uint64_t)-rc, 0);
+		check_true("cache not quiesced with real I/O in flight",
+			   !s3_cache_is_quiesced(cache), NULL);
+
+		q.cache = cache;
+		g_q_rd = &rd;
+		qrc = s3_cache_quiesce(cache, q_done_cb, &q);
+		check_u64("quiesce waits (-EINPROGRESS)", (uint64_t)-qrc,
+			  EINPROGRESS);
+		check_true("quiesce callback never inline", q.calls == 0, NULL);
+
+		s3_cache_get_stats(cache, &before);
+		s3_cache_populate(cache, 42, &uuid_q, 0, src, TEST_CHUNK_SIZE,
+				  TEST_CHUNK_SIZE);
+		check_u64("read refused while quiescing",
+			  (uint64_t)-s3_cache_read(cache, 41, &uuid_r, 0,
+						   AIO_BLOCK_SIZE, dst,
+						   read_cb, &rd), ENOENT);
+		s3_cache_get_stats(cache, &after);
+		check_u64("populate dropped while quiescing",
+			  after.populates_dropped - before.populates_dropped, 1);
+
+		check_true("quiesce callback after real aio completions",
+			   poll_until(&q.done), NULL);
+		check_u64("quiesce callback exactly once", q.calls, 1);
+		check_true("cache was idle when the callback fired",
+			   q.idle_at_cb, NULL);
+		check_true("in-flight read completed before the callback",
+			   rd.done && q.read_done_at_cb, NULL);
+		check_u64("read completed successfully", (uint64_t)-rd.status, 0);
+		check_true("read returned the populated bytes",
+			   pattern_matches(dst, 40, 0, TEST_CHUNK_SIZE, 9), NULL);
+		poll_for_ms(20);
+		check_u64("still exactly once after more polling", q.calls, 1);
+		g_q_rd = NULL;
+	}
+
 	printf("\n=== %d passed, %d failed ===\n", g_pass, g_fail);
 
 out_cache:
-	/* Let anything still in flight land: destroy asserts that nothing is,
-	 * since in-flight I/O holds pointers into the slot array. */
-	poll_for_ms(200);
+	/* Completion-driven: destroy (and below, the descriptor close) only
+	 * once the cache reports no I/O of its own outstanding. */
+	if (cache) {
+		struct q_ctx q = {0};
+		int qrc = s3_cache_quiesce(cache, q_done_cb, &q);
+
+		if (qrc == -EINPROGRESS) {
+			poll_until(&q.done);
+		}
+	}
 	s3_cache_destroy(cache);
 	spdk_dma_free(src);
 	spdk_dma_free(dst);

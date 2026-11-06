@@ -1635,15 +1635,19 @@ s3_export_manifest_parse(const void *json, size_t len, struct s3_export_manifest
 	 * future zero-copy layout would name the source's own chunk objects, and
 	 * reading it as if it were dense would produce an lvol full of the wrong
 	 * data rather than an error. */
-	if (j.version < S3_EXPORT_VERSION_MIN || j.version > S3_EXPORT_VERSION) {
+	if (j.version < S3_EXPORT_VERSION_MIN || j.version > S3_EXPORT_ADMISSION_VERSION) {
 		SPDK_ERRLOG("export manifest version %u is not supported (want %u..%u)\n",
-			    j.version, S3_EXPORT_VERSION_MIN, S3_EXPORT_VERSION);
+			    j.version, S3_EXPORT_VERSION_MIN, S3_EXPORT_ADMISSION_VERSION);
 		rc = -ENOTSUP;
 		goto out;
 	}
 	rc = layout_from_str(j.layout, &layout);
 	if (rc != 0) {
 		SPDK_ERRLOG("export manifest layout '%s' is not supported\n", j.layout);
+		goto out;
+	}
+	if (j.version == S3_EXPORT_ADMISSION_VERSION && layout != S3_EXPORT_LAYOUT_DENSE) {
+		rc = -ENOTSUP;
 		goto out;
 	}
 	if ((layout == S3_EXPORT_LAYOUT_REF) != (j.refs != NULL)) {
@@ -2206,6 +2210,9 @@ s3_export_run(const struct s3_export_opts *opts, s3_export_cb cb, void *cb_arg)
 	}
 
 	ctx->m->src          = opts->src;
+	if (opts->release_safe) {
+		ctx->m->version = S3_EXPORT_ADMISSION_VERSION;
+	}
 	ctx->m->cluster_size = opts->cluster_size;
 	/* 0 for a new export, which leaves the field as created() set it. Non-zero
 	 * when this run replaces a manifest importers may hold -- see the field's

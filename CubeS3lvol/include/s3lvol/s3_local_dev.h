@@ -44,12 +44,39 @@
  * our layout. */
 #define S3_SUPER_MAGIC          0x53334C564F4C5342ULL
 
+/* Staging magic "S3LVOLST" (the last byte is 'T' instead of 'B').
+ *
+ * A *different magic*, not a reserved flag inside the normal one, and that is
+ * the whole point. A reader that predates this protocol checks `magic ==
+ * S3_SUPER_MAGIC` and nothing else before trusting the layout, so a reserved
+ * bit would be read as "valid layout" by exactly the readers that must not
+ * accept a half-built device. A different magic makes every such reader fail
+ * its first check with -EILSEQ, which is the correct answer: this device is
+ * not attachable yet.
+ *
+ * The staging super block is written *first*, before any other local write, so
+ * a device that carries it is by construction one whose rebuild did not
+ * finish. It is never a state a completed device is left in. */
+#define S3_SUPER_MAGIC_STAGING  0x53334C564F4C5354ULL
+
 /* Version 2 added capacity_bytes and lvs_name, both of which the attach path
  * needs: the geometry it hands to blobstore has to be the geometry the lvstore
  * was created with, and the name is what proves this disk belongs to the
  * lvstore being attached. A v1 disk carries neither, so it is rejected with
  * -EPROTO rather than guessed at. */
 #define S3_SUPER_VERSION        2
+
+/* Version 3 is the staging super block. It is a *distinct version* as well as a
+ * distinct magic, so a reader that only compares versions (rather than magic)
+ * also refuses it with -EPROTO instead of reinterpreting the fields. Both
+ * checks are redundant on purpose: either one alone is enough to reject, and a
+ * future reader that relaxes one of them still cannot accept a staging block.
+ *
+ * A staging block is never opened by s3_local_dev_open(). It exists only to be
+ * written by s3_local_dev_format_staged() and replaced by a normal v2 block by
+ * s3_local_dev_commit_staged(). */
+#define S3_SUPER_VERSION_STAGING 3
+
 #define S3_SUPER_SIZE           4096
 
 /* Room for the lvstore name in the super block. Matches SPDK_LVS_NAME_MAX, but
@@ -150,6 +177,11 @@ SPDK_STATIC_ASSERT(sizeof(struct s3_super_block) <= S3_SUPER_SIZE,
 
 struct s3_local_dev;
 
+/* Owned by s3_recovery.c. Declared here rather than included so the local
+ * device header does not pull the bdev-module surface into every consumer; see
+ * the note in s3_recovery.h. */
+struct s3_recovery_claim;
+
 typedef void (*s3_local_dev_cb)(void *cb_arg, int status);
 
 typedef void (*s3_local_dev_open_cb)(void *cb_arg, struct s3_local_dev *dev,
@@ -169,6 +201,34 @@ struct s3_local_dev_format_opts {
 	/* bdev holding the chunk cache; NULL means it shares the WAL device
 	 * (single-bdev layout). */
 	const char *cache_bdev_name;
+
+	/* Optional retained, already-claimed devices.
+	 *
+	 * Set by the recovery path so the format runs on the *same* descriptors
+	 * the blank proof was taken on, with the claims still held. Neither
+	 * device is reopened: reopening is exactly what the claim forbids
+	 * (a writable open fails -EPERM while the claim is held), so a
+	 * formatter that reopened would fail on any dual-bdev recovery.
+	 *
+	 * Ownership contract, which the implementation enforces:
+	 *   - the caller owns both claims when s3_local_dev_format() is called;
+	 *   - on SUCCESS (callback status 0) the returned dev has ADOPTED both
+	 *     claims. It releases them from s3_local_dev_close(), after its I/O
+	 *     channels are put, so they live exactly as long as the object that
+	 *     uses the descriptors;
+	 *   - on FAILURE the dev does not adopt them and the caller still owns
+	 *     them. This is why a failed format leaves the claims held rather
+	 *     than closing descriptors the setup context may still release.
+	 *
+	 * Each claim must hold a live descriptor and belong to the named device.
+	 * A cache claim passed for a device that is not distinct from the WAL
+	 * device is rejected: one claim cannot be adopted twice.
+	 *
+	 * Both NULL keeps the historical behaviour: open both bdevs here, close
+	 * them on every exit path, and hand the resulting dev to the caller.
+	 */
+	struct s3_recovery_claim *wal_claim;
+	struct s3_recovery_claim *cache_claim;
 
 	/* Which lvstore this disk belongs to. Required: the attach path has
 	 * nothing else to check before it starts replaying. */
@@ -212,7 +272,148 @@ void s3_local_dev_format(const struct s3_local_dev_format_opts *opts,
 void s3_local_dev_open(const char *wal_bdev_name, const char *cache_bdev_name,
 		       s3_local_dev_open_cb cb_fn, void *cb_arg);
 
+/**
+ * Close the local device: put its I/O channels, then release the claims it
+ * adopted (or close the descriptors it opened), then free it.
+ *
+ * This is the only place a claimed descriptor is released once a format has
+ * succeeded. Callers must not release those claims themselves.
+ */
 void s3_local_dev_close(struct s3_local_dev *dev);
+
+/* ==========================================================================
+ * Staged formatting -- the crash-safe publication protocol
+ *
+ * s3_local_dev_format() writes a normal, attachable super block as its *first*
+ * write. That is correct for create, where the device is being made from
+ * nothing and a crash leaves a device that was never meant to be attachable.
+ * It is wrong for recovery, where the device is rebuilt from a remote
+ * checkpoint over several steps: a crash after the first write leaves a
+ * *normal* super block on a device whose journal, WAL, checkpoint and uuid have
+ * not been rebuilt. A later attach would accept it and replay from a
+ * checkpoint pointer that describes data that is not there.
+ *
+ * The staged protocol splits that into three explicit states:
+ *
+ *   STAGED    magic = S3_SUPER_MAGIC_STAGING, version = 3.
+ *             Written first, before any other local write. Every reader that
+ *             checks magic or version refuses it (-EILSEQ / -EPROTO), so a
+ *             half-built device cannot be attached by this build or by an
+ *             older one. This is the state a crash leaves behind.
+ *
+ *   (rebuild) journal, WAL, checkpoint and uuid are written and flushed while
+ *             the device still carries the staging block.
+ *
+ *   COMMITTED magic = S3_SUPER_MAGIC, version = 2.
+ *             Written last, after every prerequisite write has been flushed
+ *             and the caller has validated the remote blobstore state. Only
+ *             this write makes the device attachable.
+ *
+ * === What this does and does not guarantee ===
+ *
+ * Guaranteed, and tested:
+ *   - a device left in STAGED is refused by s3_local_dev_open() with a
+ *     distinguishable error, so it is never attached as if complete;
+ *   - the commit is a single 4 KiB block write followed by a flush, and the
+ *     callback that reports success runs only after that flush completed;
+ *   - a torn or corrupt commit block fails its CRC and is refused, leaving the
+ *     device in STAGED (the previous block is still the staging one, because
+ *     the commit is one block overwrite);
+ *   - any failure before the commit leaves STAGED in place and does not
+ *     silently re-format or blank the device.
+ *
+ * NOT guaranteed:
+ *   - atomicity of a 4 KiB overwrite against arbitrary power loss. A device
+ *     that loses power mid-commit may hold a block that is neither the staging
+ *     block nor a valid normal block. That is detected (magic and CRC both
+ *     fail) and refused, but it is *detection*, not atomicity. No claim is made
+ *     that the commit is atomic on any particular device.
+ *   - durability of writes the caller has not flushed. The protocol flushes
+ *     what it writes; it cannot flush what a caller wrote behind its back.
+ * ========================================================================== */
+
+/**
+ * Format a *staging* layout: same geometry computation as
+ * s3_local_dev_format(), but the super block written is the staging one and
+ * the journal head is cleared, and the callback reports only after both writes
+ * have been flushed.
+ *
+ * The returned dev is usable for the rebuild steps (journal, WAL, checkpoint,
+ * uuid) but the device is NOT attachable: s3_local_dev_open() refuses it.
+ *
+ * opts is the same struct as s3_local_dev_format(); lvs_uuid is left zero and
+ * is expected to be recorded with s3_local_dev_set_lvs_uuid() during the
+ * rebuild, exactly as on the normal path.
+ *
+ * On failure nothing is adopted and the caller still owns the claims.
+ */
+void s3_local_dev_format_staged(const struct s3_local_dev_format_opts *opts,
+				s3_local_dev_open_cb cb_fn, void *cb_arg);
+
+/**
+ * Flush the local device and report only when the flush completed.
+ *
+ * A durability barrier over the whole WAL device, which is also where the super
+ * block lives. The recovery chain uses it to establish that every prerequisite
+ * write it made is on stable storage before it publishes the normal super
+ * block.
+ *
+ * Unsupported flush is an error (-ENOTSUP), not a silent success: a device that
+ * cannot flush cannot prove durability, and the staged protocol's claim is that
+ * publication happens only after the prerequisites are durable.
+ */
+void s3_local_dev_flush_durable(struct s3_local_dev *dev, const char *what,
+				s3_local_dev_cb cb_fn, void *cb_arg);
+
+/**
+ * Publish a staged device: rewrite the super block as a normal, attachable one
+ * and flush it.
+ *
+ * This is the *last* step of recovery. The caller must have completed and
+ * flushed every prerequisite local write (journal, WAL, checkpoint pointer,
+ * uuid) and validated the remote state before calling this; this function
+ * cannot check that, and deliberately does not try to.
+ *
+ * What it does enforce, in this order:
+ *
+ *   1. a preflush of the device, *before* the in-memory super block is
+ *      switched to the normal identity. A preflush failure leaves the device
+ *      staged in memory and on disk, and no normal block is ever submitted;
+ *   2. the in-memory magic/version switch and CRC recomputation;
+ *   3. one 4 KiB super block write;
+ *   4. a postflush, after which the callback reports success.
+ *
+ * A second concurrent commit is refused with -EBUSY rather than queued: the
+ * sequence mutates the in-memory super block across several asynchronous steps.
+ *
+ * Unsupported flush is an error. A failed write or flush has an indeterminate
+ * on-disk outcome: a complete normal block may already be visible. Restoring
+ * the in-memory staging state is not rollback. The caller must establish all
+ * durable prerequisites before this operation.
+ *
+ * Calling this on a device that was not formatted with
+ * s3_local_dev_format_staged() is a programming error and is refused with
+ * -EINVAL.
+ */
+void s3_local_dev_commit_staged(struct s3_local_dev *dev,
+				s3_local_dev_cb cb_fn, void *cb_arg);
+
+/**
+ * True when \c dev was formatted with s3_local_dev_format_staged() and has not
+ * yet been committed. Used by the recovery chain to assert its own ordering.
+ */
+bool s3_local_dev_is_staged(struct s3_local_dev *dev);
+
+/**
+ * True when \c dev adopted \c claim during a successful format.
+ *
+ * The setup context uses this to decide whether a claim is still its to
+ * release. Ownership moves to the dev at format completion, so the context
+ * must not close the descriptor even though it may still hold the pointer:
+ * doing so would close it out from under the live journal and WAL consumers.
+ */
+bool s3_local_dev_owns_claim(struct s3_local_dev *dev,
+			     struct s3_recovery_claim *claim);
 
 /**
  * Look up where a region lives.

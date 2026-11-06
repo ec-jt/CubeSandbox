@@ -17,13 +17,13 @@
  *   snapshots are spoken for, and the first delete of one would break a volume
  *   running on another machine -- with nothing on this side indicating why.
  *
- *   === How that obligation ends ===
+ *   === Durable obligation, not heartbeat ownership ===
  *
- *   An export remains importable for as long as its snapshot exists. The owner
- *   ends that lifetime explicitly by deleting the snapshot; the delete path
- *   first releases every export that has no live reader. Importers renew a lease
- *   while an esnap clone still reads through the export, so a delete requested
- *   during restore is deferred until that dependency clears.
+ *   No lease state proves that a paused or disconnected reader is independent.
+ *   REF history stays pinned even after materialisation, since derived manifests
+ *   can retain original source refs. Release refuses until a durable detach and
+ *   closed-admission protocol exists. Never use lease expiry as permission to GC.
+ *   New exports reserve this obligation durably before publishing a manifest.
  */
 
 #include "spdk/stdinc.h"
@@ -55,6 +55,14 @@ struct s3lvol_export {
 
 	char         uuid_str[SPDK_UUID_STRING_LEN];
 
+	/* Last admission state this node observed for this export, cached so the
+	 * status RPC can describe retention without an S3 round trip. Updated by
+	 * the release/reconcile paths when they read the document; UNKNOWN until
+	 * then, which the disposition reports as "absent" only for exports that
+	 * cannot have one (legacy) and as "unobserved" otherwise. */
+	enum s3lvol_export_admission admission_seen;
+	bool                       admission_seen_valid;
+
 	/* The snapshot this pins. Stored by name because that is what the delete
 	 * path has in hand. snapshot_uuid is the identity: blobstore reuses blob
 	 * ids after a delete, so name+blob_id can match a replacement volume.
@@ -65,6 +73,8 @@ struct s3lvol_export {
 	uint64_t    blob_id;
 
 	enum s3_export_layout      layout;
+	bool source_obligation;
+	bool publication_pending;
 	/* Retained when loading old registries and reporting the compatible RPC
 	 * shape. It no longer controls export lifetime. */
 	uint64_t        expires_at;
@@ -215,24 +225,10 @@ s3lvol_export_find(struct s3lvol_lvstore *lvs, const char *uuid_str)
  *
  * Hence the cache: a low-frequency poller per export re-reads the lease body
  * on the lvstore's thread, and the delete path consults the cached fields.
- * Grace period W = 3x the importer's renew interval, from the body -- a lost
- * renew PUT (or clock skew) must not turn a live importer into a deletable
- * snapshot. The mis-delete window is "importer stopped renewing, then someone
- * deleted within W", which is the accepted, tunable bound.
- *
- * A lease-aware export with a confirmed miss that is older than MIN_GRACE has
- * no current reader, but remains importable until its snapshot is explicitly
- * deleted. A miss younger than that still pins: the control plane may already
- * have admitted an importer whose first lease PUT has not landed. For a
- * registry entry created before leases existed, absence is still reported as
- * LEGACY (status cannot prove the reader is gone) but does not pin: the
- * snapshot delete is the revocation.
- *
- * Until the first GET completes (lease_checked == false), the export is
- * reported as pinning. The importer may have just written its first lease and
- * the poller may not have seen it yet; refusing the delete is the safe
- * direction, and the window is normally one poll interval. A bucket that cannot
- * be read remains conservatively pinned.
+ * Lease values are retained for diagnostics and compatibility with older nodes.
+ * They are NOT consulted for destructive authorization. The durable obligation
+ * is the only safety decision, including before the first GET, after errors,
+ * and when a lease is stale, absent, malformed, or predates this implementation.
  * ========================================================================== */
 
 /* How many consecutive unreadable lease checks before this node stops treating
@@ -728,75 +724,14 @@ export_src_lease_start(struct s3lvol_export *exp, const struct s3_export_manifes
 	export_src_lease_arm(exp, &m->src);
 }
 
-/* One export's verdict on one snapshot. Split out of s3lvol_export_pinning()
- * because two callers need different amounts of detail from the same decision:
- * the delete path only asks "may I delete this now", while the pending-delete
- * poller also has to know *why* the answer is yes.
- *
- * That distinction is the whole point. A lease that has gone stale is positive
- * evidence -- an importer wrote it and stopped renewing, so nobody is reading --
- * and a delete on that basis is safe to carry out unattended. A legacy export
- * predates trustworthy leases, so status cannot prove a reader has gone; the
- * snapshot delete itself is still the revocation. */
+/* Heartbeats are diagnostic only. Paused/disconnected readers, including
+ * derived manifests that cached our original source refs, can outlive any TTL.
+ * Materialising the top-level manifest does not rewrite those derived refs. */
 static enum s3lvol_export_pin
 export_pin_verdict(const struct s3lvol_export *exp)
 {
-	uint64_t now, grace;
-
-	/* A dense export holds copies, so it does not pin the snapshot. */
-	if (exp->layout != S3_EXPORT_LAYOUT_REF) {
-		return S3LVOL_EXPORT_PIN_NONE;
-	}
-
-	/* Before the first GET completes, assume the lease may exist and an
-	 * importer may be reading it: refuse, and let the next poll decide. */
-	if (!exp->lease_checked) {
-		return S3LVOL_EXPORT_PIN_LEASE;
-	}
-
-	/* A lease-aware exporter can distinguish a live reader from no reader.
-	 * A confirmed miss therefore lets an explicit snapshot delete release the
-	 * export -- but only once the miss is older than MIN_GRACE. Until then the
-	 * first lease PUT of an importer that was just admitted may still be in
-	 * flight. It does not expire or reap the export by itself: while the
-	 * snapshot exists the export remains a valid target for a later import.
-	 *
-	 * For an entry written before leases existed, absence remains LEGACY for
-	 * status. The delete path does not wait for a lease that will never appear. */
-	if (exp->lease_updated_at == 0) {
-		if (exp->lease_aware) {
-			uint64_t miss_age;
-
-			if (!exp->lease_absent) {
-				return S3LVOL_EXPORT_PIN_LEASE;
-			}
-			now = (uint64_t)time(NULL);
-			if (exp->lease_absent_at == 0 || now < exp->lease_absent_at) {
-				return S3LVOL_EXPORT_PIN_LEASE;
-			}
-			miss_age = now - exp->lease_absent_at;
-			if (miss_age < S3LVOL_LEASE_MIN_GRACE_SEC) {
-				return S3LVOL_EXPORT_PIN_LEASE;
-			}
-			return S3LVOL_EXPORT_PIN_STALE;
-		}
-		return S3LVOL_EXPORT_PIN_LEGACY;
-	}
-
-	now = (uint64_t)time(NULL);
-	grace = 3 * (uint64_t)exp->lease_renew_s;
-	if (grace < S3LVOL_LEASE_MIN_GRACE_SEC) {
-		/* Either no renew_s at all (an older importer), or one small enough
-		 * that honouring it would delete data under a reader that is merely
-		 * slow. See the constant. */
-		grace = S3LVOL_LEASE_MIN_GRACE_SEC;
-	}
-	/* Guard against a lease stamped in the future -- a skewed importer clock
-	 * would otherwise make now - updated_at wrap and read as ancient. */
-	if (exp->lease_updated_at > now || now - exp->lease_updated_at < grace) {
-		return S3LVOL_EXPORT_PIN_LEASE;
-	}
-	return S3LVOL_EXPORT_PIN_STALE;
+	return exp->source_obligation ? S3LVOL_EXPORT_PIN_OBLIGATION :
+		S3LVOL_EXPORT_PIN_NONE;
 }
 
 /* Whether this live lvol is the snapshot the registry entry was published from.
@@ -847,8 +782,8 @@ s3lvol_export_pin_state(struct s3lvol_lvstore *lvs, const char *snapshot_name)
 	enum s3lvol_export_pin worst = S3LVOL_EXPORT_PIN_NONE;
 	struct s3lvol_export *exp;
 
-	if (!lvs || !snapshot_name) {
-		return S3LVOL_EXPORT_PIN_NONE;
+	if (!s3lvol_lvstore_exports_ready(lvs) || !snapshot_name) {
+		return S3LVOL_EXPORT_PIN_OBLIGATION;
 	}
 
 	/* Several exports can name the same snapshot, and the most restrictive
@@ -885,22 +820,8 @@ s3lvol_export_pinning(struct s3lvol_lvstore *lvs, const char *snapshot_name)
 			continue;
 		}
 
-		switch (export_pin_verdict(exp)) {
-		case S3LVOL_EXPORT_PIN_LEASE:
-			/* An importer is reading, or may be. */
+		if (export_pin_verdict(exp) != S3LVOL_EXPORT_PIN_NONE) {
 			return exp;
-		case S3LVOL_EXPORT_PIN_LEGACY:
-			/* Status still says liveness is unknown. An explicit snapshot
-			 * delete is the revocation, same as STALE — rcow_get_snapshot_status
-			 * reports deletable YES, and the poller will finish a recorded
-			 * intent. A pre-lease importer cannot be observed. */
-			continue;
-		case S3LVOL_EXPORT_PIN_STALE:
-			/* No lease within grace, or nobody has renewed within grace. */
-			continue;
-		case S3LVOL_EXPORT_PIN_NONE:
-		default:
-			continue;
 		}
 	}
 	return NULL;
@@ -978,6 +899,8 @@ s3lvol_export_get(const struct s3lvol_export *exp, struct s3lvol_export_entry *o
 	out->expires_at  = exp->expires_at;
 	out->generation  = exp->generation;
 	out->is_ref      = (exp->layout == S3_EXPORT_LAYOUT_REF);
+	out->source_obligation = exp->source_obligation;
+	out->publication_pending = exp->publication_pending;
 	out->lease_aware = exp->lease_aware;
 	out->lease_checked = exp->lease_checked;
 	out->lease_absent = exp->lease_absent;
@@ -988,6 +911,61 @@ s3lvol_export_get(const struct s3lvol_export *exp, struct s3lvol_export_entry *o
 	out->reaping = exp->reaping;
 
 	out->snapshot_alive = export_snapshot_alive(exp);
+}
+
+/* ==========================================================================
+ * Legacy / REF retention disposition
+ *
+ * The classification itself lives in export_disposition_ctl.h so it stays pure
+ * and unit-testable. This file only supplies the facts from a registry entry
+ * and caches the admission state the release/reconcile paths observed.
+ * ========================================================================== */
+
+/* The admission state this node last observed for \p exp.
+ *
+ * Synchronous and non-blocking by design: the status RPC must not turn into an
+ * S3 GET per export. The release and reconcile paths record what they read
+ * here, so an export that has been through either reports its real state. An
+ * export that has never been touched reports ABSENT, which the disposition
+ * treats as "no admission document" -- correct for a legacy export and
+ * conservative for a v4 export whose document has not been read yet, since
+ * both are retained either way. */
+enum s3lvol_export_admission
+s3lvol_export_admission_state(const struct s3lvol_export *exp)
+{
+	if (!exp || !exp->admission_seen_valid) {
+		return S3LVOL_EXPORT_ADMISSION_ABSENT;
+	}
+	return exp->admission_seen;
+}
+
+void
+s3lvol_export_note_admission(struct s3lvol_export *exp,
+			     enum s3lvol_export_admission adm)
+{
+	if (!exp) {
+		return;
+	}
+	exp->admission_seen = adm;
+	exp->admission_seen_valid = true;
+}
+
+void
+s3lvol_export_disposition_of(const struct s3lvol_export *exp,
+			     struct s3lvol_export_disposition_info *out)
+{
+	struct s3lvol_export_facts f;
+
+	if (!exp) {
+		s3lvol_export_disposition(NULL, S3LVOL_EXPORT_ADMISSION_ABSENT,
+					  out);
+		return;
+	}
+	f.is_ref = exp->layout == S3_EXPORT_LAYOUT_REF;
+	f.source_obligation = exp->source_obligation;
+	f.publication_pending = exp->publication_pending;
+	f.reaping = exp->reaping;
+	s3lvol_export_disposition(&f, s3lvol_export_admission_state(exp), out);
 }
 
 /* ==========================================================================
@@ -1006,6 +984,8 @@ s3lvol_export_add(struct s3lvol_lvstore *lvs, const struct s3_export_manifest *m
 	}
 	exp->lvs   = lvs;
 	exp->layout     = m->layout;
+	exp->source_obligation = true;
+	exp->publication_pending = true;
 	exp->blob_id    = m->src.blob_id;
 	exp->expires_at = m->expires_at;
 	exp->generation = m->generation;
@@ -1033,6 +1013,23 @@ s3lvol_export_add(struct s3lvol_lvstore *lvs, const struct s3_export_manifest *m
 	exports_reaper_sync();
 
 	return exp;
+}
+
+void
+s3lvol_export_publication_complete(struct s3lvol_export *exp,
+                                  const struct s3_export_manifest *m)
+{
+	assert(exp->publication_pending);
+	exp->publication_pending = false;
+	exp->layout = m->layout;
+	exp->generation = m->generation;
+	/* Only a FIRST publication as dense never exposed source chunk refs.
+	 * Materialisation of a published REF must retain source_obligation. */
+	exp->source_obligation = m->layout == S3_EXPORT_LAYOUT_REF;
+	if (!exp->source_obligation) {
+		s3lvol_export_lease_stop(exp);
+	}
+	/* Upstream leases were started before serializing the completed registry. */
 }
 
 void
@@ -1270,7 +1267,8 @@ s3lvol_xfer_exports_fini(struct s3lvol_lvstore *lvs)
  * ========================================================================== */
 
 static int
-exports_serialize(struct s3lvol_lvstore *lvs, char **out, size_t *out_len)
+exports_serialize(struct s3lvol_lvstore *lvs, char **out, size_t *out_len,
+                  struct s3lvol_export *completing, const struct s3_export_manifest *m)
 {
 	struct s3lvol_json_buf buf = {0};
 	struct spdk_json_write_ctx *w;
@@ -1297,13 +1295,16 @@ exports_serialize(struct s3lvol_lvstore *lvs, char **out, size_t *out_len)
 			spdk_json_write_named_string(w, "snapshot_uuid",
 						     exp->snapshot_uuid);
 		}
+		spdk_json_write_named_bool(w, "source_obligation", exp == completing ?
+			m->layout == S3_EXPORT_LAYOUT_REF : exp->source_obligation);
+		spdk_json_write_named_bool(w, "publication_pending", exp == completing ? false : exp->publication_pending);
 		spdk_json_write_named_uint64(w, "blob_id", exp->blob_id);
 		spdk_json_write_named_string(w, "layout",
-					     exp->layout == S3_EXPORT_LAYOUT_REF ?
+					     (exp == completing ? m->layout : exp->layout) == S3_EXPORT_LAYOUT_REF ?
 					   S3_EXPORT_LAYOUT_REF_STR :
 					     S3_EXPORT_LAYOUT_DENSE_STR);
 		spdk_json_write_named_uint64(w, "expires_at", exp->expires_at);
-		spdk_json_write_named_uint32(w, "generation", exp->generation);
+		spdk_json_write_named_uint32(w, "generation", exp == completing ? m->generation : exp->generation);
 		/* Only written when true. An older build ignores the unknown
 		 * field, and this build reads its absence as "not lease-aware",
 		 * which is what an entry written by an older build means. */
@@ -1421,6 +1422,8 @@ export_src_lease_restart(struct s3lvol_export *exp,
 }
 
 struct export_entry_json {
+	bool source_obligation;
+	bool publication_pending;
 	char *export_uuid;
 	char    *snapshot;
 	char    *snapshot_uuid;
@@ -1433,6 +1436,8 @@ struct export_entry_json {
 };
 
 static const struct spdk_json_object_decoder export_entry_decoders[] = {
+	{"source_obligation", offsetof(struct export_entry_json, source_obligation), spdk_json_decode_bool, true},
+	{"publication_pending", offsetof(struct export_entry_json, publication_pending), spdk_json_decode_bool, true},
 	{"export_uuid", offsetof(struct export_entry_json, export_uuid), spdk_json_decode_string, false},
 	{"snapshot",  offsetof(struct export_entry_json, snapshot),    spdk_json_decode_string, false},
 	{"snapshot_uuid", offsetof(struct export_entry_json, snapshot_uuid), spdk_json_decode_string, true},
@@ -1459,6 +1464,9 @@ struct exports_json {
 static int
 decode_export_entry(const struct spdk_json_val *val, void *out)
 {
+	/* Legacy dense entries may have been materialised from REF. Unknown history
+	 * must retain the source, not silently bless deletion after upgrade. */
+	((struct export_entry_json *)out)->source_obligation = true;
 	return spdk_json_decode_object(val, export_entry_decoders,
 				       SPDK_COUNTOF(export_entry_decoders), out);
 }
@@ -1527,11 +1535,25 @@ exports_parse(struct s3lvol_lvstore *lvs, const void *json, size_t len)
 		goto out;
 	}
 
+	if (j.version != S3_EXPORT_VERSION) {
+		rc = -EINVAL;
+		goto out;
+	}
 	rc = 0;
 	for (i = 0; i < j.entries.n; i++) {
 		struct export_entry_json *e = &j.entries.e[i];
 		struct s3lvol_export *exp;
 
+		struct spdk_uuid parsed;
+		if (!e->snapshot[0] || strlen(e->snapshot) >= SPDK_LVOL_NAME_MAX ||
+		    spdk_uuid_parse(&parsed, e->export_uuid) != 0 ||
+		    (strcmp(e->layout, S3_EXPORT_LAYOUT_REF_STR) != 0 &&
+		     strcmp(e->layout, S3_EXPORT_LAYOUT_DENSE_STR) != 0) ||
+		    (e->snapshot_uuid && spdk_uuid_parse(&parsed, e->snapshot_uuid) != 0) ||
+		    s3lvol_export_find(lvs, e->export_uuid)) {
+			rc = -EINVAL;
+			break;
+		}
 		exp = calloc(1, sizeof(*exp));
 		if (!exp) {
 			rc = -ENOMEM;
@@ -1542,6 +1564,9 @@ exports_parse(struct s3lvol_lvstore *lvs, const void *json, size_t len)
 		exp->expires_at = e->expires_at;
 		exp->generation = e->generation;
 		exp->lease_aware = e->lease_aware;
+		exp->publication_pending = e->publication_pending;
+		exp->source_obligation = e->source_obligation || e->publication_pending ||
+			strcmp(e->layout, S3_EXPORT_LAYOUT_REF_STR) == 0;
 		exp->layout     = strcmp(e->layout, S3_EXPORT_LAYOUT_REF_STR) == 0 ?
 				  S3_EXPORT_LAYOUT_REF : S3_EXPORT_LAYOUT_DENSE;
 		snprintf(exp->uuid_str, sizeof(exp->uuid_str), "%s", e->export_uuid);
@@ -1622,6 +1647,7 @@ exports_load_done(struct exports_load_ctx *ctx, int status)
 	spdk_lvs_op_complete cb_fn = ctx->cb_fn;
 	void *cb_arg = ctx->cb_arg;
 
+	s3lvol_lvstore_exports_set_ready(ctx->lvs, status == 0);
 	free(ctx->body);
 	free(ctx);
 
@@ -1642,7 +1668,8 @@ exports_load_got_body(void *cb_arg, uint64_t bytes_read, int status)
 		return;
 	}
 
-	exports_load_done(ctx, exports_parse(ctx->lvs, ctx->body, bytes_read));
+	exports_load_done(ctx, bytes_read == ctx->size ?
+		exports_parse(ctx->lvs, ctx->body, bytes_read) : -EIO);
 }
 
 static void
@@ -1663,7 +1690,7 @@ exports_load_head_done(void *cb_arg, int status)
 		return;
 	}
 	if (ctx->size == 0) {
-		exports_load_done(ctx, 0);
+		exports_load_done(ctx, -EINVAL);
 		return;
 	}
 	if (ctx->size > 64u * 1024 * 1024) {
@@ -1693,6 +1720,7 @@ s3lvol_xfer_exports_load(struct s3lvol_lvstore *lvs, spdk_lvs_op_complete cb_fn,
 	struct exports_load_ctx *ctx;
 	int rc;
 
+	s3lvol_lvstore_exports_set_ready(lvs, false);
 	ctx = calloc(1, sizeof(*ctx));
 	if (!ctx) {
 		return -ENOMEM;
@@ -1713,12 +1741,29 @@ s3lvol_xfer_exports_load(struct s3lvol_lvstore *lvs, spdk_lvs_op_complete cb_fn,
 /* ---- save ---- */
 
 struct exports_save_ctx {
+	struct s3lvol_lvstore *lvs;
+	TAILQ_ENTRY(exports_save_ctx) link;
 	spdk_lvs_op_complete cb_fn;
 	void        *cb_arg;
 	char    *json;
 	struct iovec       iov;
 	char                 key[S3_EXPORT_KEY_MAX];
 };
+
+static TAILQ_HEAD(, exports_save_ctx) g_exports_saves =
+	TAILQ_HEAD_INITIALIZER(g_exports_saves);
+
+bool
+s3lvol_export_registry_busy(struct s3lvol_lvstore *lvs)
+{
+	struct exports_save_ctx *ctx;
+	TAILQ_FOREACH(ctx, &g_exports_saves, link) {
+		if (ctx->lvs == lvs) {
+			return true;
+		}
+	}
+	return false;
+}
 
 static void
 exports_save_done(void *cb_arg, int status)
@@ -1734,6 +1779,7 @@ exports_save_done(void *cb_arg, int status)
 			    ctx->key, spdk_strerror(-status));
 	}
 
+	TAILQ_REMOVE(&g_exports_saves, ctx, link);
 	free(ctx->json);
 	free(ctx);
 
@@ -1742,14 +1788,18 @@ exports_save_done(void *cb_arg, int status)
 	}
 }
 
-int
-s3lvol_export_registry_save(struct s3lvol_lvstore *lvs, spdk_lvs_op_complete cb_fn,
-			    void *cb_arg)
+static int
+export_registry_save(struct s3lvol_lvstore *lvs, spdk_lvs_op_complete cb_fn,
+                     void *cb_arg, struct s3lvol_export *completing,
+                     const struct s3_export_manifest *m)
 {
 	struct exports_save_ctx *ctx;
 	size_t len;
 	int rc;
 
+	if (!s3lvol_lvstore_exports_ready(lvs) || s3lvol_export_registry_busy(lvs)) {
+		return -EBUSY;
+	}
 	ctx = calloc(1, sizeof(*ctx));
 	if (!ctx) {
 		return -ENOMEM;
@@ -1758,7 +1808,7 @@ s3lvol_export_registry_save(struct s3lvol_lvstore *lvs, spdk_lvs_op_complete cb_
 	ctx->cb_arg = cb_arg;
 	exports_registry_key(s3lvol_lvstore_get_name(lvs), ctx->key, sizeof(ctx->key));
 
-	rc = exports_serialize(lvs, &ctx->json, &len);
+	rc = exports_serialize(lvs, &ctx->json, &len, completing, m);
 	if (rc != 0) {
 		free(ctx);
 		return rc;
@@ -1766,11 +1816,54 @@ s3lvol_export_registry_save(struct s3lvol_lvstore *lvs, spdk_lvs_op_complete cb_
 	ctx->iov.iov_base = ctx->json;
 	ctx->iov.iov_len = len;
 
+	ctx->lvs = lvs;
+	TAILQ_INSERT_TAIL(&g_exports_saves, ctx, link);
 	rc = s3_put(s3lvol_lvstore_get_client(lvs), ctx->key, &ctx->iov, 1, false,
 		    exports_save_done, ctx);
 	if (rc != 0) {
+		TAILQ_REMOVE(&g_exports_saves, ctx, link);
 		free(ctx->json);
 		free(ctx);
 	}
+	return rc;
+}
+
+int
+s3lvol_export_registry_save(struct s3lvol_lvstore *lvs, spdk_lvs_op_complete cb, void *arg)
+{
+	return export_registry_save(lvs, cb, arg, NULL, NULL);
+}
+
+struct publication_save {
+	struct s3lvol_export *exp;
+	struct s3_export_manifest *manifest;
+	spdk_lvs_op_complete cb;
+	void *arg;
+};
+static void publication_saved(void *arg, int status)
+{
+	struct publication_save *p = arg;
+	/* Commit memory only after the registry PUT succeeds. An ambiguous failure
+	 * leaves the reservation pinned; explicit reconciliation can retry it. */
+	if (!status) s3lvol_export_publication_complete(p->exp, p->manifest);
+	s3_export_manifest_unref(p->manifest);
+	p->cb(p->arg, status);
+	free(p);
+}
+int
+s3lvol_export_publication_save(struct s3lvol_export *exp, struct s3_export_manifest *m,
+                               spdk_lvs_op_complete cb, void *arg)
+{
+	struct publication_save *p;
+	int rc;
+	if (!exp->publication_pending || !cb) return -EINVAL;
+	p = calloc(1, sizeof(*p));
+	if (!p) return -ENOMEM;
+	p->exp = exp; p->manifest = m; p->cb = cb; p->arg = arg;
+	s3_export_manifest_ref(m);
+	/* Renew/persist upstream obligations while still conservatively pinned. */
+	export_src_lease_start(exp, m);
+	rc = export_registry_save(exp->lvs, publication_saved, p, exp, m);
+	if (rc) { s3_export_manifest_unref(m); free(p); }
 	return rc;
 }

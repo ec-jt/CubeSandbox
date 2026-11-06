@@ -42,10 +42,18 @@ func tmpfsSizeFromMB(sizeMB int) uint64 {
 	return uint64(sizeMB) * 1024 * 1024
 }
 
+// stateTmpfsMode is the root directory mode of the state tmpfs. The kernel
+// default for a fresh tmpfs is 1777 (world-writable, sticky). The state dir
+// holds containerd task bundles whose shim.pid/address files the source fence
+// trusts only when every ancestor is root-owned and not group/other writable
+// (sourcefence.trustedPath), so a world-writable root would make every retained
+// runtime capture fail with "untrusted retained path".
+const stateTmpfsMode = "0755"
+
 func stateTmpfsMount(sizeMB int, remount bool) *mount.Mount {
-	opts := []string{fmt.Sprintf("size=%dm", sizeMB)}
+	opts := []string{fmt.Sprintf("size=%dm", sizeMB), "mode=" + stateTmpfsMode}
 	if remount {
-		opts = []string{"remount", opts[0]}
+		opts = append([]string{"remount"}, opts...)
 	}
 	return &mount.Mount{Type: "tmpfs", Source: "none", Options: opts}
 }
@@ -74,6 +82,9 @@ func maybeRemountStateTmpfs(stateDir string, info *mountinfo.Info, sizeMB int) e
 	desiredBytes := tmpfsSizeFromMB(sizeMB)
 	currentBytes, hasSize := parseTmpfsSizeBytes(info.VFSOptions)
 	if hasSize && tmpfsSizeEqual(currentBytes, desiredBytes) {
+		// A surviving mount from an older cubelet keeps the kernel default
+		// 1777 root mode. Tighten it in place; chmod never touches contents.
+		tightenStateTmpfsMode(stateDir)
 		return nil
 	}
 
@@ -92,6 +103,24 @@ func maybeRemountStateTmpfs(stateDir string, info *mountinfo.Info, sizeMB int) e
 	}
 	stdlog.Printf("remounted state tmpfs %s size %s -> %dm (%d bytes)", stateDir, prevSize, sizeMB, desiredBytes)
 	return nil
+}
+
+// tightenStateTmpfsMode removes group/other write from the state tmpfs root.
+// Failure only warns: the fence check fails closed on its own.
+func tightenStateTmpfsMode(stateDir string) {
+	var st unix.Stat_t
+	if err := unix.Stat(stateDir, &st); err != nil {
+		stdlog.Printf("warn: stat state tmpfs %s: %v", stateDir, err)
+		return
+	}
+	if st.Mode&0o022 == 0 {
+		return
+	}
+	if err := unix.Chmod(stateDir, 0o755); err != nil {
+		stdlog.Printf("warn: tighten state tmpfs %s mode %o -> 0755: %v", stateDir, st.Mode&0o7777, err)
+		return
+	}
+	stdlog.Printf("tightened state tmpfs %s mode %o -> 0755", stateDir, st.Mode&0o7777)
 }
 
 func refuseShrinkStateTmpfs(stateDir string, currentBytes, desiredBytes uint64) bool {

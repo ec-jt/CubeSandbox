@@ -360,10 +360,14 @@ impl Task for TaskService {
                 errf!(self.log, "Create pid file failed:{}", e);
                 return Err(Others(format!("Create pid file failed:{}", e)));
             }
-            sb.init(spec.clone()).map_err(|e| {
-                errf!(self.log, "Init sandbox config failed:{}", e.clone());
-                Error::Other(format!("Init sandbox config failed:{}", e))
-            })?;
+            if let Err(e) = sb.init(spec.clone()) {
+                let publication = sb.publish_recovery_outcome();
+                return Err(Error::Other(match publication {
+                    Ok(()) => format!("Init sandbox config failed:{e}"),
+                    Err(p) => format!("Init sandbox config failed:{e}; recovery receipt: {p}"),
+                })
+                .into());
+            }
 
             sb.create_sandbox().await.map_err(|e| {
                 errf!(self.log, "Create sandbox failed:{}", e.clone());
@@ -574,6 +578,9 @@ impl Task for TaskService {
             self.log.clone(),
         );
         let mut sb = self.sandbox.lock().await;
+        let retention = crate::common::retained::Guard::host().map_err(Others)?;
+        retention.require_absent(sb.sandbox_id()).map_err(Others)?;
+        // Ordinary deletion must not race host-side retention admission.
         // After PauseToSnapshot the MicroVM is already gone; Cubelet Destroy may
         // still call Delete to reap the task. Treat delete-while-paused as
         // success and exit the shim (same as shutdown).
@@ -605,7 +612,7 @@ impl Task for TaskService {
         }
         let (exit_code, exit_tm) = {
             if req.exec_id.is_empty() {
-                match sb.delete_container(&req.id).await {
+                match sb.delete_container(&req.id, &retention).await {
                     Err(e) => {
                         errf!(self.log, "delete container failed:{}", e);
                         return Err(e.into());
@@ -695,8 +702,40 @@ impl Task for TaskService {
         req: api::UpdateTaskRequest,
     ) -> TtrpcResult<api::Empty> {
         infof!(self.log, "update req start, id:{}", &req.id);
+        // Annotation selects a binding only; it cannot create authority.
+        if req.annotations.get("cube.shimapi.update.action").map(String::as_str)
+            == Some(crate::common::retained::ACTION)
+        {
+            if req.resources.is_some() {
+                return Err(Others("retained stop cannot update resources".into()));
+            }
+            let raw = req.annotations.get(crate::common::retained::BINDING_ANNOTATION)
+                .ok_or_else(|| Others("missing retained stop binding".into()))?;
+            let binding = serde_json::from_str(raw).map_err(|e| Others(format!("retained binding: {e}")))?;
+            let mut sb = self.sandbox.lock().await;
+            if req.id != sb.sandbox_id() {
+                return Err(Others("retained stop source ID mismatch".into()));
+            }
+            let retention = crate::common::retained::Guard::host().map_err(Others)?;
+            retention.authorize_current(sb.sandbox_id(), &binding).map_err(Others)?;
+            // Immutable authority survives cancellation. Do not hold flock
+            // across a native API call: fresh reap must be able to finish an
+            // interrupted/stalled stop using the recorded pidfds.
+            drop(retention);
+            sb.stop_retained_runtime().await.map_err(Others)?;
+            // ACK is NOT process exit or storage drain. Caller must observe
+            // pidfd exit; fresh reap can finish an interrupted/lost-ACK stop.
+            let exit = self.exit.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                exit.signal();
+            });
+            return Ok(api::Empty::default());
+        }
         let outcome = {
             let mut sb = self.sandbox.lock().await;
+            let retention = crate::common::retained::Guard::host().map_err(Others)?;
+            retention.require_absent(sb.sandbox_id()).map_err(Others)?;
             if sb.paused().await {
                 errf!(self.log, "sandbox not in normal state");
                 return Err(Others(format!("sandbox not in normal state")));
@@ -761,6 +800,8 @@ impl Task for TaskService {
         infof!(self.log, "shutdown req start");
 
         let mut sb = self.sandbox.lock().await;
+        let retention = crate::common::retained::Guard::host().map_err(Others)?;
+        retention.require_absent(sb.sandbox_id()).map_err(Others)?;
         // After PauseToSnapshot the sandbox is Paused (MicroVM already gone).
         // Allow shutdown so Cubelet can reap the shim; skip destroy_sandbox
         // when already paused because there is no live VM to tear down.
@@ -770,11 +811,12 @@ impl Task for TaskService {
                 self.log,
                 "sandbox not empty, do nothing, shutdown req finish"
             );
-            return Ok(api::Empty::default());
+            return Err(Others("sandbox not empty; shutdown refused".into()));
         }
         if !already_paused {
             if let Err(e) = sb.destroy_sandbox().await {
-                errf!(self.log, "shutdown failed:{}", e)
+                errf!(self.log, "shutdown failed:{}", e);
+                return Err(Others(format!("shutdown failed: {e}")));
             } else {
                 infof!(self.log, "shutdown req finish");
             }

@@ -164,6 +164,15 @@ impl SandboxService {
             .and_then(|s| s.end_at.as_ref().cloned())
             .or(d.end_at);
 
+        // Registered writable-rootfs contract, not measured runtime geometry.
+        let disk_size_mb = if d.disk_size_mb > 0 { Some(d.disk_size_mb) }
+        else if !d.template_id.is_empty() {
+            let template = self.cubemaster.get_template(&d.template_id).await.map_err(params_error_or_internal)?;
+            if template.template_id != d.template_id || template.status != "READY" {
+                return Err(AppError::Internal(anyhow::anyhow!("Sandbox template geometry is unavailable")));
+            }
+            template.create_request.as_ref().and_then(template_rootfs_mib)
+        } else { None };
         let envd_version = envd_version_from_annotations(&d.annotations);
         Ok(SandboxDetail {
             template_id: d.template_id,
@@ -178,7 +187,7 @@ impl SandboxService {
             cpu_count: d.cpu_count,
             cpu_milli: (d.cpu_milli > 0).then_some(d.cpu_milli),
             memory_mb: d.memory_mb,
-            disk_size_mb: Some(d.disk_size_mb),
+            disk_size_mb,
             metadata: optional_metadata(d.labels),
             state: sandbox_state_from_status(d.status),
             volume_mounts: map_volume_mounts(&d.volume_mounts),
@@ -2921,5 +2930,43 @@ mod tests {
         let mounts: Vec<crate::models::SandboxVolumeMount> = vec![];
         let has_mounts = !mounts.is_empty();
         assert!(!has_mounts, "no mounts → containers should stay empty");
+    }
+}
+
+// Fail closed for ambiguous or malformed single-container rootfs contracts.
+fn template_rootfs_mib(request: &serde_json::Value) -> Option<i32> {
+    let containers = request.get("containers")?.as_array()?;
+    if containers.len() != 1 { return None; }
+    let mounts = containers[0].get("volume_mounts")?.as_array()?;
+    let roots: Vec<_> = mounts.iter().filter(|m| m.get("container_path").and_then(|v| v.as_str()) == Some("/")).collect();
+    if roots.len() != 1 || roots[0].get("readonly").and_then(|v| v.as_bool()) == Some(true) { return None; }
+    let name = roots[0].get("name")?.as_str()?;
+    let volumes: Vec<_> = request.get("volumes")?.as_array()?.iter()
+        .filter(|v| v.get("name").and_then(|n| n.as_str()) == Some(name)).collect();
+    if volumes.len() != 1 { return None; }
+    let size = volumes[0].pointer("/volume_source/empty_dir/size_limit")?.as_str()?;
+    let (number, multiplier) = if let Some(n) = size.strip_suffix("Gi") { (n, 1024u64) }
+        else if let Some(n) = size.strip_suffix("Mi") { (n, 1u64) }
+        else { return None; };
+    let mib = number.parse::<u64>().ok()?.checked_mul(multiplier)?;
+    if mib == 0 || mib > i32::MAX as u64 { return None; }
+    Some(mib as i32)
+}
+
+#[cfg(test)]
+mod native_geometry_tests {
+    use super::*;
+    #[test]
+    fn rootfs_contract_is_bound_and_fail_closed() {
+        let mut r = serde_json::json!({"containers":[{"volume_mounts":[{"name":"root","container_path":"/"}]}],
+            "volumes":[{"name":"root","volume_source":{"empty_dir":{"size_limit":"2Gi"}}}]});
+        assert_eq!(template_rootfs_mib(&r), Some(2048));
+        r["volumes"][0]["name"] = "other".into(); assert_eq!(template_rootfs_mib(&r),None);
+        r["volumes"][0]["name"] = "root".into();
+        for size in ["0Gi", "-1Gi", "NaNGi", "999999999999999999Gi", "garbage"] {
+            r["volumes"][0]["volume_source"]["empty_dir"]["size_limit"] = size.into();
+            assert_eq!(template_rootfs_mib(&r),None);
+        }
+        assert_eq!(template_rootfs_mib(&serde_json::json!({})),None);
     }
 }

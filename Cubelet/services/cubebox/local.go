@@ -42,6 +42,7 @@ import (
 	"github.com/tencentcloud/CubeSandbox/Cubelet/pkg/container/runc"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/pkg/container/virtiofs"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/pkg/log"
+	"github.com/tencentcloud/CubeSandbox/Cubelet/pkg/sourcefence"
 	cubeboxstore "github.com/tencentcloud/CubeSandbox/Cubelet/pkg/store/cubebox"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/pkg/taskio"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/pkg/utils"
@@ -56,8 +57,12 @@ const (
 )
 
 type CubeConfig struct {
-	RootPath  string `toml:"root_path"`
-	StatePath string `toml:"state_path"`
+	// New admission only; existing durable source fences are always enforced.
+	SourceFenceEnabled bool                       `toml:"source_fence_enabled"`
+	SourceFenceNodeID  string                     `toml:"source_fence_node_id"`
+	SourceFenceRuntime sourcefence.RetainedConfig `toml:"source_fence_runtime"`
+	RootPath           string                     `toml:"root_path"`
+	StatePath          string                     `toml:"state_path"`
 
 	CubeHostSharedDir  string `toml:"cube_host_shared_dir"`
 	CubeHyperVisorPath string `toml:"cube_hypervisor_path"`
@@ -215,10 +220,18 @@ func init() {
 				envdInitPort:   defaultEnvdInitPort,
 			}
 
+			workflow.SourceFences, err = sourcefence.Open(config.RootPath + "-source-fences")
+			if err != nil {
+				return nil, fmt.Errorf("open source fences: %w", err)
+			}
+
 			CubeLog.Info("Start recovering state")
 
 			cbriManager.SetCubeRuntimeImplementation(l)
 			afterRecover := func(tmpCtx context.Context, cb *cubeboxstore.CubeBox) error {
+				if workflow.SourceFences.Check(cb.ID) != nil {
+					return nil
+				}
 				if cb.GetPublicationHold() != nil {
 					return nil
 				}
@@ -280,6 +293,11 @@ func (l *local) ID() string {
 }
 
 func (l *local) Init(ctx context.Context, opts *workflow.InitInfo) error {
+	// Bulk initialization destroys local runtime/storage state. Never run it
+	// over retained recovery sources, even when new admission is disabled.
+	if err := workflow.SourceFences.Any(); err != nil {
+		return err
+	}
 
 	CubeLog.WithContext(ctx).Errorf("Init doing")
 	defer CubeLog.WithContext(ctx).Errorf("Init end")
@@ -422,8 +440,16 @@ func unmountNoFollow(path string) error {
 }
 
 func (l *local) CleanUp(ctx context.Context, opts *workflow.CleanContext) error {
+	if opts != nil {
+		if err := workflow.SourceFences.Check(opts.SandboxID); err != nil {
+			return err
+		}
+	}
 
 	if opts == nil {
+		return nil
+	}
+	if evidence := workflow.LifecycleCleanupFrom(ctx); evidence != nil && evidence.NeverStarted {
 		return nil
 	}
 	stepLog := log.G(ctx).WithFields(CubeLog.Fields{
@@ -435,7 +461,7 @@ func (l *local) CleanUp(ctx context.Context, opts *workflow.CleanContext) error 
 	info, err := l.cubeboxManger.Get(ctx, sandBoxID)
 	if err != nil {
 		if errors.Is(err, utils.ErrorKeyNotFound) || errors.Is(err, utils.ErrorBucketNotFound) {
-			return nil
+			return requireRuntimeCleanupEvidence(ctx, sandBoxID)
 		}
 		CubeLog.WithContext(ctx).Warnf("clean up getSandBoxInfo [%s] fail:%v", sandBoxID, err)
 		return err
@@ -450,6 +476,12 @@ func (l *local) CleanUp(ctx context.Context, opts *workflow.CleanContext) error 
 	}
 	ctx = namespaces.WithNamespace(ctx, ns)
 
+	runtimePIDs := l.collectSandboxRuntimePIDs(ctx, info)
+	if len(runtimePIDs) == 0 {
+		if err := requireRuntimeCleanupEvidence(ctx, sandBoxID); err != nil {
+			return err
+		}
+	}
 	err = l.cbriManager.DestroySandbox(ctx, info.SandboxID)
 	if err != nil {
 		log.G(ctx).Errorf("faild to destroy cbri sandbox %s", err.Error())
@@ -466,8 +498,10 @@ func (l *local) CleanUp(ctx context.Context, opts *workflow.CleanContext) error 
 		ctrLists = append(ctrLists, ctr)
 	}
 	ctrLists = append(ctrLists, info.FirstContainer())
-	runtimePIDs := l.collectSandboxRuntimePIDs(ctx, info)
 	for _, ctr := range ctrLists {
+		if ctr == nil {
+			continue
+		}
 		err = l.stopTask(ctx, ctr.Container)
 		if err != nil {
 			stepLog.Warnf("CleanUp stopTask %s fail: %v", sandBoxID, err)
@@ -477,6 +511,7 @@ func (l *local) CleanUp(ctx context.Context, opts *workflow.CleanContext) error 
 		return fmt.Errorf("shim process still Exists [%s]: %w", sandBoxID, err)
 	}
 
+	workflow.MarkRuntimeGone(ctx)
 	var (
 		result *multierror.Error
 	)

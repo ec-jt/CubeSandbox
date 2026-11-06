@@ -194,7 +194,7 @@ func TestStore_PublishState_HappyPath(t *testing.T) {
 			r := &fakeRedis{}
 			s := NewStore(r)
 
-			s.PublishState(context.Background(), "sbx-1", tc.state, "api")
+			s.PublishState(context.Background(), "sbx-1", tc.state, "api", "operation-receipt")
 
 			calls := r.snapshot()
 			if len(calls) != 1 {
@@ -231,6 +231,9 @@ func TestStore_PublishState_HappyPath(t *testing.T) {
 			var got StatePayload
 			if err := json.Unmarshal(payloadBytes, &got); err != nil {
 				t.Fatalf("payload json: %v", err)
+			}
+			if got.RequestID != "operation-receipt" {
+				t.Fatalf("missing request receipt: %+v", got)
 			}
 			if got.State != tc.state {
 				t.Fatalf("payload state = %q, want %q", got.State, tc.state)

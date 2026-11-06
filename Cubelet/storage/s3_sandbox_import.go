@@ -163,8 +163,8 @@ func (s *SandboxImport) Memory(ctx context.Context) (string, string, error) {
 }
 
 // importOne materializes one exported object under name and opens its block
-// device. A retried Create finds its own leftover and reuses it; the names
-// are unique to this sandbox, so nothing else can have put one there.
+// device. A retried Create may reuse a leftover only after checking native
+// blob-local origin. A sandbox-derived name is not proof of identity.
 //
 // Unlike [S3Cow.fetchOne] this does not accept "the object is here now" as
 // proof that a failed import succeeded. That tolerance exists for package
@@ -183,11 +183,19 @@ func (s *SandboxImport) importOne(ctx context.Context, name, role, uuid string) 
 	if store == nil {
 		return "", fmt.Errorf("s3 cow store is not initialized")
 	}
+	// Acquire the COMPLETE committed set before any import, activation, mount,
+	// or metadata read. Service calls reuse a trusted request-scoped attempt;
+	// standalone calls mint one. Neither borrows the import-reader identity. Holds are retained
+	// on every outcome until a durable safe-release protocol is implemented.
+	if _, err := s.acquireRemoteRestoreRetention(ctx, store); err != nil {
+		return "", fmt.Errorf("protect cross-node restore before %s use: %w", role, err)
+	}
 	importer, ok := store.engine.(cowVolumeImporter)
 	if !ok || importer == nil {
 		return "", fmt.Errorf("cubecow engine cannot import %s %s", role, name)
 	}
-	present, err := cowObjectPresent(store.GetVolumeInfo(ctx, name))
+	info, lookupErr := store.GetVolumeInfo(ctx, name)
+	present, err := cowObjectPresent(info, lookupErr)
 	if err != nil {
 		return "", fmt.Errorf("lookup %s %s: %w", role, name, err)
 	}
@@ -195,6 +203,13 @@ func (s *SandboxImport) importOne(ctx context.Context, name, role, uuid string) 
 		if _, err := importer.ImportLvol(name, uuid); err != nil && !isCowSemantic(err, cubecow.SemAlreadyExists) {
 			return "", fmt.Errorf("import %s %s (remote_uuid=%s): %w", role, name, uuid, err)
 		}
+		info, err = store.GetVolumeInfo(ctx, name)
+		if err != nil {
+			return "", fmt.Errorf("read native origin for %s %s: %w", role, name, err)
+		}
+	}
+	if err := requireImportedOrigin(info, name, uuid); err != nil {
+		return "", fmt.Errorf("refuse imported %s %s: %w", role, name, err)
 	}
 	if _, err := store.engine.ActivateVolume(name); err != nil && !isCowSemantic(err, cubecow.SemAlreadyExists) {
 		return "", fmt.Errorf("activate imported %s %s: %w", role, name, err)
@@ -204,4 +219,17 @@ func (s *SandboxImport) importOne(ctx context.Context, name, role, uuid string) 
 		return "", fmt.Errorf("resolve imported %s %s: %w", role, name, err)
 	}
 	return dev, nil
+}
+
+func requireImportedOrigin(info *cubecow.Volume, name, uuid string) error {
+	if info == nil || info.ImportOrigin == nil {
+		return fmt.Errorf("native import origin is absent")
+	}
+	o := info.ImportOrigin
+	if o.Version != 1 || info.Name != name || info.VolumeUUID == "" ||
+		o.VolumeUUID != info.VolumeUUID || o.LvstoreUUID == "" ||
+		uuid == "" || o.ExportUUID != uuid || o.SizeBytes == 0 {
+		return fmt.Errorf("native import origin does not match destination and requested export")
+	}
+	return nil
 }

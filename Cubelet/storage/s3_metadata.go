@@ -161,6 +161,15 @@ func EnsureS3MetadataReady(ctx context.Context) error {
 // first use, then snapshots it and deactivates the volume (no further host
 // IO). Restart of an older Cubelet that left the base activated is reconciled
 // on this path. Missing volumes are recreated.
+//
+// Presence is decided against the CURRENT attached lvstore, never against the
+// persisted state file alone. The state file outlives the lvstore, so a base
+// recorded for a destroyed lvstore used to look present here; the code then
+// activated a device the lvstore does not have and never created the base,
+// leaving every backend=s3 request on ErrS3NotReady. A base that is not in the
+// attached lvstore is created there (create + mkfs + snapshot). A base that is
+// present is reused without mkfs. Nothing is ever reused across lvstores and
+// no existing metadata volume or snapshot is deleted or rewritten.
 func EnsureS3MetadataBase(ctx context.Context) error {
 	store, err := requireS3Cow()
 	if err != nil {
@@ -174,12 +183,12 @@ func EnsureS3MetadataBase(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	name := strings.TrimSpace(state.Base.Name)
-	if name == "" {
-		name = S3MetadataBaseVolumeName
-	}
-	if name != S3MetadataBaseVolumeName {
-		CubeLog.Warnf("s3 metadata base using persisted name %q", name)
+	// The base always lives under the canonical name in the attached lvstore.
+	// A persisted name from another lvstore is reported, never adopted: the
+	// base must be created here, and the old object is left untouched.
+	name := S3MetadataBaseVolumeName
+	if persisted := strings.TrimSpace(state.Base.Name); persisted != "" && persisted != name {
+		CubeLog.Warnf("s3 metadata base persisted name %q is not the canonical %q; using the canonical name in the attached lvstore", persisted, name)
 	}
 
 	info, infoErr := store.GetVolumeInfo(ctx, name)
@@ -215,6 +224,12 @@ func EnsureS3MetadataBase(ctx context.Context) error {
 		return nil
 	}
 
+	// The base is not in the attached lvstore. A persisted record for this
+	// name is a binding to a lvstore that no longer holds it: it is stale, and
+	// the object it names must be created here, not activated.
+	if state.Base.Name != "" || state.Base.Formatted {
+		CubeLog.Warnf("s3 metadata base %q is not present in the attached lvstore; creating it here (persisted formatted=%v)", name, state.Base.Formatted)
+	}
 	devPath, created, err := store.createOrResolveVolumePath(ctx, name, s3MetadataBaseSizeBytes)
 	if err != nil {
 		return fmt.Errorf("create s3 metadata base %s: %w", name, err)
@@ -224,7 +239,9 @@ func EnsureS3MetadataBase(ctx context.Context) error {
 		_ = store.DeleteByKind(ctx, name, cowKindVolume)
 		return err
 	}
-	if created || !state.Base.Formatted {
+	// A base created here is always formatted: the persisted Formatted flag
+	// describes a different lvstore's object and must not skip mkfs.
+	if created {
 		if err := formatS3MetadataBaseDevice(devPath); err != nil {
 			_ = store.DeleteByKind(ctx, name, cowKindVolume)
 			return fmt.Errorf("format s3 metadata base %s at %s: %w", name, devPath, err)
@@ -251,6 +268,10 @@ func EnsureS3MetadataBase(ctx context.Context) error {
 	return nil
 }
 
+// ensureS3MetadataBaseSnapshotLocked makes sure the base's RO snapshot exists
+// in the attached lvstore. The snapshot name is always the canonical one for
+// the base: a persisted name from another lvstore is not reused, because the
+// snapshot must be derived from the base that is actually here.
 func ensureS3MetadataBaseSnapshotLocked(ctx context.Context, store *S3Cow, base *s3MetadataBaseRecord) error {
 	if store == nil || base == nil {
 		return fmt.Errorf("s3 metadata base snapshot requires store and base record")
@@ -260,20 +281,18 @@ func ensureS3MetadataBaseSnapshotLocked(ctx context.Context, store *S3Cow, base 
 		volName = S3MetadataBaseVolumeName
 		base.Name = volName
 	}
-	snapName := strings.TrimSpace(base.SnapshotName)
-	if snapName == "" {
-		snapName = S3MetadataBaseSnapshotName
-	}
+	snapName := S3MetadataBaseSnapshotName
 	info, infoErr := store.GetVolumeInfo(ctx, snapName)
 	exists, err := cowObjectPresent(info, infoErr)
 	if err != nil {
 		return fmt.Errorf("lookup s3 metadata base snapshot %s: %w", snapName, err)
 	}
 	if !exists {
-		if _, err := store.engine.CreateSnapshotFromVolume(volName, snapName, false); err != nil {
-			if !isCowSemantic(err, cubecow.SemAlreadyExists) {
-				return fmt.Errorf("create s3 metadata base snapshot %s from %s: %w", snapName, volName, err)
-			}
+		// Absent from the attached lvstore: create it here. A persisted name
+		// that the index still reports as existing is a stale binding and is
+		// recreated rather than trusted (see createOrResolveInactiveSnapshot).
+		if _, err := store.createOrResolveInactiveSnapshot(ctx, volName, snapName); err != nil {
+			return fmt.Errorf("create s3 metadata base snapshot %s from %s: %w", snapName, volName, err)
 		}
 	}
 	base.SnapshotName = snapName
@@ -772,21 +791,41 @@ func saveS3MetadataState(state *s3MetadataState) error {
 	return writeS3MetadataKV(body)
 }
 
+// readS3MetadataKV returns the persisted state document, treating "absent" and
+// "present but zero-length" identically: both yield (nil, nil). The key/value
+// store only reports ErrorKeyNotFound/ErrorBucketNotFound for a missing
+// record, so a stored empty value comes back as a non-nil zero-length slice
+// with err == nil. Propagating that slice made loadS3MetadataState hand an
+// empty buffer to json.Unmarshal, which fails with "unexpected end of JSON
+// input" and aborted the fence RPC before any binding or sidecar was written.
+// Normalizing the empty document here keeps a fresh vault equivalent to a
+// missing one while leaving malformed non-empty documents to fail closed in
+// loadS3MetadataState.
 func readS3MetadataKV() ([]byte, error) {
-	if testS3MetadataKV != nil {
-		return testS3MetadataKV.Get()
-	}
-	if localStorage == nil || localStorage.db == nil {
-		return nil, nil
-	}
-	b, err := localStorage.db.Get(s3MetadataBucket, s3MetadataStateKey)
+	b, err := readS3MetadataRaw()
 	if err != nil {
 		if errors.Is(err, utils.ErrorKeyNotFound) || errors.Is(err, utils.ErrorBucketNotFound) {
 			return nil, nil
 		}
 		return nil, err
 	}
+	if len(b) == 0 {
+		return nil, nil
+	}
 	return b, nil
+}
+
+// readS3MetadataRaw performs the underlying key/value read and returns store
+// errors unmapped, so absent-record handling stays identical for the real
+// store and for the test hook.
+func readS3MetadataRaw() ([]byte, error) {
+	if testS3MetadataKV != nil {
+		return testS3MetadataKV.Get()
+	}
+	if localStorage == nil || localStorage.db == nil {
+		return nil, nil
+	}
+	return localStorage.db.Get(s3MetadataBucket, s3MetadataStateKey)
 }
 
 func writeS3MetadataKV(body []byte) error {

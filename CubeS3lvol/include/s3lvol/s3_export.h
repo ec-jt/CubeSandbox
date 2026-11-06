@@ -63,6 +63,9 @@
  *    a bump.
  */
 #define S3_EXPORT_VERSION       3
+/* Version 4 is dense-only and requires durable admission before exposure.
+ * Never upgrade an already-published v2/v3 manifest in place. */
+#define S3_EXPORT_ADMISSION_VERSION 4
 
 /* The oldest a reader accepts. Writing is always at S3_EXPORT_VERSION; reading
  * has to span the range, because manifests already in a bucket outlive the binary
@@ -561,6 +564,7 @@ void s3_export_chunk_prefix(const char *prefix, const char *uuid_str,
 
 struct s3_export_opts {
 	struct s3_client       *client;
+	bool                   release_safe; /* New publication only, dense v4. */
 	const char             *prefix;      /* destination prefix, i.e. lvs_name */
 	const char             *uuid_str;    /* export uuid, already generated */
 

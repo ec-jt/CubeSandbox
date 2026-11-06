@@ -639,6 +639,14 @@ wal_submit(struct s3_wal *wal, enum s3_wal_entry_type type, uint64_t lba,
 		}
 		return;
 	}
+	/* Preserve legacy replay without admitting writes into a geometry that
+	 * cannot reclaim its only segment before backpressure stops progress. */
+	if (wal->seg_count < 2) {
+		if (cb_fn) {
+			cb_fn(cb_arg, -ENOSPC);
+		}
+		return;
+	}
 	/* Backpressure is a retry signal, not a failure: blobstore will queue
 	 * and resubmit. */
 	if (wal->state == S3_WAL_BACKPRESSURE) {
@@ -888,9 +896,10 @@ s3_wal_sync_super(struct s3_wal *wal, uint64_t ckpt_seq, s3_wal_cb cb_fn,
  * a log formatted with 2 MiB segments failed to open, because open assumed the
  * 16 MiB default and concluded the region could not hold three segments. */
 static int
-wal_setup_geometry(struct s3_wal *wal, uint32_t seg_size)
+wal_setup_geometry(struct s3_wal *wal, uint32_t seg_size, bool creating)
 {
 	uint64_t ring_bytes;
+	uint32_t seg_count;
 
 	if (seg_size == 0) {
 		seg_size = S3_WAL_DEFAULT_SEG_SIZE;
@@ -916,8 +925,25 @@ wal_setup_geometry(struct s3_wal *wal, uint32_t seg_size)
 		return -ENOSPC;
 	}
 
+	seg_count = (uint32_t)(ring_bytes / seg_size) - 2;
+
+	/* With one usable segment, 85% backpressure stops appends before a
+	 * segment can close, so even a fully flushed log cannot reclaim space.
+	 * Reject new logs before writing. Keep legacy geometry readable for
+	 * recovery; wal_submit refuses its appends rather than retrying forever.
+	 * Recover into a separately formatted adequate log, never resize in place. */
+	if (seg_count < 2) {
+		if (creating) {
+			SPDK_ERRLOG("WAL requires at least 2 usable segments; region=%"
+				    PRIu64 " segment_size=%u\n", wal->region_size, seg_size);
+			return -ENOSPC;
+		}
+		SPDK_WARNLOG("Legacy one-segment WAL: replay allowed, appends disabled; "
+			     "recover into a new adequately sized WAL\n");
+	}
+
 	wal->seg_size  = seg_size;
-	wal->seg_count = (uint32_t)(ring_bytes / seg_size) - 2;
+	wal->seg_count = seg_count;
 
 	/* Sized here rather than in wal_alloc() because seg_count is only known
 	 * now. open() calls this twice (default first, then the on-disk value),
@@ -1114,7 +1140,7 @@ s3_wal_create(struct s3_local_dev *local_dev, const struct s3_wal_opts *opts,
 		return;
 	}
 
-	rc = wal_setup_geometry(wal, seg_size);
+	rc = wal_setup_geometry(wal, seg_size, true);
 	if (rc != 0) {
 		wal_free(wal);
 		cb_fn(cb_arg, NULL, rc);
@@ -1202,7 +1228,7 @@ wal_open_super_read(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
 	 * agrees. A disagreement means the WAL region was resized underneath an
 	 * existing log, and every offset derived from seg_count would then point
 	 * somewhere else, so refuse rather than silently misread the log. */
-	if (wal_setup_geometry(wal, best->seg_size) != 0) {
+	if (wal_setup_geometry(wal, best->seg_size, false) != 0) {
 		wal_open_finish(ctx, -EPROTO);
 		return;
 	}

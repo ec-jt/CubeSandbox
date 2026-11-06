@@ -1,0 +1,45 @@
+# Copyright (c) 2026 Tencent Inc.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Standalone build for s3_recovery_unwind_test.c.
+#
+# Links ONE real translation unit:
+#
+#   lib/s3bsdev/s3_recovery_unwind.c   the release-ordering state machine
+#
+# It calls no SPDK function except the logging/error-string helpers, which the
+# test wraps, so no SPDK archive, bdev module, hugepages, PCI device or
+# hardware is required. Build with the sanitizers enabled:
+#
+#   make -f /work/test/integration/Makefile.s3_recovery_unwind \
+#        WORK=/work TARGET=/evid/s3_recovery_unwind_test \
+#        SANITIZE="-fsanitize=address,undefined -fno-omit-frame-pointer"
+#
+# Defaults build into /tmp.
+
+CC ?= cc
+WORK ?= /work
+
+CFLAGS ?= -I$(WORK)/include -I$(WORK)/deps/spdk/include \
+	-Wall -Wextra -Wno-unused-parameter -Werror \
+	-DDEBUG -g3 -O0 -D_GNU_SOURCE -fno-strict-aliasing \
+	-ffunction-sections -fdata-sections $(SANITIZE)
+
+UNWIND_SRC ?= $(WORK)/lib/s3bsdev/s3_recovery_unwind.c
+TEST_SRC ?= $(WORK)/test/integration/s3_recovery_unwind_test.c
+TARGET ?= /tmp/s3_recovery_unwind_test
+OBJ_UNWIND := $(TARGET).unwind.o
+
+WRAPS := \
+	-Wl,--wrap=spdk_log \
+	-Wl,--wrap=spdk_strerror
+
+all: $(TARGET)
+
+$(TARGET): $(UNWIND_SRC) $(TEST_SRC)
+	$(CC) $(CFLAGS) -c $(UNWIND_SRC) -o $(OBJ_UNWIND)
+	$(CC) $(CFLAGS) $(TEST_SRC) $(OBJ_UNWIND) $(WRAPS) \
+		-Wl,--gc-sections -o $(TARGET)
+
+clean:
+	rm -f $(OBJ_UNWIND) $(TARGET)

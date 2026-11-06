@@ -2297,6 +2297,12 @@ pub fn setup_bundle(
         lowerdir,
     ));
 
+    if spec.annotations.get("cube.rootfs.retained.required").map(String::as_str) == Some("true") {
+        let retained = spec.annotations.get(ANNOTATION_K_ROOTFS_WL_PATH)
+            .ok_or_else(|| anyhow!("cold recreate missing retained rootfs attachment"))?;
+        crate::retained_rootfs::validate(Path::new(retained))
+            .map_err(|e| anyhow!(e).context("cold recreate retained rootfs rejected"))?;
+    }
     fs::create_dir_all(&rootfs_path)?;
     let mut read_only = true;
     if let Some(wl_path) = spec.annotations.get(ANNOTATION_K_ROOTFS_WL_PATH) {

@@ -36,6 +36,7 @@ ngx.req.set_uri(rest, false)
 
 -- Auto-pause gate: if the sandbox is currently paused, ask CLM to resume it
 -- before we attempt backend resolution. No-op when the sandbox isn't tracked.
+sb.authorize(ins_id)
 state.gate(ins_id)
 
 local host_ip, host_port, mask_request_host = sb.resolve_backend(ins_id, container_port)

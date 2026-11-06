@@ -151,7 +151,7 @@ func applySnapshotPorts(ctx context.Context, req *cubebox.RunCubeSandboxRequest,
 // actual VM restore. Templates retain legacy behavior when no record is present.
 func restoreSnapshotPorts(ctx context.Context, req *cubebox.RunCubeSandboxRequest) (context.Context, error) {
 	flow := &workflow.CreateContext{ReqInfo: req}
-	if !flow.IsRetoreSnapshot() {
+	if !flow.IsRetoreSnapshot() && !flow.IsColdRecreate() {
 		return ctx, nil
 	}
 	id, ok := flow.GetSnapshotTemplateID()

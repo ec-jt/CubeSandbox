@@ -28,6 +28,7 @@
 #include "s3lvol/s3_client.h"
 #include "s3lvol/s3_spawner.h"
 #include "s3_copy_xml.h"
+#include "s3_put_etag.h"
 
 /* ==========================================================================
  * Internal structures
@@ -59,6 +60,8 @@ struct app_context {
 	struct aws_tls_ctx               *tls_ctx;
 	struct aws_tls_connection_options tls_connection_options;
 	struct aws_logger                 logger;
+	/* Frozen before any client is created; shared by every pool entry. */
+	bool                              put_if_match_bare_etag;
 };
 
 struct s3_client {
@@ -155,6 +158,16 @@ struct s3_request {
 	uint64_t                         bytes_read;
 
 	bool                             if_none_match;
+
+	/* DELETE: conditional release. The header value is copied at submit so
+	 * the caller's buffer may be freed as soon as the call returns. */
+	bool                             has_if_match;
+	char                             if_match_buf[128];
+
+	/* GET: where to put the response ETag (may be NULL). Kept alive by the
+	 * caller until the callback fires. */
+	char                            *etag_out;
+	size_t                           etag_cap;
 
 	/* CopyObject: the body was larger than S3_COPY_XML_MAX. The prefix can
 	 * still be a valid CopyObjectResult; without that opening tag it is
@@ -478,6 +491,46 @@ s3_request_set_key(struct s3_request *req, const char *key)
 	return 0;
 }
 
+/* Percent-encode a key for the request path.
+ *
+ * The key is placed in the request path verbatim today. That is fine for the
+ * uuid-named data objects, but not for anything a caller supplies: a space, a
+ * quote or a non-ASCII byte in a key produces a malformed request line, and
+ * some backends reject the whole request with 400 before it reaches the
+ * object layer. The owner marker and the probe key are built from an lvstore
+ * name, which is caller-supplied, so they need this.
+ *
+ * Unreserved characters (RFC 3986 2.3) and '/' are left alone; everything
+ * else becomes %XX. '/' is kept because it is the key separator and S3 treats
+ * it as a literal path character.
+ */
+static int
+s3_encode_key_path(struct aws_allocator *allocator, struct aws_byte_cursor key,
+		   struct aws_byte_buf *out)
+{
+	static const char hex[] = "0123456789ABCDEF";
+	size_t i;
+
+	if (aws_byte_buf_init(out, allocator, key.len * 3 + 1)) {
+		return AWS_OP_ERR;
+	}
+
+	for (i = 0; i < key.len; i++) {
+		unsigned char c = key.ptr[i];
+
+		if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+		    (c >= '0' && c <= '9') || c == '-' || c == '_' ||
+		    c == '.' || c == '~' || c == '/') {
+			aws_byte_buf_append_byte_dynamic(out, c);
+		} else {
+			aws_byte_buf_append_byte_dynamic(out, '%');
+			aws_byte_buf_append_byte_dynamic(out, (uint8_t)hex[c >> 4]);
+			aws_byte_buf_append_byte_dynamic(out, (uint8_t)hex[c & 0xF]);
+		}
+	}
+	return AWS_OP_SUCCESS;
+}
+
 /* ==========================================================================
  * Helper: build the request path
  *
@@ -494,21 +547,33 @@ s3_set_request_path(struct aws_http_message *message,
 	struct aws_byte_buf path_buf;
 	int rc;
 
+	struct aws_byte_buf encoded;
+
+	if (s3_encode_key_path(allocator, key, &encoded) != AWS_OP_SUCCESS) {
+		return AWS_OP_ERR;
+	}
+
 	if (client->use_path_style) {
 		struct aws_byte_cursor bucket_cur = aws_byte_cursor_from_c_str(client->bucket);
 		if (aws_byte_buf_init(&path_buf, allocator,
-				      1 + bucket_cur.len + 1 + key.len)) {
+				      1 + bucket_cur.len + 1 + encoded.len)) {
+			aws_byte_buf_clean_up(&encoded);
 			return AWS_OP_ERR;
 		}
 		aws_byte_buf_append_dynamic(&path_buf, &g_slash_cur);
 		aws_byte_buf_append_dynamic(&path_buf, &bucket_cur);
 	} else {
-		if (aws_byte_buf_init(&path_buf, allocator, 1 + key.len)) {
+		if (aws_byte_buf_init(&path_buf, allocator, 1 + encoded.len)) {
+			aws_byte_buf_clean_up(&encoded);
 			return AWS_OP_ERR;
 		}
 	}
 	aws_byte_buf_append_dynamic(&path_buf, &g_slash_cur);
-	aws_byte_buf_append_dynamic(&path_buf, &key);
+	{
+		struct aws_byte_cursor enc_cur = aws_byte_cursor_from_buf(&encoded);
+		aws_byte_buf_append_dynamic(&path_buf, &enc_cur);
+	}
+	aws_byte_buf_clean_up(&encoded);
 
 	struct aws_byte_cursor path_cur = aws_byte_cursor_from_buf(&path_buf);
 	rc = aws_http_message_set_request_path(message, path_cur);
@@ -547,6 +612,14 @@ s3_crt_global_init_body(uint32_t event_loop_threads)
 	if (g_app_ctx_initialized) {
 		SPDK_WARNLOG("CRT global context already initialized\n");
 		return 0;
+	}
+
+	/* Process-wide, not per-request getenv(): pooled clients cannot change
+	 * wire format mid-lifetime. Reinitialization after fini may select anew. */
+	if (s3_put_etag_mode_parse(getenv("S3LVOL_PUT_IF_MATCH_BARE_ETAG"),
+				   &g_app_ctx.put_if_match_bare_etag) != 0) {
+		SPDK_ERRLOG("S3LVOL_PUT_IF_MATCH_BARE_ETAG must be unset, 0 or 1\n");
+		return -EINVAL;
 	}
 
 	if (event_loop_threads == 0) {
@@ -823,7 +896,9 @@ s3_client_get_or_create(const struct s3_target *target, struct s3_client **out)
 	 *
 	 * The aws_s3_client underneath really is per endpoint, so this is one
 	 * connection pool per (endpoint, bucket) rather than per endpoint. That is a
-	 * few more sockets for a correctness property worth having. */
+	 * few more sockets for a correctness property worth having.
+	 * PUT ETag wire mode is frozen on the shared app_ctx at global init, so
+	 * no pool-key component or per-target override is needed for that mode. */
 	for (i = 0; i < g_num_clients; i++) {
 		if (g_clients[i] &&
 		    strcmp(g_clients[i]->endpoint, target->endpoint) == 0 &&
@@ -1074,6 +1149,12 @@ s3_client_bucket(const struct s3_client *client)
 	return client ? client->bucket : "";
 }
 
+const char *
+s3_client_endpoint(const struct s3_client *client)
+{
+	return client ? client->endpoint : "";
+}
+
 void
 s3_client_get(struct s3_client *client)
 {
@@ -1226,6 +1307,39 @@ s3_get_body_callback(struct aws_s3_meta_request *meta_request,
 	return AWS_OP_SUCCESS;
 }
 
+/* Capture the response ETag. aws_s3_meta_request_result carries no success
+	* headers (only error_response_headers), so this has to happen in the headers
+	* callback, exactly like the HEAD size capture. */
+static int
+s3_get_headers_callback(struct aws_s3_meta_request *meta_request,
+			const struct aws_http_headers *headers,
+			int response_status, void *user_data)
+{
+	struct s3_request *req = user_data;
+	struct aws_byte_cursor etag_name = aws_byte_cursor_from_c_str("etag");
+	struct aws_byte_cursor value;
+
+	if (!req->etag_out || req->etag_cap == 0) {
+		return AWS_OP_SUCCESS;
+	}
+
+	if (response_status != 200 && response_status != 206) {
+		return AWS_OP_SUCCESS;
+	}
+
+	if (aws_http_headers_get(headers, etag_name, &value) == AWS_OP_SUCCESS) {
+		size_t n = value.len < req->etag_cap - 1 ? value.len : req->etag_cap - 1;
+
+		memcpy(req->etag_out, value.ptr, n);
+		req->etag_out[n] = '\0';
+	} else {
+		aws_reset_error();
+		req->etag_out[0] = '\0';
+	}
+
+	return AWS_OP_SUCCESS;
+}
+
 static void
 s3_get_finished(struct aws_s3_meta_request *meta_request,
 		const struct aws_s3_meta_request_result *result,
@@ -1262,12 +1376,25 @@ s3_get_range(struct s3_client *client, const char *key,
 	     uint64_t offset, uint64_t len, void *buf,
 	     s3_get_cb cb, void *cb_arg)
 {
+	return s3_get_range_ex(client, key, offset, len, buf, NULL, 0, cb, cb_arg);
+}
+
+int
+s3_get_range_ex(struct s3_client *client, const char *key,
+		uint64_t offset, uint64_t len, void *buf,
+		char *etag_out, size_t etag_len,
+		s3_get_cb cb, void *cb_arg)
+{
 	struct s3_request *req;
 	char range_hdr[128];
 	int rc;
 
 	if (!client || !key || !buf || !cb) {
 		return -EINVAL;
+	}
+
+	if (etag_out && etag_len > 0) {
+		etag_out[0] = '\0';
 	}
 
 	if (len == 0) {
@@ -1287,6 +1414,8 @@ s3_get_range(struct s3_client *client, const char *key,
 	req->offset  = offset;
 	req->len     = len;
 	req->buf     = buf;
+	req->etag_out = etag_out;
+	req->etag_cap = etag_len;
 	req->cb.get_cb = cb;
 	req->cb_arg  = cb_arg;
 	req->is_get  = true;
@@ -1303,6 +1432,7 @@ s3_get_range(struct s3_client *client, const char *key,
 		.user_data      = req,
 		.signing_config = &client->signing_config,
 		.body_callback  = s3_get_body_callback,
+		.headers_callback = s3_get_headers_callback,
 		.finish_callback = s3_get_finished,
 	};
 
@@ -1372,16 +1502,36 @@ s3_put_finished(struct aws_s3_meta_request *meta_request,
 
 		/* 412 Precondition Failed / 409 Conflict on If-None-Match: *
 		 * means the object already exists. Expected during concurrent
-		 * create  — log at a lower level. */
-		if (req->if_none_match && req->status == -EEXIST) {
-			SPDK_NOTICELOG("PutObject: key=%s already exists "
-				       "(If-None-Match rejected, http=%d)\n",
-				       req->key_buf, result->response_status);
+		 * create  — log at a lower level. The same holds for a rejected
+		 * If-Match (CAS) write: the precondition did not hold and the
+		 * object is untouched. */
+		if ((req->if_none_match || req->has_if_match) &&
+		    (req->status == -EEXIST || req->status == -EBUSY ||
+		     (req->has_if_match && req->status == -ENOENT))) {
+			SPDK_NOTICELOG("PutObject: key=%s precondition rejected "
+				       "(%s, http=%d)\n", req->key_buf,
+				       req->has_if_match ? "If-Match" :
+				       "If-None-Match",
+				       result->response_status);
 		} else {
 			SPDK_ERRLOG("PutObject failed: key=%s, error=%d (%s), http=%d\n",
 				    req->key_buf, result->error_code,
 				    aws_error_str(result->error_code),
 				    result->response_status);
+		}
+
+		/* The XML error body is the only place a non-AWS backend says
+		 * *why* it rejected the request (for example a conditional
+		 * header it does not parse). Bounded so a huge error page cannot
+		 * flood the log. */
+		if (result->error_response_body &&
+		    result->error_response_body->len > 0) {
+			int n = (int)result->error_response_body->len;
+			if (n > 512) {
+				n = 512;
+			}
+			SPDK_ERRLOG("PutObject error body: %.*s\n", n,
+				    (const char *)result->error_response_body->buffer);
 		}
 	} else {
 		req->status = 0;
@@ -1407,19 +1557,31 @@ s3_put_finished(struct aws_s3_meta_request *meta_request,
 	s3_request_complete(req);
 }
 
-int
-s3_put(struct s3_client *client, const char *key,
-       struct iovec *iov, int iovcnt, bool if_none_match,
-       s3_op_cb cb, void *cb_arg)
+static int
+s3_put_common(struct s3_client *client, const char *key,
+	      struct iovec *iov, int iovcnt, bool if_none_match,
+	      const char *if_match_etag, s3_op_cb cb, void *cb_arg)
 {
 	struct s3_request *req;
 	size_t total_size = 0;
 	size_t body_pos;
 	char content_length_str[32];
+	char if_match_buf[sizeof(req->if_match_buf)];
 	int rc;
 
 	if (!client || !key || !iov || iovcnt <= 0 || !cb) {
 		return -EINVAL;
+	}
+	/* Both conditions at once is never what a caller means. */
+	if (if_none_match && if_match_etag) {
+		return -EINVAL;
+	}
+	if (if_match_etag) {
+		rc = s3_put_etag_format(if_match_buf, sizeof(if_match_buf), if_match_etag,
+					client->app_ctx->put_if_match_bare_etag);
+		if (rc) {
+			return rc;
+		}
 	}
 
 	/* Calculate total payload size */
@@ -1435,6 +1597,11 @@ s3_put(struct s3_client *client, const char *key,
 	req->client   = client;
 	req->allocator = client->app_ctx->allocator;
 	req->if_none_match = if_none_match;
+	if (if_match_etag) {
+		/* Request-owned storage survives caller reuse and CRT retries. */
+		memcpy(req->if_match_buf, if_match_buf, strlen(if_match_buf) + 1);
+		req->has_if_match = true;
+	}
 	req->cb.op_cb = cb;
 	req->cb_arg   = cb_arg;
 	req->owner_thread = spdk_get_thread();
@@ -1501,6 +1668,23 @@ s3_put(struct s3_client *client, const char *key,
 		aws_http_message_add_header(options.message, inm_header);
 	}
 
+	/* If-Match for compare-and-swap replacement (strict ownership) */
+	if (req->has_if_match) {
+		struct aws_http_header im_header = {
+			.name  = aws_byte_cursor_from_c_str("If-Match"),
+			.value = aws_byte_cursor_from_c_str(req->if_match_buf),
+		};
+		if (aws_http_message_add_header(options.message, im_header) != AWS_OP_SUCCESS) {
+			/* Never submit a conditional PUT if adding its condition failed. */
+			aws_http_message_release(options.message);
+			if (req->buf) {
+				aws_mem_release(client->app_ctx->allocator, req->buf);
+			}
+			aws_mem_release(client->app_ctx->allocator, req);
+			return -ENOMEM;
+		}
+	}
+
 	aws_http_message_set_request_method(options.message, aws_http_method_put);
 	rc = s3_set_request_path(options.message, client->app_ctx->allocator,
 				 client, req->key);
@@ -1549,6 +1733,29 @@ s3_put(struct s3_client *client, const char *key,
 	/* Do NOT touch req past this point. */
 
 	return 0;
+}
+
+int
+s3_put(struct s3_client *client, const char *key,
+       struct iovec *iov, int iovcnt, bool if_none_match,
+       s3_op_cb cb, void *cb_arg)
+{
+	return s3_put_common(client, key, iov, iovcnt, if_none_match, NULL,
+			     cb, cb_arg);
+}
+
+int
+s3_put_if_match(struct s3_client *client, const char *key,
+		struct iovec *iov, int iovcnt, const char *etag,
+		s3_op_cb cb, void *cb_arg)
+{
+	if (!etag || etag[0] == '\0') {
+		/* A CAS without a comparand is a blind overwrite. Refuse
+		 * rather than silently downgrade. */
+		return -EINVAL;
+	}
+	return s3_put_common(client, key, iov, iovcnt, false, etag,
+			     cb, cb_arg);
 }
 
 /* ==========================================================================
@@ -1636,6 +1843,20 @@ s3_head(struct s3_client *client, const char *key,
 		return -EINVAL;
 	}
 
+	/* HEAD has no body. CRT's default signing config announces
+	 * X-Amz-Content-Sha256: UNSIGNED-PAYLOAD for every request, and some
+	 * backends (MinIO among them) reject a bodyless HEAD that carries it
+	 * with 400 InvalidRequest. The header cannot be added to the message
+	 * (CRT refuses to sign a header it adds itself), so the signing config
+	 * for this one request names the empty-body hash instead. */
+	struct aws_signing_config_aws head_signing = client->signing_config;
+	static const struct aws_byte_cursor empty_sha_cur =
+		AWS_BYTE_CUR_INIT_FROM_STRING_LITERAL(
+			"e3b0c44298fc1c149afbf4c8996fb924"
+			"27ae41e4649b934ca495991b7852b855");
+
+	head_signing.signed_body_value = empty_sha_cur;
+
 	req = aws_mem_calloc(client->app_ctx->allocator, 1, sizeof(*req));
 	if (!req) {
 		return -ENOMEM;
@@ -1662,7 +1883,7 @@ s3_head(struct s3_client *client, const char *key,
 		.type             = AWS_S3_META_REQUEST_TYPE_DEFAULT,
 		.operation_name   = aws_byte_cursor_from_c_str("HeadObject"),
 		.user_data        = req,
-		.signing_config   = &client->signing_config,
+		.signing_config   = &head_signing,
 		.headers_callback = s3_head_headers_callback,
 		.finish_callback  = s3_head_finished,
 	};
@@ -1682,6 +1903,7 @@ s3_head(struct s3_client *client, const char *key,
 		aws_mem_release(client->app_ctx->allocator, req);
 		return -ENOMEM;
 	}
+
 
 	S3_STAT_INC(client, inflight);
 
@@ -1715,8 +1937,18 @@ s3_delete_finished(struct aws_s3_meta_request *meta_request,
 {
 	struct s3_request *req = user_data;
 
-	if (result->error_code != AWS_ERROR_SUCCESS &&
-	    result->response_status != 404) {
+	/* A conditional delete that was rejected (412/409) is a *successful*
+	 * request whose condition did not hold: the object is untouched, which
+	 * is exactly what the caller asked for. CRT reports it as an error
+	 * because the HTTP status is not 2xx, so it has to be mapped back here.
+	 * Without this, every "wrong ETag" probe step looks like a transport
+	 * failure and the capability check cannot tell "the backend enforces
+	 * If-Match" from "the backend is broken". */
+	if (req->has_if_match &&
+	    (result->response_status == 412 || result->response_status == 409)) {
+		req->status = -EEXIST;
+	} else if (result->error_code != AWS_ERROR_SUCCESS &&
+		   result->response_status != 404) {
 		/* 404 on delete is success — DELETE is idempotent, and GC may
 		 * legitimately retry a key that was already collected . */
 		SPDK_ERRLOG("DeleteObject failed: key=%s, error=%d (%s), http=%d\n",
@@ -1726,6 +1958,16 @@ s3_delete_finished(struct aws_s3_meta_request *meta_request,
 		req->status = crt_error_to_errno(result->error_code,
 						result->response_status);
 		s3_stats_record_error(req->client, result->response_status);
+		if (result->error_response_body &&
+		    result->error_response_body->len > 0) {
+			int n = (int)result->error_response_body->len;
+
+			if (n > 512) {
+				n = 512;
+			}
+			SPDK_ERRLOG("DeleteObject error body: %.*s\n", n,
+				    (const char *)result->error_response_body->buffer);
+		}
 	} else {
 		req->status = 0;
 	}
@@ -1764,11 +2006,25 @@ s3_delete_submit_one(struct s3_client *client, struct s3_request *req)
 {
 	int rc;
 
+	/* DELETE has no body. CRT's default signing config announces
+	 * X-Amz-Content-Sha256: UNSIGNED-PAYLOAD for every request, and some
+	 * backends (MinIO among them) reject a bodyless DELETE that carries it
+	 * with 400 InvalidRequest. The header cannot be added to the message
+	 * (CRT refuses to sign a header it adds itself), so the signing config
+	 * for this one request names the empty-body hash instead. */
+	struct aws_signing_config_aws delete_signing = client->signing_config;
+	static const struct aws_byte_cursor empty_sha_cur =
+		AWS_BYTE_CUR_INIT_FROM_STRING_LITERAL(
+			"e3b0c44298fc1c149afbf4c8996fb924"
+			"27ae41e4649b934ca495991b7852b855");
+
+	delete_signing.signed_body_value = empty_sha_cur;
+
 	struct aws_s3_meta_request_options options = {
 		.type            = AWS_S3_META_REQUEST_TYPE_DEFAULT,
 		.operation_name  = aws_byte_cursor_from_c_str("DeleteObject"),
 		.user_data       = req,
-		.signing_config  = &client->signing_config,
+		.signing_config  = &delete_signing,
 		.finish_callback = s3_delete_finished,
 	};
 
@@ -1778,6 +2034,16 @@ s3_delete_submit_one(struct s3_client *client, struct s3_request *req)
 	}
 
 	s3_set_common_headers(options.message, client);
+
+	if (req->has_if_match) {
+		struct aws_http_header inm_header = {
+			.name  = aws_byte_cursor_from_c_str("If-Match"),
+			.value = aws_byte_cursor_from_c_str(req->if_match_buf),
+		};
+		aws_http_message_add_header(options.message, inm_header);
+	}
+
+
 	aws_http_message_set_request_method(options.message, aws_http_method_delete);
 	rc = s3_set_request_path(options.message, client->app_ctx->allocator,
 				 client, req->key);
@@ -1803,9 +2069,9 @@ s3_delete_submit_one(struct s3_client *client, struct s3_request *req)
 	return 0;
 }
 
-int
-s3_delete(struct s3_client *client, const char *key,
-	  s3_op_cb cb, void *cb_arg)
+static int
+s3_delete_common(struct s3_client *client, const char *key, const char *etag,
+		 s3_op_cb cb, void *cb_arg)
 {
 	struct s3_request *req;
 	int rc;
@@ -1830,6 +2096,15 @@ s3_delete(struct s3_client *client, const char *key,
 	req->cb_arg    = cb_arg;
 	req->owner_thread = spdk_get_thread();
 
+	if (etag) {
+		if (strlen(etag) >= sizeof(req->if_match_buf)) {
+			aws_mem_release(client->app_ctx->allocator, req);
+			return -ENAMETOOLONG;
+		}
+		snprintf(req->if_match_buf, sizeof(req->if_match_buf), "%s", etag);
+		req->has_if_match = true;
+	}
+
 	rc = s3_request_set_key(req, key);
 	if (rc) {
 		aws_mem_release(client->app_ctx->allocator, req);
@@ -1843,6 +2118,26 @@ s3_delete(struct s3_client *client, const char *key,
 	}
 
 	return 0;
+}
+
+int
+s3_delete(struct s3_client *client, const char *key,
+	  s3_op_cb cb, void *cb_arg)
+{
+	return s3_delete_common(client, key, NULL, cb, cb_arg);
+}
+
+int
+s3_delete_if_match(struct s3_client *client, const char *key,
+		   const char *etag, s3_op_cb cb, void *cb_arg)
+{
+	if (!etag || etag[0] == '\0') {
+		/* A conditional delete without a condition is a plain delete.
+		 * Refuse rather than silently downgrade: strict release must not
+		 * delete whatever happens to be there. */
+		return -EINVAL;
+	}
+	return s3_delete_common(client, key, etag, cb, cb_arg);
 }
 
 /* ==========================================================================

@@ -19,6 +19,7 @@ import (
 
 	"github.com/tencentcloud/CubeSandbox/cube-lifecycle-manager/internal/cubemasterclient"
 	"github.com/tencentcloud/CubeSandbox/cube-lifecycle-manager/internal/lifecycle"
+	"github.com/tencentcloud/CubeSandbox/cube-lifecycle-manager/internal/redisstream"
 	"github.com/tencentcloud/CubeSandbox/cube-lifecycle-manager/internal/registry"
 )
 
@@ -109,6 +110,7 @@ func (r *Resumer) Resume(ctx context.Context, sandboxID string) error {
 }
 
 func (r *Resumer) doResume(ctx context.Context, sandboxID string) error {
+	ctx = redisstream.WithTransitionOwner(ctx)
 	start := time.Now()
 	entry := r.o.Registry.Get(sandboxID)
 	if entry == nil {
@@ -138,23 +140,17 @@ func (r *Resumer) doResume(ctx context.Context, sandboxID string) error {
 		// auto-resume, and release the lock we just SET so the sweeper
 		// doesn't skip decisions for its TTL window.
 		if !entry.Meta.AutoResume {
-			r.clearState(sandboxID)
+			r.clearState(ctx, sandboxID)
 			return errors.New("auto_resume not enabled for sandbox")
 		}
 		if err := r.callCubeMasterResume(ctx, sandboxID, entry.Meta.InstanceType); err != nil {
 			return err
 		}
 	case errors.Is(ownErr, errAlreadyRunning):
-		// Sandbox is already running per Redis. Skip the RPC and run the
-		// success bookkeeping below so we re-assert state to the proxy.
-		// This covers two important cases:
-		//   1. A peer resume already completed but the proxy's local dict
-		//      still says "paused".
-		//   2. The user called CubeMaster.Resume directly and the state
-		//      event synchroniser flipped Redis to "running" before the
-		//      next dataplane request arrived. In this case AutoResume may
-		//      well be false — that's fine; the sandbox is running and the
-		//      request should be forwarded.
+		// No ownership was acquired. Never rewrite running here: an idle pause
+		// may already have claimed it. The proxy can retry if that race occurs.
+		r.o.Registry.MergeLastActive(sandboxID, time.Now().UnixMilli())
+		return nil
 	default:
 		return ownErr
 	}
@@ -174,11 +170,12 @@ func (r *Resumer) doResume(ctx context.Context, sandboxID string) error {
 	//     misleading. The proxy's log_phase will eventually overwrite
 	//     this via the periodic last_active poll, but we want the right
 	//     answer immediately, not 5–10 seconds later.
-	bookkeepingCtx, cancel := context.WithTimeout(context.Background(), stateBookkeepingTimeout)
+	bookkeepingCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), stateBookkeepingTimeout)
 	defer cancel()
 	if err := r.o.Redis.WriteState(bookkeepingCtx, sandboxID, "running", r.o.StateLockTTL); err != nil {
 		r.o.Log.Warn("write running state failed",
 			zap.String("sandbox_id", sandboxID), zap.Error(err))
+		return err
 	}
 	// CubeProxy locally flips the state to running as part of the successful
 	// resume sub-request. The fleet-wide push is only a convergence/safety
@@ -238,7 +235,7 @@ func (r *Resumer) callCubeMasterResume(ctx context.Context, sandboxID, instanceT
 		// from under us. Evict everywhere and surface as an error to
 		// the HTTP caller so CubeProxy returns 5xx (the dataplane
 		// request can't be served either way).
-		cleanupCtx, cancel := context.WithTimeout(context.Background(), stateBookkeepingTimeout)
+		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), stateBookkeepingTimeout)
 		_ = r.o.Redis.ClearStateNotify(cleanupCtx, sandboxID)
 		_ = r.o.ProxyPush.DeleteMeta(cleanupCtx, sandboxID)
 		cancel()
@@ -260,18 +257,18 @@ func (r *Resumer) callCubeMasterResume(ctx context.Context, sandboxID, instanceT
 		// Preserve ownership only for the ambiguity window (AmbiguityTTL),
 		// preventing duplicate RPCs and sweeper races without locking the sandbox for 60s.
 		if !errors.As(resumeErr, &apiErr) {
-			r.markAmbiguous(sandboxID)
+			r.markAmbiguous(ctx, sandboxID)
 			return errors.New("cubemaster resume result unknown: " + resumeErr.Error())
 		}
 		// A structured non-success response is definitive; release ownership
 		// with an independent context so request cancellation cannot strand it.
-		r.clearState(sandboxID)
+		r.clearState(ctx, sandboxID)
 		return errors.New("cubemaster resume: " + resumeErr.Error())
 	}
 }
 
-func (r *Resumer) markAmbiguous(sandboxID string) {
-	ctx, cancel := context.WithTimeout(context.Background(), stateBookkeepingTimeout)
+func (r *Resumer) markAmbiguous(parent context.Context, sandboxID string) {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(parent), stateBookkeepingTimeout)
 	defer cancel()
 	if err := r.o.Redis.WriteState(ctx, sandboxID, "resuming", r.o.AmbiguityTTL); err != nil {
 		r.o.Log.Warn("preserve ambiguous resume ownership failed",
@@ -279,8 +276,8 @@ func (r *Resumer) markAmbiguous(sandboxID string) {
 	}
 }
 
-func (r *Resumer) clearState(sandboxID string) {
-	ctx, cancel := context.WithTimeout(context.Background(), stateBookkeepingTimeout)
+func (r *Resumer) clearState(parent context.Context, sandboxID string) {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(parent), stateBookkeepingTimeout)
 	defer cancel()
 	if err := r.o.Redis.ClearStateNotify(ctx, sandboxID); err != nil {
 		r.o.Log.Warn("clear resume ownership failed",

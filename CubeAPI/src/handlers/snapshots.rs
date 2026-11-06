@@ -135,7 +135,7 @@ pub async fn rollback_sandbox(
     let resp = state
         .services
         .snapshots
-        .rollback(&sandbox_id, &body.snapshot_id, body.backend)
+        .rollback(&sandbox_id, &body.snapshot_id, body.backend, body.request_id)
         .await?;
 
     tracing::info!(

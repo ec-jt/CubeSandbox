@@ -122,6 +122,7 @@ const (
 // per-worker state dict with externally-driven state changes (e.g. the SDK
 // calling connect() to resume a sandbox the sweeper had paused).
 type StatePayload struct {
+	RequestID string `json:"request_id,omitempty"`
 	// State is the new terminal state. Must be one of StatePaused / StateRunning.
 	State string `json:"state"`
 	// Actor identifies the driver of the state change. Used for logging

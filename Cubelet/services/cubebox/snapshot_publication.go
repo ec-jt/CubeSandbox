@@ -100,7 +100,14 @@ func (s *service) snapshotPackageRetentionError(snapshotID string) error {
 	return nil
 }
 
-func publishSnapshotPackage(ctx context.Context, backend string, entry *storage.SnapshotCatalogEntry) (string, error) {
+func publishSnapshotPackage(ctx context.Context, backend string, entry *storage.SnapshotCatalogEntry, sandbox string, generation uint32) (string, error) {
+	// This is pre-publication capture evidence, not a committed export receipt.
+	if err := storage.PrepareCheckpointDiskBinding(ctx, entry, sandbox, generation); err != nil {
+		return "", fmt.Errorf("prepare checkpoint disk binding: %w", err)
+	}
+	if storage.IsS3Backend(backend) && entry.DiskBinding.NativeRootfsUUID == "" {
+		return "", fmt.Errorf("capture requires native rootfs snapshot identity")
+	}
 	return publishCapturedSnapshot(
 		func() error { return storage.WriteSnapshotCatalogFor(backend, entry) },
 		func() error { return storage.FinalizeS3PackageSnapshots(ctx, backend, entry.SnapshotID) },

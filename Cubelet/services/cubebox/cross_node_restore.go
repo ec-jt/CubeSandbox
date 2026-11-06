@@ -13,6 +13,7 @@ import (
 	"github.com/tencentcloud/CubeSandbox/Cubelet/pkg/log"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/pkg/pathutil"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/pkg/utils"
+	"github.com/tencentcloud/CubeSandbox/Cubelet/plugins/workflow"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/storage"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/storage/cow"
 	"github.com/tencentcloud/CubeSandbox/pkgs/proto/services/cubebox/v1"
@@ -104,4 +105,29 @@ func ensureCrossNodeSandboxID(req *cubebox.RunCubeSandboxRequest) (string, error
 		return "", fmt.Errorf("invalid desired sandbox id: %w", err)
 	}
 	return sandboxID, nil
+}
+
+// createLifecycleSandboxID preserves createid's special template-build identity
+// while settling all other IDs before storage effects. It never reads metadata.
+func createLifecycleSandboxID(req *cubebox.RunCubeSandboxRequest) (string, error) {
+	if req == nil {
+		return "", fmt.Errorf("nil create request")
+	}
+	if req.Annotations == nil {
+		req.Annotations = map[string]string{}
+	}
+	if strings.TrimSpace(req.Annotations[constants.MasterAnnotationDesiredSandboxID]) == "" {
+		copy := *req
+		copy.InstanceType = constants.GetInstanceTypeWithDefault(copy.InstanceType)
+		opts := &workflow.CreateContext{ReqInfo: &copy}
+		if opts.IsCreateSnapshot() {
+			templateID, _ := opts.GetSnapshotTemplateID()
+			req.Annotations[constants.MasterAnnotationDesiredSandboxID] = templateID + "_0"
+		}
+	}
+	id, err := ensureCrossNodeSandboxID(req)
+	if err == nil {
+		req.Annotations[constants.MasterAnnotationDesiredSandboxID] = id
+	}
+	return id, err
 }

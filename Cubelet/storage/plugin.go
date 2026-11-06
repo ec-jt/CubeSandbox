@@ -56,9 +56,9 @@ const defaultVolumePluginBaseDir = "/data/cube-shared/volume"
 // upper layers** need when they initialise an ext4 default-medium
 // volume on top of a reflink-backed file. cubecow itself uses zero
 // external commands (mkdir/open/FICLONE/statvfs are pure libc) — but
-// `initExt4BlockDevice` in `cubecow_volume_manager.go` formats the
-// reflink file as ext4 and mounts it, which under the hood pulls in
-// `losetup` (auto-loop in mount(8)). Surface those commands here so a
+// `initExt4BlockDevice` in `shell.go` populates regular files with
+// mkfs.ext4 -d. Legacy block-device paths still mount the filesystem;
+// their mount(8) fallback can need losetup. Surface those commands so a
 // missing binary is reported at startup rather than at the first
 // `CreateDefaultMediumVolume` call.
 var reflinkExt4InitCommands = []string{

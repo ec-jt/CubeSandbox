@@ -20,6 +20,12 @@ type fakeCowEngine struct {
 	createVolumeErr             error
 	createVolumes               []string
 	createVolumeSizes           map[string]uint64
+	// staleIndexNames models the S3 engine's persisted name index: the name is
+	// still indexed, so CreateVolume/CreateSnapshotFromVolume report
+	// AlreadyExists, but the attached lvstore does not hold the object.
+	staleIndexNames []string
+	// getVolumeInfoErr is returned for every lookup (non-not-found failure).
+	getVolumeInfoErr error
 	createSnapshots             [][2]string
 	createSnapshotActivations   []bool
 	createSnapshotPath          string
@@ -61,8 +67,32 @@ func (f *fakeCowEngine) ImportLvol(name, remoteUUID string) (string, error) {
 	if f.volumeInfos == nil {
 		f.volumeInfos = map[string]*cubecow.Volume{}
 	}
-	f.volumeInfos[name] = &cubecow.Volume{DevicePath: path, SizeBytes: 8 << 20}
+	f.volumeInfos[name] = &cubecow.Volume{Name: name, VolumeUUID: "native-" + name, DevicePath: path, SizeBytes: 8 << 20, ImportOrigin: &cubecow.ImportOrigin{Version: 1, VolumeUUID: "native-" + name, LvstoreUUID: "native-store", ExportUUID: remoteUUID, SizeBytes: 8 << 20}}
 	return path, nil
+}
+
+// staleIndexed reports whether the persisted index still names this object
+// while the attached lvstore does not hold it.
+func (f *fakeCowEngine) staleIndexed(name string) bool {
+	for _, stale := range f.staleIndexNames {
+		if stale == name {
+			return true
+		}
+	}
+	return false
+}
+
+// dropStaleIndexBinding models the engine's delete path for a stale name: the
+// persisted index entry is removed and the native delete tolerates a missing
+// object. The attached lvstore holds nothing, so nothing is destroyed.
+func (f *fakeCowEngine) dropStaleIndexBinding(name string) {
+	kept := f.staleIndexNames[:0]
+	for _, stale := range f.staleIndexNames {
+		if stale != name {
+			kept = append(kept, stale)
+		}
+	}
+	f.staleIndexNames = kept
 }
 
 func (f *fakeCowEngine) CreateVolume(name string, sizeBytes uint64) (string, error) {
@@ -73,6 +103,11 @@ func (f *fakeCowEngine) CreateVolume(name string, sizeBytes uint64) (string, err
 	f.createVolumeSizes[name] = sizeBytes
 	if f.volumeInfos == nil {
 		f.volumeInfos = map[string]*cubecow.Volume{}
+	}
+	if f.staleIndexed(name) {
+		// Index hit short-circuits the native create, exactly like the S3
+		// engine: no lvol is created in the attached lvstore.
+		return "", &cubecow.CowError{Code: cubecow.SemAlreadyExists, RawRC: int32(cubecow.SemAlreadyExists), Message: "name '" + name + "' already exists in s3 namespace"}
 	}
 	if f.createVolumeErr == nil {
 		if _, ok := f.volumeInfos[name]; !ok {
@@ -87,6 +122,9 @@ func (f *fakeCowEngine) CreateSnapshotFromVolume(sourceName, snapshotName string
 	f.createSnapshotActivations = append(f.createSnapshotActivations, activate)
 	if f.createSnapshotErr != nil {
 		return f.createSnapshotPath, f.createSnapshotErr
+	}
+	if f.staleIndexed(snapshotName) {
+		return "", &cubecow.CowError{Code: cubecow.SemAlreadyExists, RawRC: int32(cubecow.SemAlreadyExists), Message: "name '" + snapshotName + "' already exists in s3 namespace"}
 	}
 	path := f.createSnapshotPath
 	// activate=false may return an empty path (template rootfs commit);
@@ -174,7 +212,11 @@ func (f *fakeCowEngine) DeleteVolume(name string) error {
 	if err, ok := f.deleteErrByName[name]; ok {
 		return err
 	}
-	return f.deleteVolumeErr
+	if f.deleteVolumeErr != nil {
+		return f.deleteVolumeErr
+	}
+	f.dropStaleIndexBinding(name)
+	return nil
 }
 
 func (f *fakeCowEngine) DeleteSnapshot(name string) error {
@@ -182,7 +224,11 @@ func (f *fakeCowEngine) DeleteSnapshot(name string) error {
 	if err, ok := f.deleteErrByName[name]; ok {
 		return err
 	}
-	return f.deleteSnapshotErr
+	if f.deleteSnapshotErr != nil {
+		return f.deleteSnapshotErr
+	}
+	f.dropStaleIndexBinding(name)
+	return nil
 }
 
 func (f *fakeCowEngine) ResizeVolume(name string, newSizeBytes uint64) (uint64, uint64, error) {
@@ -207,6 +253,9 @@ func (f *fakeCowEngine) ResizeVolume(name string, newSizeBytes uint64) (uint64, 
 }
 
 func (f *fakeCowEngine) GetVolumeInfo(name string) (*cubecow.Volume, error) {
+	if f.getVolumeInfoErr != nil {
+		return nil, f.getVolumeInfoErr
+	}
 	if f.volumeInfos == nil {
 		return nil, nil
 	}
@@ -262,7 +311,15 @@ func (f *fakeCowEngine) ExportSnapshot(name string) (string, error) {
 	if prefix == "" {
 		prefix = "export-"
 	}
-	return prefix + name, nil
+	uuid := prefix + name
+	if info := f.volumeInfos[name]; info != nil {
+		if info.ExportUUID != "" {
+			return info.ExportUUID, nil
+		}
+		info.ExportUUID = uuid
+		info.ExportStatus = "DONE"
+	}
+	return uuid, nil
 }
 
 func stubInitDefaultMediumDevice(t *testing.T, fn func(string) error) {

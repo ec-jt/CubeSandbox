@@ -522,6 +522,7 @@ name = "cube-api"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
  "async-trait",
  "axum",
  "axum-extra",
@@ -534,6 +535,7 @@ dependencies = [
  "futures",
  "governor",
  "reqwest",
+ "ring",
  "serde",
  "serde_json",
  "thiserror 1.0.69",

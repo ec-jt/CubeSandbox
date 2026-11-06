@@ -39,6 +39,9 @@ use crate::container::container_mgr::ContainerInfo;
 use crate::container::{exec::Tty, Container, GUEST_DEV_SHM};
 use crate::hypervisor::config::{HypConfig, VmConfig};
 use crate::hypervisor::cube_hypervisor as CH;
+use crate::hypervisor::restore_outcome::{
+    valid_attempt, Cause, RestoreOutcome, Stage, REQUEST_ANNOTATION,
+};
 use crate::hypervisor::snapshot::{enable_snapshot, SnapshotInfo};
 use crate::log::{stat_defer, Log};
 use crate::sandbox::config;
@@ -69,6 +72,7 @@ pub struct SandBox {
     containers: Arc<Mutex<HashMap<String, Container>>>,
     pub(super) log: Log,
     inited: bool,
+    recovery_outcome: Option<RestoreOutcome>,
     pid: u32,
     tx_containerd: Sender<(String, Box<dyn MessageDyn>)>,
     debug: bool,
@@ -109,6 +113,7 @@ impl SandBox {
             containers: Arc::new(Mutex::new(HashMap::new())),
             log,
             inited: false,
+            recovery_outcome: None,
             pid: std::process::id(),
             tx_containerd,
             debug,
@@ -165,6 +170,17 @@ impl SandBox {
     pub fn init(&mut self, spec: Spec) -> CResult<()> {
         self.spec = spec;
         let annotations = self.spec.annotations();
+        if let Some(attempt) = annotations.as_ref().and_then(|a| a.get(REQUEST_ANNOTATION)) {
+            if !valid_attempt(attempt) {
+                return Err("invalid recovery attempt".into());
+            }
+            self.recovery_outcome = Some(RestoreOutcome::failed(
+                &self.id,
+                attempt,
+                Stage::Unknown,
+                Cause::Unknown,
+            ));
+        }
         self.conf = config::Config::new(annotations)?;
         if self.conf.app_snapshot_restore {
             let snapshot_base = annotations
@@ -183,9 +199,16 @@ impl SandBox {
                     .map(|anno| anno.keys().cloned().collect::<Vec<_>>())
                     .unwrap_or_default();
                 annotation_keys.sort();
-                return Err(format!(
+                if let Some(outcome) = self.recovery_outcome.as_mut() {
+                    outcome.failure_stage = Stage::MemoryReference;
+                    outcome.cause = Cause::MissingMemoryReference;
+                }
+                return Err(crate::hypervisor::recovery::refuse_disk_only_fallback(
+                    crate::hypervisor::recovery::RestoreFailureStage::MemoryReference,
+                    &format!(
                     "app snapshot restore requires fresh memory_vol_url annotation (cube.vm.snapshot.memory_vol_url); upstream must resolve the template memory volume for this start, snapshot_base:{}, annotation_keys:{:?}",
                     snapshot_base, annotation_keys
+                    ),
                 ));
             } else {
                 infof!(
@@ -469,8 +492,30 @@ impl SandBox {
         Ok(())
     }
 
+    pub fn publish_recovery_outcome(&self) -> CResult<()> {
+        match &self.recovery_outcome {
+            Some(o) => o.publish(),
+            None => Ok(()),
+        }
+    }
+
     pub async fn create_sandbox(&mut self) -> CResult<()> {
-        let snapshot = self.start_vm().await?;
+        let result = self.start_vm().await;
+        // Publish before agent reset/init. Mechanism success is not guest liveness.
+        // Keep the original failure even if publication also fails.
+        let publication = self.publish_recovery_outcome();
+        let snapshot = match result {
+            Err(e) => {
+                return Err(match publication {
+                    Err(p) => format!("{e}; recovery receipt: {p}"),
+                    Ok(()) => e,
+                })
+            }
+            Ok(snapshot) => {
+                publication?;
+                snapshot
+            }
+        };
 
         //todo: app snapshot
         if self.conf.notify_snapshot_ret {
@@ -677,6 +722,18 @@ impl SandBox {
         containers.is_empty()
     }
 
+    pub fn sandbox_id(&self) -> &str { &self.id }
+
+    /// Caller has verified durable retention authorization. Reap may finish an
+    /// interrupted stop; the immutable record keeps destructive hooks blocked.
+    pub async fn stop_retained_runtime(&mut self) -> CResult<()> {
+        self.disconnect_agent(true).await?;
+        let ch = self.ch.as_ref().ok_or("retained stop: no native runtime")?;
+        ch.lock().await.stop_retained_runtime().await?;
+        *self.state.lock().await = SandBoxState::Exited;
+        Ok(())
+    }
+
     pub async fn destroy_sandbox(&mut self) -> CResult<()> {
         infof!(self.log, "destroy sandbox start");
         let req = agent::DestroySandboxRequest {
@@ -865,23 +922,40 @@ impl SandBox {
     }
     async fn start_vm(&mut self) -> CResult<bool> {
         infof!(self.log, "start vm start");
+        let mut snapshot = false;
+        if self.conf.app_snapshot_restore && !self.by_snapshot() {
+            if let Some(o) = self.recovery_outcome.as_mut() {
+                o.failure_stage = Stage::Compatibility;
+                o.cause = Cause::RestoreDisabled;
+            }
+            return Err("application snapshot restore disabled; disk_only_fallback=refused".into());
+        }
+
+        if let Some(o) = self.recovery_outcome.as_mut() {
+            o.failure_stage = Stage::Runtime;
+        }
         {
             let mut ch = self.ch.as_mut().unwrap().lock().await;
             ch.launch_vmm().await?;
         }
-        let mut snapshot = false;
 
         if self.by_snapshot() {
             match self.restore_vm().await {
                 Ok(_) => {
                     snapshot = true;
                     if self.conf.app_snapshot_restore {
+                        if let Some(o) = self.recovery_outcome.as_mut() {
+                            *o = RestoreOutcome::restored(&self.id, &o.attempt_id);
+                        }
                         return Ok(snapshot);
                     }
                 }
                 Err(e) => {
                     errf!(self.log, "restore vm failed:{}", e);
                     if self.conf.app_snapshot_restore {
+                        // Fail closed. boot_vm alone cannot recover restored
+                        // guest mounts/process metadata, and this error does
+                        // not prove that only the memory image is unusable.
                         return Err(format!("app snapshot restore vm failed:{}", e));
                     }
                 }
@@ -928,11 +1002,21 @@ impl SandBox {
             Self::ensure_ivshmem_file(&self.id)?;
         }
 
+        if let Some(o) = self.recovery_outcome.as_mut() {
+            o.failure_stage = Stage::Metadata;
+        }
         let ss_file = SnapshotInfo::load(
             self.conf.snapshot_base.as_str(),
             self.conf.vm_res.cpu,
             self.conf.vm_res.snap_memory,
-        )?;
+        )
+        .map_err(|e| {
+            crate::hypervisor::recovery::restore_failure(
+                self.conf.app_snapshot_restore,
+                crate::hypervisor::recovery::RestoreFailureStage::Metadata,
+                &e,
+            )
+        })?;
 
         let mut ss_req = SnapshotInfo::new(self.conf.vm_res.cpu, self.conf.vm_res.snap_memory);
         ss_req.set_image_version_for_path(self.conf.os_image_path.as_str())?;
@@ -944,9 +1028,17 @@ impl SandBox {
         ss_req.set_pmems(&align_pmem);
 
         //ss_file must be treated as a self object.
-        ss_file
-            .eq(&ss_req)
-            .map_err(|e| format!("snapshot metadata not match:{}", e))?;
+        ss_file.eq(&ss_req).map_err(|e| {
+            if let Some(o) = self.recovery_outcome.as_mut() {
+                o.failure_stage = Stage::Compatibility;
+                o.cause = Cause::ConfigurationMismatch;
+            }
+            crate::hypervisor::recovery::restore_failure(
+                self.conf.app_snapshot_restore,
+                crate::hypervisor::recovery::RestoreFailureStage::Compatibility,
+                &format!("snapshot metadata not match:{}", e),
+            )
+        })?;
 
         let snapshot = Utils::get_snapshot_dir(
             self.conf.snapshot_base.as_str(),
@@ -985,7 +1077,16 @@ impl SandBox {
             ..Default::default()
         };
 
-        ch.restore_vm(config).await?;
+        if let Some(o) = self.recovery_outcome.as_mut() {
+            o.failure_stage = Stage::Runtime;
+        }
+        ch.restore_vm(config).await.map_err(|e| {
+            crate::hypervisor::recovery::restore_failure(
+                self.conf.app_snapshot_restore,
+                crate::hypervisor::recovery::RestoreFailureStage::Runtime,
+                &e,
+            )
+        })?;
         /*
         let ev = ch
             .wait_notify(Duration::from_nanos(self.ctx.timeout_nano as u64))
@@ -1069,7 +1170,8 @@ impl SandBox {
         container.unwrap().close_io(exec_id).await
     }
 
-    pub async fn delete_container(&mut self, id: &String) -> Result<(u32, DateTime<Utc>)> {
+    pub async fn delete_container(&mut self, id: &String, retention: &crate::common::retained::Guard) -> Result<(u32, DateTime<Utc>)> {
+        retention.require_absent(&self.id).map_err(Error::Other)?;
         let mut container = {
             let mut containers = self.containers.lock().await;
             match containers.get_mut(id) {
@@ -1078,7 +1180,7 @@ impl SandBox {
                     let should_clean = id == &self.id && !self.conf.app_snapshot_create;
                     drop(containers);
                     if should_clean {
-                        crate::container::remove_sandbox_log_dir(&self.id, &self.log).await;
+                        crate::container::remove_sandbox_log_dir_unchecked(&self.id).map_err(Error::Other)?;
                     }
                     // Keep NotFound: cubelet already treats it as success on
                     // destroy. Changing the RPC contract is out of scope.
@@ -1100,7 +1202,7 @@ impl SandBox {
         // Live Task.Delete. Crash leftover is cleaned by the delete subcommand
         // (`clean_sandbox_resource`). Pause-to-snapshot returns before here.
         if id == &self.id && !self.conf.app_snapshot_create {
-            crate::container::remove_sandbox_log_dir(&self.id, &self.log).await;
+            crate::container::remove_sandbox_log_dir_unchecked(&self.id).map_err(Error::Other)?;
         }
         Ok((code, tm))
     }
@@ -1626,6 +1728,7 @@ fn normalize_dns_for_agent(entry: &str) -> CResult<String> {
 
 #[cfg(test)]
 mod tests {
+    use crate::hypervisor::restore_outcome::{Cause, RestoreOutcome, Stage};
     use nix::sys::socket::{socketpair, AddressFamily, SockFlag, SockType};
     use oci_spec::runtime::SpecBuilder;
     use protobuf::MessageDyn;
@@ -1645,6 +1748,35 @@ mod tests {
     use super::normalize_dns_for_agent;
     use super::Log;
     use super::SandBox;
+
+    #[tokio::test]
+    async fn typed_recovery_disabled_refuses_before_vmm_launch() {
+        let (tx, _) = channel::<(String, Box<dyn MessageDyn>)>(1);
+        let mut sb = SandBox::new("synthetic-sandbox".into(), Log::default(), false, tx);
+        sb.conf.app_snapshot_restore = true;
+        sb.spec = SpecBuilder::default()
+            .annotations(HashMap::from([(
+                config::ANNO_SNAPSHOT_DISABLE.to_string(),
+                "true".to_string(),
+            )]))
+            .build()
+            .unwrap();
+        sb.recovery_outcome = Some(RestoreOutcome::failed(
+            &sb.id,
+            &"a".repeat(64),
+            Stage::Unknown,
+            Cause::Unknown,
+        ));
+        sb.ch = None; // Any VMM launch or disk boot would panic.
+        assert!(sb
+            .start_vm()
+            .await
+            .unwrap_err()
+            .contains("disk_only_fallback=refused"));
+        let outcome = sb.recovery_outcome.unwrap();
+        assert_eq!(outcome.failure_stage, Stage::Compatibility);
+        assert_eq!(outcome.cause, Cause::RestoreDisabled);
+    }
 
     #[tokio::test]
     async fn test_sandbox_prepare_resource() {

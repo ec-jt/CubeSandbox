@@ -41,15 +41,18 @@ import (
 // a kernel mismatch requires rebuilding the snapshot/template replica, but does
 // not by itself require rebuilding the rootfs ext4 artifact.
 type SnapshotCatalogEntry struct {
-	SnapshotID   string `json:"snapshot_id"`
-	InstanceType string `json:"instance_type,omitempty"`
-	SpecDir      string `json:"spec_dir,omitempty"`
-	SnapshotPath string `json:"snapshot_path"`
-	MetaDir      string `json:"meta_dir"`
-	RootfsVol    string `json:"rootfs_vol"`
-	RootfsKind   string `json:"rootfs_kind"`
-	MemoryVol    string `json:"memory_vol"`
-	MemoryKind   string `json:"memory_kind"`
+	// DiskBinding is producer metadata, not a native identity/retention receipt.
+	// Missing bindings retain legacy memory-restore compatibility.
+	DiskBinding  *CheckpointDiskBinding `json:"disk_binding,omitempty"`
+	SnapshotID   string                 `json:"snapshot_id"`
+	InstanceType string                 `json:"instance_type,omitempty"`
+	SpecDir      string                 `json:"spec_dir,omitempty"`
+	SnapshotPath string                 `json:"snapshot_path"`
+	MetaDir      string                 `json:"meta_dir"`
+	RootfsVol    string                 `json:"rootfs_vol"`
+	RootfsKind   string                 `json:"rootfs_kind"`
+	MemoryVol    string                 `json:"memory_vol"`
+	MemoryKind   string                 `json:"memory_kind"`
 	// MetadataVol/Kind is the S3 package metadata volume (cloned from the
 	// node-local base snapshot or a parent package metadata volume).
 	// Empty on XFS (plain directory). The node-local base volume/snapshot
@@ -60,9 +63,10 @@ type SnapshotCatalogEntry struct {
 	// during template build (AppSnapshot path). They must be cleaned up at
 	// template delete time. Empty for runtime snapshots (CommitSandbox), which
 	// never produce a build artifact.
-	BuildRootfsVol  string `json:"build_rootfs_vol,omitempty"`
-	BuildRootfsKind string `json:"build_rootfs_kind,omitempty"`
-	RootfsSizeBytes uint64 `json:"rootfs_size_bytes,omitempty"`
+	BuildRootfsVol   string `json:"build_rootfs_vol,omitempty"`
+	BuildRootfsKind  string `json:"build_rootfs_kind,omitempty"`
+	RootfsSizeBytes  uint64 `json:"rootfs_size_bytes,omitempty"`
+	RootfsGeneration uint32 `json:"rootfs_generation,omitempty"`
 	// ComponentVersions: inventory dir name → version string (no absolute paths).
 	ComponentVersions map[string]string `json:"component_versions,omitempty"`
 	// Kind distinguishes the producer/semantics of this catalog entry so
@@ -507,6 +511,14 @@ func cloneCatalogEntry(in *SnapshotCatalogEntry) *SnapshotCatalogEntry {
 		return nil
 	}
 	out := *in
+	if in.DiskBinding != nil {
+		binding := *in.DiskBinding
+		binding.MetadataSHA256 = make(map[string]string, len(in.DiskBinding.MetadataSHA256))
+		for k, v := range in.DiskBinding.MetadataSHA256 {
+			binding.MetadataSHA256[k] = v
+		}
+		out.DiskBinding = &binding
+	}
 	if in.ComponentVersions != nil {
 		out.ComponentVersions = make(map[string]string, len(in.ComponentVersions))
 		for k, v := range in.ComponentVersions {

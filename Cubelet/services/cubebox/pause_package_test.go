@@ -118,6 +118,7 @@ func TestPauseRestoreBindingSurvivesPackedSpecSwap(t *testing.T) {
 	assert.Equal(t, "req-1", req.RequestID)
 	assert.Equal(t, "sb-1", req.Annotations[constants.MasterAnnotationDesiredSandboxID])
 	assert.Equal(t, "snap-1", req.Annotations[constants.MasterAnnotationPauseSnapshotID])
+	assert.Equal(t, "v2", req.Annotations[constants.MasterAnnotationAppSnapshotVersion])
 	assert.Equal(t, "snap-1", req.Annotations[constants.MasterAnnotationRuntimeSnapshotID])
 	assert.Equal(t, "s3", req.Annotations[constants.MasterAnnotationStorageBackend])
 	assert.Equal(t, "s3", req.Backend)

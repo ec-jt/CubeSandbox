@@ -28,13 +28,17 @@
 /* Tick interval: roughly a millisecond. */
 #define S3_FLUSHER_DEFAULT_POLL_US 1000
 
-/* How long a drain waits for dirty data before giving up.
+/* How long a drain waits before reporting -ETIMEDOUT to its caller.
  *
- * A drain must not be able to hang shutdown. If S3 is unreachable the flusher
- * retries forever, which is right while running and wrong while exiting: the
- * data is already durable in the log, so giving up costs nothing but a replay on
- * the next attach. In-flight uploads are still waited for -- those are bounded by
- * the S3 client's own timeouts. */
+ * The deadline is honoured whether or not uploads are in flight. It used not to
+ * be: the check returned early while any upload was running, and with S3
+ * unreachable a failed upload re-queues at once, so the deadline was never
+ * evaluated and an unload blocked for as long as the outage lasted.
+ *
+ * A drain timeout is a RESULT, not a state change: the flusher is not stopped,
+ * uploads in flight keep running and their completions keep touching the
+ * flusher (and whatever the upload callback reaches), and the flusher keeps
+ * retrying. Freeing anything requires s3_flusher_retire(). */
 #define S3_FLUSHER_DRAIN_TIMEOUT_US (30ULL * 1000 * 1000)
 
 struct s3_flusher;
@@ -94,10 +98,36 @@ int s3_flusher_create(struct s3_overlay *overlay, struct s3_wal *wal,
 		      struct s3_flusher **out);
 
 /**
- * Stop and release. *The caller must drain first* -- this asserts that no
- * upload is in flight, because a completion would otherwise touch freed memory.
+ * Release. *The caller must retire first* (s3_flusher_retire(), and wait for its
+ * callback) -- this asserts that no upload or super sync is in flight, because a
+ * completion would otherwise touch freed memory. A completed drain is NOT
+ * sufficient: a drain may report -ETIMEDOUT with uploads still in flight.
  */
 void s3_flusher_destroy(struct s3_flusher *f);
+
+/**
+ * Stop starting uploads and report once nothing can call back into the flusher.
+ *
+ * Sets the flusher stopping (a failed upload is no longer re-queued, so the
+ * in-flight count only goes down), answers a pending drain immediately (0 if
+ * already clean, else -ETIMEDOUT), and fires \c cb_fn exactly once when no
+ * upload and no WAL super sync is in flight:
+ *
+ *   0        nothing is dirty: everything acknowledged is in S3
+ *   -EAGAIN  dirty data remains; it is durable only in the WAL
+ *
+ * The callback is only ever invoked from the flusher's poller tick -- never
+ * inline from this call, from s3_flusher_kick(), or from an upload completion --
+ * so it may call s3_flusher_destroy() and tear down the owner. Retirement is
+ * irreversible and happens at most once; a second call gets -EBUSY. How long it
+ * takes is bounded only by how long the in-flight upload_fn requests take to
+ * complete (for s3_bs_dev: the S3 client's own timeouts); the flusher itself
+ * adds no unbounded wait.
+ */
+void s3_flusher_retire(struct s3_flusher *f, s3_flusher_cb cb_fn, void *cb_arg);
+
+/** True once s3_flusher_retire() was called. */
+bool s3_flusher_is_retiring(const struct s3_flusher *f);
 
 /**
  * Start uploads for whatever is dirty, up to the concurrency limit. Cheap and
@@ -106,15 +136,20 @@ void s3_flusher_destroy(struct s3_flusher *f);
 void s3_flusher_kick(struct s3_flusher *f);
 
 /**
- * Fire the callback once nothing is dirty and nothing is in flight, i.e. once
- * everything acknowledged so far is in S3 (INV2).
+ * Observe, with a deadline, whether everything acknowledged so far reaches S3.
+ * The callback fires exactly once:
  *
- * \param timeout_us 0 selects S3_FLUSHER_DRAIN_TIMEOUT_US. Once it expires no
- *                   new round is started and the callback reports -ETIMEDOUT,
- *                   but uploads already running are still waited for -- their
- *                   completions would otherwise touch freed memory.
+ *   0           nothing dirty, nothing in flight, no super sync (INV2 holds)
+ *   -ETIMEDOUT  the deadline passed first. Reported at the deadline even with
+ *               uploads in flight. NOTHING is released or stopped: the flusher
+ *               keeps retrying in the background, so a later drain may succeed.
+ *   -EBUSY      another drain is already waiting
+ *   -ESHUTDOWN  the flusher is retiring
  *
- * One drain at a time; a second concurrent call gets -EBUSY.
+ * \param timeout_us 0 selects S3_FLUSHER_DRAIN_TIMEOUT_US.
+ *
+ * A drain result never licenses freeing the flusher or anything an upload
+ * completion can reach; use s3_flusher_retire() for that.
  */
 void s3_flusher_drain(struct s3_flusher *f, uint64_t timeout_us,
 		      s3_flusher_cb cb_fn, void *cb_arg);

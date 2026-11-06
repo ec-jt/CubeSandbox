@@ -40,6 +40,10 @@ type Config struct {
 	// CubeMaster internal HTTP for pause/resume. CLM calls
 	// POST <CubeMasterURL>/cube/sandbox/update with action=pause|resume.
 	CubeMasterURL string
+	// Optional HMAC credentials for CubeMaster's authenticated HTTP API.
+	// Both must be configured together; never log the secret.
+	CubeMasterUserID    string
+	CubeMasterSecretKey string
 
 	// HTTP listener for /internal/resume (called by CubeProxy via the
 	// internal sub-location). In the standalone deployment CLM is reached
@@ -180,6 +184,8 @@ func Load() (*Config, error) {
 	if v := os.Getenv("CUBE_LCM_CUBEMASTER_URL"); v != "" {
 		c.CubeMasterURL = v
 	}
+	c.CubeMasterUserID = os.Getenv("CUBE_LCM_CUBEMASTER_USER_ID")
+	c.CubeMasterSecretKey = os.Getenv("CUBE_LCM_CUBEMASTER_SECRET_KEY")
 	if v := os.Getenv("CUBE_LCM_LISTEN_ADDR"); v != "" {
 		c.ListenAddr = v
 	}
@@ -311,6 +317,9 @@ func (c *Config) Validate() error {
 	}
 	if c.CubeMasterURL == "" {
 		return errors.New("cube master url is empty")
+	}
+	if (c.CubeMasterUserID == "") != (c.CubeMasterSecretKey == "") {
+		return errors.New("CUBE_LCM_CUBEMASTER_USER_ID and CUBE_LCM_CUBEMASTER_SECRET_KEY must be configured together")
 	}
 	if c.ListenAddr == "" {
 		return errors.New("listen addr is empty")
