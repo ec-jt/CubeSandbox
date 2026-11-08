@@ -102,6 +102,9 @@ type UpdateNodeStatusRequest struct {
 	Allocated           *AllocatedResources `json:"allocated,omitempty"`
 	DiskUsage           *DiskUsage          `json:"disk_usage,omitempty"`
 	MetricTime          time.Time           `json:"metric_time,omitempty"`
+	// RealMetrics carries observed host CPU / load / disk-IO telemetry.
+	// Optional (omitempty) so older cubelets keep working unchanged.
+	RealMetrics         *RealMetrics        `json:"real_metrics,omitempty"`
 	Versions            []ComponentVersion  `json:"versions,omitempty"`
 	InventoryIncomplete bool                `json:"inventory_incomplete,omitempty"`
 	HostFacts           *HostFacts          `json:"host_facts,omitempty"`
@@ -116,6 +119,20 @@ type AllocatedResources struct {
 	NicQueues     int64 `json:"nic_queues,omitempty"`
 	DataDiskMB    int64 `json:"data_disk_mb,omitempty"`
 	StorageDiskMB int64 `json:"storage_disk_mb,omitempty"`
+}
+
+// RealMetrics carries real host utilisation (not quota allocation) for a
+// node: aggregate + per-core CPU busy %, load averages, and disk IOPS /
+// throughput, as rates over the cubelet's report interval.
+type RealMetrics struct {
+	CpuUtilPct   float64   `json:"cpu_util_pct,omitempty"`
+	PerCoreUtils []float64 `json:"per_core_utils,omitempty"`
+	Load1        float64   `json:"load1,omitempty"`
+	Load5        float64   `json:"load5,omitempty"`
+	Load15       float64   `json:"load15,omitempty"`
+	DiskIOPS     float64   `json:"disk_iops,omitempty"`
+	DiskReadBps  float64   `json:"disk_read_bps,omitempty"`
+	DiskWriteBps float64   `json:"disk_write_bps,omitempty"`
 }
 
 // DiskUsage carries filesystem fill ratios (0~100).

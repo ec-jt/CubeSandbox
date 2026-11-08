@@ -49,6 +49,11 @@ func checkParam(ctx context.Context, realReq *cubebox.RunCubeSandboxRequest) err
 		}
 	}
 
+	// Only per-port range validation. There is intentionally NO count limit on
+	// the ports baked into a CREATE request: they come from the template
+	// (operator-chosen), not from sandbox users, and a numeric cap only ever
+	// rejected legitimate runtime images. Dynamic ports opened later go through
+	// UpdateWithExposePort (update.go), which is also uncapped for now.
 	for _, p := range realReq.GetExposedPorts() {
 		if p <= 0 || p > 65535 {
 			return ret.Errorf(errorcode.ErrorCode_InvalidParamFormat, "invalid exposed port %d", p)

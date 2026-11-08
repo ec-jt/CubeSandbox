@@ -5,6 +5,7 @@ package nodemetric
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
@@ -198,6 +199,19 @@ type NodeMetric struct {
 	DataDiskUsagePer    float64
 	StorageDiskUsagePer float64
 	SysDiskUsagePer     float64
+
+	// HasRealMetrics marks that the cubelet populated the real host telemetry
+	// group (CPU / load / disk IO); same partial-update semantics as HasDisk.
+	// Field names mirror CubeMaster's localcache RedisNodeInfo redis tags.
+	HasRealMetrics bool
+	CpuUtilPct     float64
+	PerCoreUtils   []float64
+	Load1          float64
+	Load5          float64
+	Load15         float64
+	DiskIOPS       float64
+	DiskReadBps    float64
+	DiskWriteBps   float64
 }
 
 // WriteNodeMetric writes the metric snapshot to Redis, mirroring
@@ -207,7 +221,7 @@ func WriteNodeMetric(m *NodeMetric) error {
 	if m == nil || m.NodeID == "" {
 		return errors.New("WriteNodeMetric: node id required")
 	}
-	if !m.HasAllocated && !m.HasDisk {
+	if !m.HasAllocated && !m.HasDisk && !m.HasRealMetrics {
 		return nil
 	}
 	if m.MetricTime.IsZero() {
@@ -241,6 +255,18 @@ func WriteNodeMetric(m *NodeMetric) error {
 			"data_disk_usage_per", m.DataDiskUsagePer,
 			"storage_disk_usage_per", m.StorageDiskUsagePer,
 			"sys_disk_usage_per", m.SysDiskUsagePer,
+		)
+	}
+	if m.HasRealMetrics {
+		fields = append(fields,
+			"real_cpu_util_pct", m.CpuUtilPct,
+			"per_core_utils", marshalFloatSlice(m.PerCoreUtils),
+			"real_load1", m.Load1,
+			"real_load5", m.Load5,
+			"real_load15", m.Load15,
+			"real_disk_iops", m.DiskIOPS,
+			"real_disk_read_bps", m.DiskReadBps,
+			"real_disk_write_bps", m.DiskWriteBps,
 		)
 	}
 	conn := pool.Get()
@@ -347,6 +373,19 @@ func ReadNodeMetric(nodeID string) (*NodeMetric, error) {
 		nm.SysDiskUsagePer = atof64(m["sys_disk_usage_per"])
 	}
 	return nm, nil
+}
+
+// marshalFloatSlice encodes a float slice as a compact JSON array string for
+// flat Redis HSET storage (CubeMaster decodes it). Empty/nil yields "".
+func marshalFloatSlice(v []float64) string {
+	if len(v) == 0 {
+		return ""
+	}
+	b, err := json.Marshal(v)
+	if err != nil {
+		return ""
+	}
+	return string(b)
 }
 
 // atoi64 parses s as int64; 0 on error.

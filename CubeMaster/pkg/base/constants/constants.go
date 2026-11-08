@@ -148,6 +148,8 @@ const (
 
 	UpdateActionAddDevice    = "addDevice"
 	UpdateActionRemoveDevice = "removeDevice"
+	UpdateActionExposePort   = "exposePort"
+	UpdateActionClosePort    = "closePort"
 )
 
 const (

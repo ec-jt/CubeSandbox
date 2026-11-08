@@ -226,7 +226,7 @@ func (svc *NodeService) UpdateNodeStatus(ctx context.Context, nodeID string, req
 }
 
 func fanOutResourceMetric(ctx context.Context, nodeID string, req *model.UpdateNodeStatusRequest, metricTime time.Time) {
-	if req == nil || (req.Allocated == nil && req.DiskUsage == nil) {
+	if req == nil || (req.Allocated == nil && req.DiskUsage == nil && req.RealMetrics == nil) {
 		return
 	}
 	if metricTime.IsZero() {
@@ -245,6 +245,17 @@ func fanOutResourceMetric(ctx context.Context, nodeID string, req *model.UpdateN
 		m.DataDiskUsagePer = d.DataDiskUsagePer
 		m.StorageDiskUsagePer = d.StorageDiskUsagePer
 		m.SysDiskUsagePer = d.SysDiskUsagePer
+	}
+	if rm := req.RealMetrics; rm != nil {
+		m.HasRealMetrics = true
+		m.CpuUtilPct = rm.CpuUtilPct
+		m.PerCoreUtils = append([]float64(nil), rm.PerCoreUtils...)
+		m.Load1 = rm.Load1
+		m.Load5 = rm.Load5
+		m.Load15 = rm.Load15
+		m.DiskIOPS = rm.DiskIOPS
+		m.DiskReadBps = rm.DiskReadBps
+		m.DiskWriteBps = rm.DiskWriteBps
 	}
 	if err := nodemetric.WriteNodeMetric(m); err != nil {
 		logging.G(ctx).Warnf("nodemgmt: write node metric to redis failed: node=%s: %v", nodeID, err)
