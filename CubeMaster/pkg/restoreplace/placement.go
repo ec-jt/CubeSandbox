@@ -53,6 +53,11 @@ type Input struct {
 	SourceSandboxID        string
 	SourceCheckpointID     string
 	SourceCheckpointDigest string
+	// PersistedSourceQuiescedRecord is the origin local-quiesced record Master
+	// persisted at LRU eviction. Consulted only with ExcludeOrigin; when set it
+	// replaces the origin read (the origin may be drained or offline) and is
+	// validated strictly. Empty keeps the origin read.
+	PersistedSourceQuiescedRecord []byte
 }
 
 // Placement is the chosen host. CrossNode is true only after origin failed

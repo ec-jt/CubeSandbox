@@ -7,6 +7,7 @@ package restoreplace
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -172,6 +173,55 @@ func sourceQuiescedRequired() bool {
 	return on
 }
 
+// EvictedNativeKind mirrors Cubelet/pkg/sourcefence.EvictedNativeKind: the
+// native_binding kind of a local-quiesced record produced by LRU paused
+// eviction. FenceRecoverySource never produces it.
+const EvictedNativeKind = "paused-eviction-v1"
+
+// evictedNativeBinding mirrors Cubelet/pkg/sourcefence.EvictedNativeBinding.
+type evictedNativeBinding struct {
+	Kind             string          `json:"kind"`
+	CheckpointCommit json.RawMessage `json:"checkpoint_commit"`
+}
+
+// EvictionRecordDigest strictly decodes an eviction record and returns the
+// checkpoint digest it binds. It does not authorize anything by itself: the
+// caller must still run ValidateEvictionRecord with that digest, which also
+// requires the embedded commit to reproduce it.
+func EvictionRecordDigest(raw []byte) (string, error) {
+	rec, err := decodeSourceQuiescedRecord(raw)
+	if err != nil {
+		return "", err
+	}
+	return rec.Binding.CheckpointDigest, nil
+}
+
+// ValidateEvictionRecord strictly decodes a persisted eviction record and
+// binds it to the restore identity, exactly like the origin read path, and in
+// addition requires the eviction native binding whose embedded commit hashes
+// to the binding digest. A record from FenceRecoverySource, or one whose
+// evidence does not reproduce the digest, is refused.
+func ValidateEvictionRecord(in Input, raw []byte) (*SourceQuiescedRecord, error) {
+	rec, err := decodeSourceQuiescedRecord(raw)
+	if err != nil {
+		return nil, err
+	}
+	if err := ValidateSourceQuiesced(in, rec); err != nil {
+		return nil, err
+	}
+	var nb evictedNativeBinding
+	d := json.NewDecoder(bytes.NewReader(rec.NativeBinding))
+	d.DisallowUnknownFields()
+	if err := d.Decode(&nb); err != nil || nb.Kind != EvictedNativeKind || len(nb.CheckpointCommit) == 0 {
+		return nil, fmt.Errorf("eviction record native binding is not a paused-eviction binding")
+	}
+	sum := sha256.Sum256(nb.CheckpointCommit)
+	if hex.EncodeToString(sum[:]) != rec.Binding.CheckpointDigest {
+		return nil, fmt.Errorf("eviction record checkpoint commit does not reproduce its digest")
+	}
+	return rec, nil
+}
+
 // fetchSourceQuiescedFn is the trusted server-side read of the origin's
 // durable drain record. It is a seam so placement tests can exercise every
 // outcome without a Cubelet.
@@ -181,6 +231,17 @@ var fetchSourceQuiescedFn = fetchSourceQuiescedFromOrigin
 // the existing private Update RPC. There is no request annotation and no
 // caller-supplied flag: the record is durable node state or nothing.
 func fetchSourceQuiescedFromOrigin(ctx context.Context, originIP, originNodeID, sandboxID string) (*SourceQuiescedRecord, error) {
+	raw, err := ReadOriginSourceQuiescedRaw(ctx, originIP, sandboxID)
+	if err != nil {
+		return nil, err
+	}
+	return decodeSourceQuiescedRecord(raw)
+}
+
+// ReadOriginSourceQuiescedRaw returns the origin's record bytes as served by
+// ReadRecoverySourceQuiesced, without validating them. Callers must validate
+// with decodeSourceQuiescedRecord / ValidateEvictionRecord before trusting it.
+func ReadOriginSourceQuiescedRaw(ctx context.Context, originIP, sandboxID string) ([]byte, error) {
 	ip := strings.TrimSpace(originIP)
 	if ip == "" {
 		return nil, fmt.Errorf("origin ip unknown")
@@ -205,7 +266,11 @@ func fetchSourceQuiescedFromOrigin(ctx context.Context, originIP, originNodeID, 
 	if rsp.GetRet().GetRetCode() != cubeleterrorcode.ErrorCode_Success {
 		return nil, fmt.Errorf("origin refused: %s", strings.TrimSpace(rsp.GetRet().GetRetMsg()))
 	}
-	return decodeSourceQuiescedRecord(rsp.GetExtInfo()[sourceQuiescedExtInfoKey])
+	raw := rsp.GetExtInfo()[sourceQuiescedExtInfoKey]
+	if len(raw) == 0 {
+		return nil, fmt.Errorf("origin local-quiesced record absent")
+	}
+	return raw, nil
 }
 
 // checkCrossNodeSourceQuiesced enforces the cross-node precondition. It is
@@ -222,6 +287,20 @@ func checkCrossNodeSourceQuiesced(ctx context.Context, in Input) error {
 	}
 	originIP := strings.TrimSpace(in.OriginNodeIP)
 	originID := strings.TrimSpace(in.OriginNodeID)
+	// An evicted binding carries the origin's record persisted by Master at
+	// eviction. It is validated with the same strict decoder and binding
+	// check plus the eviction evidence; a present but invalid record is a
+	// refusal, never a reason to ask the origin instead. Only when no record
+	// was persisted does an evicted restore fall back to the origin read.
+	if in.ExcludeOrigin && len(in.PersistedSourceQuiescedRecord) > 0 {
+		rec, err := ValidateEvictionRecord(in, in.PersistedSourceQuiescedRecord)
+		if err != nil {
+			return fmt.Errorf("cross-node restore of %s refused: persisted eviction record: %w", snapshot, err)
+		}
+		log.G(ctx).Infof("restoreplace: cross-node source quiesced (persisted eviction record) snapshot=%s sandbox=%s origin=%s operation=%s",
+			snapshot, sandbox, originID, rec.Binding.OperationID)
+		return nil
+	}
 	if originIP == "" {
 		return fmt.Errorf("cross-node restore of %s refused: origin node address unknown", snapshot)
 	}

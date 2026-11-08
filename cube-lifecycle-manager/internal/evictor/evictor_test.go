@@ -157,6 +157,7 @@ type fakeMaster struct {
 	view    *cubemasterclient.PausedEvictionView
 	evicted []string
 	during  func(sid string)
+	errs    []error // returned in order, then nil
 }
 
 func (f *fakeMaster) PausedEvictionView(context.Context) (*cubemasterclient.PausedEvictionView, error) {
@@ -168,6 +169,11 @@ func (f *fakeMaster) Evict(_ context.Context, sid, _ string) error {
 		f.during(sid)
 	}
 	f.evicted = append(f.evicted, sid)
+	if len(f.errs) > 0 {
+		err := f.errs[0]
+		f.errs = f.errs[1:]
+		return err
+	}
 	return nil
 }
 

@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"strings"
 	"time"
 
@@ -45,6 +46,11 @@ func (s *service) readRecoverySourceQuiesced(ctx context.Context, req *cubebox.U
 		return rsp, nil
 	}
 	local, err := workflow.SourceFences.LoadLocalDrain(sandboxID)
+	if errors.Is(err, os.ErrNotExist) {
+		// No recovery fence drain here: serve the LRU paused eviction record,
+		// which uses the same format and the same strict loader.
+		local, err = workflow.EvictionRecords.LoadLocalDrain(sandboxID)
+	}
 	if err != nil {
 		rsp.Ret.RetCode = errorcode.ErrorCode_PreConditionFailed
 		rsp.Ret.RetMsg = err.Error()

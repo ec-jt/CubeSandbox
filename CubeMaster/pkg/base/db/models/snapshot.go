@@ -61,6 +61,11 @@ type PauseSnapshotRecord struct {
 	// reported by the origin Cubelet at eviction; the cross-node
 	// source-quiesced gate binds to it.
 	CheckpointDigest string `json:"checkpoint_digest" gorm:"column:checkpoint_digest"`
+	// EvictionRecord is the exact local-quiesced record bytes the origin
+	// Cubelet published when it evicted this binding. The cross-node
+	// source-quiesced gate validates it strictly, so resume does not depend
+	// on the origin being reachable.
+	EvictionRecord string `json:"eviction_record,omitempty" gorm:"column:eviction_record"`
 }
 
 func (PauseSnapshotRecord) TableName() string {

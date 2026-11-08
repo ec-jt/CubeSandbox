@@ -16,8 +16,10 @@ import (
 	"github.com/tencentcloud/CubeSandbox/Cubelet/pkg/constants"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/pkg/container/runc"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/pkg/log"
+	"github.com/tencentcloud/CubeSandbox/Cubelet/pkg/sourcefence"
 	cubeboxstore "github.com/tencentcloud/CubeSandbox/Cubelet/pkg/store/cubebox"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/plugins/cube/internals/cubes"
+	"github.com/tencentcloud/CubeSandbox/Cubelet/plugins/workflow"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/storage"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/storage/cow"
 	"github.com/tencentcloud/CubeSandbox/pkgs/proto/services/cubebox/v1"
@@ -30,16 +32,19 @@ import (
 // durable "evicted" record lives in CubeMaster.
 const pausedEvictAction = "EvictPausedSandbox"
 
-// ExtInfo keys returned on a successful eviction.
+// ExtInfo keys returned on a successful eviction. The local-quiesced record is
+// returned under the same key ReadRecoverySourceQuiesced uses, so the wire
+// shape has one meaning; Master persists those exact bytes.
 const (
 	pausedEvictDigestKey   = "paused_eviction_checkpoint_digest"
 	pausedEvictReleasedKey = "paused_eviction_released"
+	pausedEvictRecordKey   = sourceQuiescedExtInfoKey
 )
 
 // Test seams. Production values verify against the native store and wipe the
 // paused runtime leftovers exactly like the pause-delete tombstone path.
 var (
-	verifyCommittedPauseCheckpointFn = storage.VerifyCommittedPauseCheckpoint
+	verifyCommittedPauseCheckpointFn = storage.VerifyCommittedPauseCheckpointRecord
 	cleanPausedRuncFn                = runc.Clean
 )
 
@@ -51,6 +56,14 @@ type pausedEvictionReleased struct {
 
 // evictPausedSandbox runs under the sandbox lifecycle lock taken by Update,
 // so it is serialized with resume Create (same lock) and with Destroy/Pause.
+//
+// Proof for the cross-node gate: after the PAUSED tombstone is dropped it
+// publishes a durable local-quiesced record (sourcefence LocalDrainResult,
+// stage local-quiesced-not-global-fenced) bound to operation=RequestID,
+// sandbox, this node's fence identity, the evicted incarnation, checkpoint and
+// digest, with the verified native commit as native_binding. The record is
+// written and fsynced before the drop and only renamed into place after it,
+// and its bytes are returned so Master can persist them.
 //
 // It evicts only when every condition holds:
 //   - node policy enabled (paused_eviction_enabled, default off);
@@ -90,10 +103,34 @@ func (s *service) evictPausedSandbox(ctx context.Context, req *cubebox.UpdateCub
 	if snapID == "" || want == "" || snapID != want {
 		return fail("pause checkpoint %q does not match requested %q", snapID, want)
 	}
-	digest, err := verifyCommittedPauseCheckpointFn(ctx, sb.ID, snapID)
+	nodeID := strings.TrimSpace(s.cubeboxMgr.config.SourceFenceNodeID)
+	if nodeID == "" {
+		return fail("source_fence_node_id is not configured; eviction cannot bind its proof to this node")
+	}
+	digest, commit, err := verifyCommittedPauseCheckpointFn(ctx, sb.ID, snapID)
 	if err != nil {
 		return fail("pause checkpoint is not durably committed: %v", err)
 	}
+	incarnation, err := sourcefence.EvictedIncarnation(sb.ID, sb.CreatedAt, snapID, digest)
+	if err != nil {
+		return fail("evicted source identity: %v", err)
+	}
+	native, err := sourcefence.NewEvictedNativeBinding(digest, commit)
+	if err != nil {
+		return fail("evicted native binding: %v", err)
+	}
+	stage, err := workflow.EvictionRecords.StageEvicted(workflow.SourceFences, sourcefence.Binding{
+		OperationID:      strings.TrimSpace(req.RequestID),
+		SandboxID:        sb.ID,
+		NodeID:           nodeID,
+		Incarnation:      incarnation,
+		CheckpointID:     snapID,
+		CheckpointDigest: digest,
+	}, native)
+	if err != nil {
+		return fail("stage eviction record: %v", err)
+	}
+	defer stage.Abort()
 
 	released := pausedEvictionReleased{}
 	if r := sb.ResourceWithOverHead; r != nil {
@@ -108,14 +145,37 @@ func (s *service) evictPausedSandbox(ctx context.Context, req *cubebox.UpdateCub
 		rsp.Ret.RetMsg = fmt.Sprintf("drop paused state: %v", err)
 		return rsp, nil
 	}
+	_, record, err := stage.Publish()
+	if err != nil {
+		// The tombstone is gone but no proof exists: Master must not mark the
+		// binding evicted (it never does without a record), and reconcile will
+		// keep refusing until an operator resolves it. Fail closed.
+		rsp.Ret.RetCode = errorcode.ErrorCode_Unknown
+		rsp.Ret.RetMsg = fmt.Sprintf("paused state dropped but eviction record not published: %v", err)
+		log.G(ctx).Errorf("evict paused sandbox %s: %s", sb.ID, rsp.Ret.RetMsg)
+		return rsp, nil
+	}
 	raw, _ := json.Marshal(released)
 	rsp.ExtInfo = map[string][]byte{
 		pausedEvictDigestKey:   []byte(digest),
 		pausedEvictReleasedKey: raw,
+		pausedEvictRecordKey:   record,
 	}
-	log.G(ctx).Infof("evicted paused sandbox %s checkpoint=%s digest=%s released=%s",
-		sb.ID, snapID, digest, string(raw))
+	log.G(ctx).Infof("evicted paused sandbox %s checkpoint=%s digest=%s operation=%s released=%s",
+		sb.ID, snapID, digest, req.RequestID, string(raw))
 	return rsp, nil
+}
+
+// refuseEvictedCheckpointRestore keeps the eviction promise on the origin: a
+// checkpoint this node evicted is never restored here again, so the record
+// Master relies on stays true. Other checkpoints of the same sandbox (a later
+// pause) are unaffected. Caller holds the lifecycle lock.
+func refuseEvictedCheckpointRestore(sandboxID, pauseSnapshotID string) error {
+	pauseSnapshotID = strings.TrimSpace(pauseSnapshotID)
+	if pauseSnapshotID == "" {
+		return nil
+	}
+	return workflow.EvictionRecords.EvictedCheckpointBlocked(sandboxID, pauseSnapshotID)
 }
 
 // dropEvictedTombstone removes the PAUSED CubeBox row and any leftover runtime

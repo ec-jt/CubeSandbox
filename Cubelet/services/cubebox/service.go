@@ -268,6 +268,11 @@ func (s *service) Create(ctx context.Context, req *cubebox.RunCubeSandboxRequest
 		rsp.Ret.RetMsg = err.Error()
 		return rsp, nil
 	}
+	if err := refuseEvictedCheckpointRestore(sid, req.GetAnnotations()[constants.MasterAnnotationPauseSnapshotID]); err != nil {
+		rsp.Ret.RetCode = errorcode.ErrorCode_PreConditionFailed
+		rsp.Ret.RetMsg = err.Error()
+		return rsp, nil
+	}
 	// Reject an existing live runtime before importing, cloning or replacing
 	// storage. The later runtime-step check is too late for those effects.
 	if existing, err := s.cubeboxMgr.cubeboxManger.Get(ctx, sid); err == nil && existing != nil {

@@ -5,6 +5,9 @@ package sandbox
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"testing"
 	"time"
@@ -21,7 +24,30 @@ import (
 	cubeleterrorcode "github.com/tencentcloud/CubeSandbox/pkgs/proto/services/errorcode/v1"
 )
 
-const evictDigest = "b27d4a66044e3bc47447fe98595713142ee20a58dd436269d0bb6e8d5264f9bd"
+// evictCommit stands in for the origin's canonical native commit record;
+// evictDigest is its sha256, as the origin Cubelet computes it.
+var evictCommit = []byte(`{"version":1,"binding":{"sandbox_id":"sb-1"},"objects":{}}`)
+
+var evictDigest = func() string { s := sha256.Sum256(evictCommit); return hex.EncodeToString(s[:]) }()
+
+// evictRecord builds the origin local-quiesced eviction record bytes exactly
+// as Cubelet publishes them.
+func evictRecord(t *testing.T, sandbox, checkpoint, node, digest string) []byte {
+	t.Helper()
+	native, err := json.Marshal(map[string]any{"kind": restoreplace.EvictedNativeKind, "checkpoint_commit": json.RawMessage(evictCommit)})
+	require.NoError(t, err)
+	raw, err := json.Marshal(restoreplace.SourceQuiescedRecord{
+		Version: 1,
+		Binding: restoreplace.SourceQuiescedBinding{
+			OperationID: "evict-op", SandboxID: sandbox, NodeID: node, Incarnation: "inc",
+			CheckpointID: checkpoint, CheckpointDigest: digest,
+		},
+		Stage:         restoreplace.LocalQuiesced,
+		NativeBinding: native,
+	})
+	require.NoError(t, err)
+	return raw
+}
 
 func readyS3Binding() *pausesnap.Record {
 	return &pausesnap.Record{
@@ -36,35 +62,74 @@ type evictSeams struct {
 	cubeletRsp   *cubebox.UpdateCubeSandboxResponse
 	cubeletErr   error
 	marked       []string
+	records      []string
+	// Reconcile probes of the origin.
+	present     bool
+	presentErr  error
+	originRaw   []byte
+	originErr   error
+	probeCalls  int
+	recordReads int
 }
 
 func installEvictSeams(t *testing.T, s *evictSeams) {
 	t.Helper()
 	origLookup, origMark, origCubelet := evictLookupPauseFn, evictMarkFn, evictCubeletFn
-	t.Cleanup(func() { evictLookupPauseFn, evictMarkFn, evictCubeletFn = origLookup, origMark, origCubelet })
+	origProbe, origRead := evictProbePresentFn, evictReadRecordFn
+	t.Cleanup(func() {
+		evictLookupPauseFn, evictMarkFn, evictCubeletFn = origLookup, origMark, origCubelet
+		evictProbePresentFn, evictReadRecordFn = origProbe, origRead
+	})
 	evictLookupPauseFn = func(context.Context, string) (*pausesnap.Record, error) {
 		if s.rec == nil {
 			return nil, pausesnap.ErrNotFound
 		}
 		return s.rec, nil
 	}
-	evictMarkFn = func(_ context.Context, sid, snap, digest string) error {
+	evictMarkFn = func(_ context.Context, sid, snap, digest, record string) error {
+		if record == "" {
+			t.Fatal("MarkEvicted must never be called without an eviction record")
+		}
 		s.marked = append(s.marked, sid+"/"+snap+"/"+digest)
+		s.records = append(s.records, record)
 		now := time.Now()
-		s.rec.EvictedAt, s.rec.CheckpointDigest = &now, digest
+		s.rec.EvictedAt, s.rec.CheckpointDigest, s.rec.EvictionRecord = &now, digest, record
 		return nil
 	}
 	evictCubeletFn = func(_ context.Context, _ string, req *cubebox.UpdateCubeSandboxRequest) (*cubebox.UpdateCubeSandboxResponse, error) {
 		s.cubeletCalls = append(s.cubeletCalls, req)
 		return s.cubeletRsp, s.cubeletErr
 	}
+	evictProbePresentFn = func(context.Context, string, string) (bool, error) {
+		s.probeCalls++
+		return s.present, s.presentErr
+	}
+	evictReadRecordFn = func(context.Context, string, string) ([]byte, error) {
+		s.recordReads++
+		return s.originRaw, s.originErr
+	}
+}
+
+func okEvictRspWith(record []byte) *cubebox.UpdateCubeSandboxResponse {
+	return &cubebox.UpdateCubeSandboxResponse{
+		Ret: &cubeleterrorcode.Ret{RetCode: cubeleterrorcode.ErrorCode_Success},
+		ExtInfo: map[string][]byte{
+			cubeletEvictDigestKey: []byte(evictDigest),
+			cubeletEvictRecordKey: record,
+		},
+	}
 }
 
 func okEvictRsp() *cubebox.UpdateCubeSandboxResponse {
-	return &cubebox.UpdateCubeSandboxResponse{
-		Ret:     &cubeleterrorcode.Ret{RetCode: cubeleterrorcode.ErrorCode_Success},
-		ExtInfo: map[string][]byte{cubeletEvictDigestKey: []byte(evictDigest)},
-	}
+	// Record built without *testing.T: helpers below assert on it.
+	native, _ := json.Marshal(map[string]any{"kind": restoreplace.EvictedNativeKind, "checkpoint_commit": json.RawMessage(evictCommit)})
+	raw, _ := json.Marshal(restoreplace.SourceQuiescedRecord{
+		Version: 1,
+		Binding: restoreplace.SourceQuiescedBinding{OperationID: "evict-op", SandboxID: "sb-1", NodeID: "node-a",
+			Incarnation: "inc", CheckpointID: "snap-1", CheckpointDigest: evictDigest},
+		Stage: restoreplace.LocalQuiesced, NativeBinding: native,
+	})
+	return okEvictRspWith(raw)
 }
 
 func TestPausedEvictionMasterFlagOffByDefault(t *testing.T) {
@@ -109,6 +174,8 @@ func TestPausedEvictionMasterRecordsDigestAndNeverCleans(t *testing.T) {
 	require.Equal(t, cubeletEvictAction, ann[constants.CubeAnnotationsUpdateAction])
 	require.Equal(t, "snap-1", ann[constants.CubeAnnotationPauseSnapshotID])
 	require.Equal(t, []string{"sb-1/snap-1/" + evictDigest}, s.marked)
+	require.Equal(t, string(okEvictRsp().GetExtInfo()[cubeletEvictRecordKey]), s.records[0],
+		"Master persists the exact origin record bytes")
 
 	// Second attempt: already evicted, refused without touching the node.
 	rsp = evictPausedSandbox(context.Background(), &types.UpdateRequest{RequestID: "r2", SandboxID: "sb-1"})
@@ -119,11 +186,15 @@ func TestPausedEvictionMasterRecordsDigestAndNeverCleans(t *testing.T) {
 func TestPausedEvictionMasterOriginRefusalLeavesBinding(t *testing.T) {
 	t.Setenv(PausedEvictionEnv, "true")
 	for name, s := range map[string]*evictSeams{
-		"refused": {rec: readyS3Binding(), cubeletRsp: &cubebox.UpdateCubeSandboxResponse{
+		"refused": {rec: readyS3Binding(), present: true, cubeletRsp: &cubebox.UpdateCubeSandboxResponse{
 			Ret: &cubeleterrorcode.Ret{RetCode: cubeleterrorcode.ErrorCode_PreConditionFailed, RetMsg: "not committed"}}},
-		"transport": {rec: readyS3Binding(), cubeletErr: errors.New("timeout")},
+		"transport, origin unreachable": {rec: readyS3Binding(), cubeletErr: errors.New("timeout"), presentErr: errors.New("down")},
+		"transport, still paused":       {rec: readyS3Binding(), cubeletErr: errors.New("timeout"), present: true},
 		"no digest": {rec: readyS3Binding(), cubeletRsp: &cubebox.UpdateCubeSandboxResponse{
 			Ret: &cubeleterrorcode.Ret{RetCode: cubeleterrorcode.ErrorCode_Success}}},
+		"no record": {rec: readyS3Binding(), cubeletRsp: &cubebox.UpdateCubeSandboxResponse{
+			Ret:     &cubeleterrorcode.Ret{RetCode: cubeleterrorcode.ErrorCode_Success},
+			ExtInfo: map[string][]byte{cubeletEvictDigestKey: []byte(evictDigest)}}},
 	} {
 		installEvictSeams(t, s)
 		rsp := evictPausedSandbox(context.Background(), &types.UpdateRequest{RequestID: "r", SandboxID: "sb-1"})

@@ -5,8 +5,11 @@ package cubebox
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -14,9 +17,11 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/tencentcloud/CubeSandbox/Cubelet/pkg/constants"
+	"github.com/tencentcloud/CubeSandbox/Cubelet/pkg/sourcefence"
 	cubeboxstore "github.com/tencentcloud/CubeSandbox/Cubelet/pkg/store/cubebox"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/pkg/utils"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/plugins/cube/internals/cubes"
+	"github.com/tencentcloud/CubeSandbox/Cubelet/plugins/workflow"
 	"github.com/tencentcloud/CubeSandbox/pkgs/proto/services/cubebox/v1"
 	"github.com/tencentcloud/CubeSandbox/pkgs/proto/services/errorcode/v1"
 )
@@ -57,18 +62,40 @@ func pausedS3Sandbox(id, snap, backend string, status cubeboxstore.Status) *cube
 	return sb
 }
 
+// evictTestStores installs fresh, separate fence and eviction record roots.
+func evictTestStores(t *testing.T) (fences, evictions *sourcefence.Store) {
+	t.Helper()
+	root := t.TempDir()
+	var err error
+	fences, err = sourcefence.Open(filepath.Join(root, "fences"))
+	require.NoError(t, err)
+	evictions, err = sourcefence.Open(filepath.Join(root, "evictions"))
+	require.NoError(t, err)
+	origF, origE := workflow.SourceFences, workflow.EvictionRecords
+	workflow.SourceFences, workflow.EvictionRecords = fences, evictions
+	t.Cleanup(func() { workflow.SourceFences, workflow.EvictionRecords = origF, origE })
+	return fences, evictions
+}
+
 func newEvictService(t *testing.T, sb *cubeboxstore.CubeBox, enabled bool, verify func(context.Context, string, string) (string, error)) (*service, *evictFakeAPI) {
 	t.Helper()
+	evictTestStores(t)
 	api := &evictFakeAPI{fakeCubeboxAPI: fakeCubeboxAPI{cb: sb}}
 	origVerify, origClean := verifyCommittedPauseCheckpointFn, cleanPausedRuncFn
-	verifyCommittedPauseCheckpointFn = verify
+	verifyCommittedPauseCheckpointFn = func(ctx context.Context, sandbox, snap string) (string, []byte, error) {
+		d, err := verify(ctx, sandbox, snap)
+		if err != nil {
+			return "", nil, err
+		}
+		return d, testCommit, nil
+	}
 	cleanPausedRuncFn = func(context.Context, string) error { return nil }
 	t.Cleanup(func() { verifyCommittedPauseCheckpointFn, cleanPausedRuncFn = origVerify, origClean })
 	s := &service{
 		sandboxLifecycleLocks: utils.NewResourceLocks(),
 		cubeboxMgr: &local{
 			cubeboxManger: api,
-			config:        &CubeConfig{PausedEvictionEnabled: enabled},
+			config:        &CubeConfig{PausedEvictionEnabled: enabled, SourceFenceNodeID: "node-a"},
 		},
 	}
 	return s, api
@@ -85,7 +112,11 @@ func evictReq(id, snap string) *cubebox.UpdateCubeSandboxRequest {
 	}
 }
 
-const testDigest = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+// testCommit stands in for the canonical native commit record; testDigest is
+// its sha256, exactly as VerifyCommittedPauseCheckpointRecord computes it.
+var testCommit = []byte(`{"version":1,"binding":{"sandbox_id":"sb-ev"},"objects":{}}`)
+
+var testDigest = func() string { s := sha256.Sum256(testCommit); return hex.EncodeToString(s[:]) }()
 
 func committed(context.Context, string, string) (string, error) { return testDigest, nil }
 

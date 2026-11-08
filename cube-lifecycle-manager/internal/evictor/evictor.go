@@ -71,7 +71,18 @@ type Evictor struct {
 	o       Options
 	evicted atomic.Int64
 	failed  atomic.Int64
+	// uncertain holds sandboxes whose last eviction ended with an unknown
+	// outcome (transport error or Master ReqCubeAPIFailed). They are retried
+	// every tick, independent of node pressure, until Master's evict action
+	// reconciles them (marks evicted from the origin's record, or reports a
+	// definite refusal) or the binding disappears/becomes ineligible. Only
+	// the sweep goroutine touches it.
+	uncertain map[string]Candidate
 }
+
+// RetCodeOutcomeUnknown is CubeMaster ErrorCode_ReqCubeAPIFailed: the
+// Master->Cubelet evict call did not produce a definite answer.
+const RetCodeOutcomeUnknown = 130595
 
 func New(o Options) *Evictor {
 	if o.Now == nil {
@@ -83,7 +94,7 @@ func New(o Options) *Evictor {
 	if o.Log == nil {
 		o.Log = zap.NewNop()
 	}
-	return &Evictor{o: o}
+	return &Evictor{o: o, uncertain: map[string]Candidate{}}
 }
 
 // Run blocks until ctx is cancelled. When the feature is disabled it only
@@ -228,6 +239,7 @@ func (e *Evictor) sweepOnce(ctx context.Context) {
 		// Master flag off: never evict, whatever CLM is configured to do.
 		return
 	}
+	e.retryUncertain(ctx, view)
 	nodes := make([]string, 0)
 	cands := SelectCandidates(view, e.o.Registry, e.o.Thresholds, e.o.MinPausedAge, e.o.Now())
 	for n := range cands {
@@ -245,6 +257,40 @@ func (e *Evictor) sweepOnce(ctx context.Context) {
 			}
 		}
 	}
+}
+
+// retryUncertain re-drives unknown-outcome evictions so Master reconciles
+// them. A binding that is gone, already evicted or no longer Master-eligible
+// needs nothing more from CLM.
+func (e *Evictor) retryUncertain(ctx context.Context, view *cubemasterclient.PausedEvictionView) {
+	if len(e.uncertain) == 0 {
+		return
+	}
+	byID := make(map[string]cubemasterclient.PausedEvictionBinding, len(view.Bindings))
+	for _, b := range view.Bindings {
+		byID[b.SandboxID] = b
+	}
+	ids := make([]string, 0, len(e.uncertain))
+	for id := range e.uncertain {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	for _, id := range ids {
+		b, ok := byID[id]
+		if !ok || b.Evicted || !b.Eligible {
+			delete(e.uncertain, id)
+			continue
+		}
+		e.tryEvict(ctx, e.uncertain[id])
+	}
+}
+
+func outcomeUnknown(err error) bool {
+	var apiErr *cubemasterclient.APIError
+	if errors.As(err, &apiErr) {
+		return apiErr.RetCode == RetCodeOutcomeUnknown
+	}
+	return err != nil
 }
 
 // tryEvict claims the sandbox's lifecycle state (paused -> evicting) so a
@@ -267,6 +313,11 @@ func (e *Evictor) tryEvict(ctx context.Context, c Candidate) bool {
 	}
 	if evictErr != nil {
 		e.failed.Add(1)
+		if outcomeUnknown(evictErr) {
+			e.uncertain[c.SandboxID] = c
+		} else {
+			delete(e.uncertain, c.SandboxID)
+		}
 		var apiErr *cubemasterclient.APIError
 		if errors.As(evictErr, &apiErr) {
 			e.o.Log.Info("paused eviction refused", zap.String("sandbox_id", c.SandboxID),
@@ -276,6 +327,7 @@ func (e *Evictor) tryEvict(ctx context.Context, c Candidate) bool {
 		}
 		return false
 	}
+	delete(e.uncertain, c.SandboxID)
 	e.evicted.Add(1)
 	e.o.Log.Info("evicted paused sandbox", zap.String("sandbox_id", c.SandboxID), zap.Int64("last_used_ms", c.LastUsedMs))
 	return true

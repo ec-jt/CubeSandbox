@@ -93,18 +93,24 @@ type Record struct {
 	// CheckpointDigest is the committed native checkpoint digest captured at
 	// eviction; consumed by the cross-node source-quiesced gate.
 	CheckpointDigest string
-	CreatedAt        time.Time
-	UpdatedAt        time.Time
+	// EvictionRecord is the exact origin local-quiesced record published at
+	// eviction. The cross-node gate validates it strictly and only falls back
+	// to reading the origin when it is empty.
+	EvictionRecord string
+	CreatedAt      time.Time
+	UpdatedAt      time.Time
 }
 
 // Evicted reports whether the pause binding's node-local state was evicted.
 func (r *Record) Evicted() bool { return r != nil && r.EvictedAt != nil }
 
-// MarkEvicted records a completed eviction on a READY S3 binding. It refuses
-// any row that is not READY, not S3, not remote-ready, or already evicted, so a
-// concurrent resume (which deletes the row) or a stale request cannot mark the
-// wrong binding. Callers hold the per-sandbox lifecycle lock.
-func MarkEvicted(ctx context.Context, sandboxID, snapshotID, digest string) error {
+// MarkEvicted records a completed eviction on a READY S3 binding together with
+// the origin's local-quiesced record. It refuses any row that is not READY,
+// not S3, not remote-ready, or already evicted, so a concurrent resume (which
+// deletes the row) or a stale request cannot mark the wrong binding. A binding
+// is never marked evicted without the record. Callers hold the per-sandbox
+// lifecycle lock and have already validated the record.
+func MarkEvicted(ctx context.Context, sandboxID, snapshotID, digest, record string) error {
 	client := getDB()
 	if client == nil {
 		return ErrNotReady
@@ -116,12 +122,16 @@ func MarkEvicted(ctx context.Context, sandboxID, snapshotID, digest string) erro
 	if sandboxID == "" || snapshotID == "" || digest == "" {
 		return errors.New("sandboxID, snapshotID and digest are required")
 	}
+	if strings.TrimSpace(record) == "" {
+		return errors.New("eviction record is required")
+	}
 	res := client.WithContext(ctx).Table(constants.PauseSnapshotTableName).
 		Where("snapshot_id = ? AND sandbox_id = ? AND status = ? AND backend = ? AND remote_status = ? AND evicted_at IS NULL",
 			snapshotID, sandboxID, statusReady, constants.SnapshotBackendS3, constants.RemoteStatusReady).
 		Updates(map[string]any{
 			"evicted_at":        gorm.Expr("CURRENT_TIMESTAMP"),
 			"checkpoint_digest": digest,
+			"eviction_record":   record,
 			"updated_at":        gorm.Expr("CURRENT_TIMESTAMP"),
 		})
 	if res.Error != nil {
@@ -418,6 +428,7 @@ func recordFromModel(row *models.PauseSnapshotRecord) *Record {
 		ExportUUIDs:         row.ExportUUIDs,
 		EvictedAt:           row.EvictedAt,
 		CheckpointDigest:    strings.TrimSpace(row.CheckpointDigest),
+		EvictionRecord:      row.EvictionRecord,
 		CreatedAt:           row.CreatedAt,
 		UpdatedAt:           row.UpdatedAt,
 	}

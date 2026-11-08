@@ -229,6 +229,10 @@ func init() {
 			if err != nil {
 				return nil, fmt.Errorf("open source fences: %w", err)
 			}
+			workflow.EvictionRecords, err = sourcefence.Open(config.RootPath + "-paused-evictions")
+			if err != nil {
+				return nil, fmt.Errorf("open paused eviction records: %w", err)
+			}
 
 			CubeLog.Info("Start recovering state")
 

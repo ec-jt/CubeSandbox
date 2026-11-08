@@ -39,7 +39,10 @@ const (
 	pauseCubeletRPCTimeout = 120 * time.Second
 )
 
-var decidePauseResumePlacementFn = restoreplace.Decide
+var (
+	decidePauseResumePlacementFn = restoreplace.Decide
+	resumeReconcileEvictionFn    = reconcilePausedEviction
+)
 
 // pauseSandbox:
 //  1. allocate snap-* and record CREATING binding
@@ -318,6 +321,13 @@ func resumeFromPauseSnapshot(ctx context.Context, req *types.UpdateRequest, host
 			rsp.Ret.RetMsg = msg
 			return rsp
 		}
+	}
+	// Ambiguous earlier eviction: if the origin already dropped this
+	// sandbox and published its eviction record, record that now so resume
+	// goes cross-node instead of trying the origin. Gated on the Master
+	// eviction flag; never marks without a validated record.
+	if PausedEvictionEnabled() && !rec.Evicted() && EvictionIneligibleReason(rec) == "" {
+		rec, _ = resumeReconcileEvictionFn(ctx, rec)
 	}
 	snapID := rec.SnapshotID
 
@@ -669,8 +679,12 @@ func pauseResumePlacementInput(rec *pausesnap.Record, instanceType string, creat
 		in.SourceSandboxID = strings.TrimSpace(rec.SandboxID)
 		in.SourceCheckpointID = strings.TrimSpace(rec.SnapshotID)
 		// An evicted binding carries the digest the origin Cubelet verified
-		// against the committed native record at eviction time.
+		// against the committed native record at eviction time, and the
+		// origin's eviction record itself so the gate needs no origin call.
 		in.SourceCheckpointDigest = strings.TrimSpace(rec.CheckpointDigest)
+		if rec.Evicted() && strings.TrimSpace(rec.EvictionRecord) != "" {
+			in.PersistedSourceQuiescedRecord = []byte(rec.EvictionRecord)
+		}
 	}
 	if createReq != nil && config.GetConfig() != nil {
 		if reqRes, rerr := checkAndGetReqResource(createReq); rerr == nil {
