@@ -164,3 +164,67 @@ func TestResumeNonEvictedCarriesNoPersistedRecord(t *testing.T) {
 	require.False(t, in.ExcludeOrigin)
 	_ = pausesnap.StatusReady
 }
+
+// Eviction crash window: the origin answers, no longer holds the sandbox,
+// and serves no record yet (Cubelet crashed between the tombstone drop and
+// the publish). Evict must report the retryable outcome-unknown code (CLM
+// keeps it in its uncertain set), never a definite refusal, and never mark.
+// After origin startup recovery publishes the record, the retry marks the
+// binding evicted with the exact record, and resume goes cross-node with it.
+func TestEvictCrashWindowRetryableThenReconciles(t *testing.T) {
+	t.Setenv(PausedEvictionEnv, "true")
+	s := &evictSeams{rec: readyS3Binding(), present: false,
+		originErr:  errors.New("origin refused: no such file or directory"),
+		cubeletRsp: okRefusal("sandbox record missing")}
+	installEvictSeams(t, s)
+
+	rsp := evictPausedSandbox(context.Background(), &types.UpdateRequest{RequestID: "r", SandboxID: "sb-1"})
+	require.Equal(t, int(errorcode.ErrorCode_ReqCubeAPIFailed), rsp.Ret.RetCode, rsp.Ret.RetMsg)
+	require.Equal(t, 130595, rsp.Ret.RetCode)
+	require.False(t, s.rec.Evicted())
+	require.Empty(t, s.marked)
+	_, outcome := reconcilePausedEvictionOutcome(context.Background(), s.rec)
+	require.Equal(t, reconcileUnknown, outcome)
+
+	// Transport-error path reports the same retryable code.
+	s.cubeletRsp, s.cubeletErr = nil, errors.New("context deadline exceeded")
+	rsp = evictPausedSandbox(context.Background(), &types.UpdateRequest{RequestID: "r1", SandboxID: "sb-1"})
+	require.Equal(t, int(errorcode.ErrorCode_ReqCubeAPIFailed), rsp.Ret.RetCode)
+	require.Empty(t, s.marked)
+
+	// Origin restarted, recovery published the staged record.
+	raw := evictRecord(t, "sb-1", "snap-1", "node-a", evictDigest)
+	s.originErr, s.originRaw = nil, raw
+	s.cubeletRsp, s.cubeletErr = okRefusal("sandbox record missing"), nil
+	rsp = evictPausedSandbox(context.Background(), &types.UpdateRequest{RequestID: "r2", SandboxID: "sb-1"})
+	require.Equal(t, int(errorcode.ErrorCode_Success), rsp.Ret.RetCode, rsp.Ret.RetMsg)
+	require.True(t, s.rec.Evicted())
+	require.Equal(t, string(raw), s.rec.EvictionRecord)
+
+	// Resume now goes cross-node carrying the persisted record, which the
+	// gate validates against the binding.
+	orig := decidePauseResumePlacementFn
+	t.Cleanup(func() { decidePauseResumePlacementFn = orig })
+	var in restoreplace.Input
+	decidePauseResumePlacementFn = func(_ context.Context, i restoreplace.Input) (*restoreplace.Placement, error) {
+		in = i
+		return &restoreplace.Placement{NodeID: "node-b", NodeIP: "10.0.0.2", CrossNode: true}, nil
+	}
+	_, err := resumePlacement(context.Background(), s.rec, "cubebox", nil)
+	require.NoError(t, err)
+	require.True(t, in.ExcludeOrigin)
+	require.Equal(t, string(raw), string(in.PersistedSourceQuiescedRecord))
+	_, err = restoreplace.ValidateEvictionRecord(in, in.PersistedSourceQuiescedRecord)
+	require.NoError(t, err)
+}
+
+// Still present on the origin is a definite "not evicted", not unknown, so a
+// refusal stays a refusal.
+func TestEvictStillPausedRefusalIsDefinite(t *testing.T) {
+	t.Setenv(PausedEvictionEnv, "true")
+	s := &evictSeams{rec: readyS3Binding(), present: true, cubeletRsp: okRefusal("pause checkpoint is not durably committed")}
+	installEvictSeams(t, s)
+	rsp := evictPausedSandbox(context.Background(), &types.UpdateRequest{RequestID: "r", SandboxID: "sb-1"})
+	require.Equal(t, int(errorcode.ErrorCode_MasterParamsError), rsp.Ret.RetCode)
+	require.Empty(t, s.marked)
+}

@@ -255,6 +255,14 @@ func init() {
 				return nil, fmt.Errorf("cubebox manager not support recover")
 			}
 
+			// Resolve eviction records a crash left staged, now that every
+			// PAUSED tombstone is loaded and before lifecycle RPCs are
+			// served. See paused_evict_recover.go.
+			if err := startEvictionRecovery(namespaces.WithNamespace(context.Background(), namespaces.Default),
+				l.cubeboxManger, config.SourceFenceNodeID); err != nil {
+				return nil, fmt.Errorf("recover staged paused evictions: %w", err)
+			}
+
 			runc.Init(config.RootPath)
 			taskio.Init(taskio.FIFODir(config.StatePath))
 			rootfs.Init(config.RootPath)

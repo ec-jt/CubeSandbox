@@ -99,40 +99,63 @@ func evictionIdentity(rec *pausesnap.Record, digest string) restoreplace.Input {
 // unreachable origin, a still-present sandbox, or a missing/foreign/tampered
 // record, leaves the binding unchanged. It never marks without the record.
 func reconcilePausedEviction(ctx context.Context, rec *pausesnap.Record) (*pausesnap.Record, bool) {
+	out, outcome := reconcilePausedEvictionOutcome(ctx, rec)
+	return out, outcome == reconcileEvicted
+}
+
+// reconcileOutcome is the tri-state result of reconcilePausedEviction.
+type reconcileOutcome int
+
+const (
+	// reconcileNotEvicted: definite. The origin still holds the sandbox (or
+	// the binding is not a reconcile candidate); the binding is unchanged.
+	reconcileNotEvicted reconcileOutcome = iota
+	// reconcileEvicted: the binding was marked evicted from a valid record.
+	reconcileEvicted
+	// reconcileUnknown: retry later. The origin is unreachable, or it no
+	// longer holds the sandbox but serves no valid record yet. The latter is
+	// the eviction crash window (tombstone dropped, record still staged);
+	// origin Cubelet startup recovery publishes the record, after which a
+	// retry marks the binding. Never marked without a valid record.
+	reconcileUnknown
+)
+
+func reconcilePausedEvictionOutcome(ctx context.Context, rec *pausesnap.Record) (*pausesnap.Record, reconcileOutcome) {
 	if rec == nil || rec.Evicted() || EvictionIneligibleReason(rec) != "" {
-		return rec, false
+		return rec, reconcileNotEvicted
 	}
 	present, err := evictProbePresentFn(ctx, rec.NodeIP, rec.SandboxID)
-	if err != nil || present {
-		if err != nil {
-			log.G(ctx).Warnf("paused eviction reconcile sandbox=%s: origin probe failed, binding unchanged: %v", rec.SandboxID, err)
-		}
-		return rec, false
+	if err != nil {
+		log.G(ctx).Warnf("paused eviction reconcile sandbox=%s: origin probe failed, binding unchanged: %v", rec.SandboxID, err)
+		return rec, reconcileUnknown
+	}
+	if present {
+		return rec, reconcileNotEvicted
 	}
 	raw, err := evictReadRecordFn(ctx, rec.NodeIP, rec.SandboxID)
 	if err != nil {
-		log.G(ctx).Warnf("paused eviction reconcile sandbox=%s: origin holds no sandbox and no eviction record, binding unchanged: %v", rec.SandboxID, err)
-		return rec, false
+		log.G(ctx).Warnf("paused eviction reconcile sandbox=%s: origin holds no sandbox and no eviction record yet (outcome unknown, retry later), binding unchanged: %v", rec.SandboxID, err)
+		return rec, reconcileUnknown
 	}
 	digest, err := restoreplace.EvictionRecordDigest(raw)
 	if err != nil {
-		log.G(ctx).Warnf("paused eviction reconcile sandbox=%s: invalid eviction record: %v", rec.SandboxID, err)
-		return rec, false
+		log.G(ctx).Warnf("paused eviction reconcile sandbox=%s: invalid eviction record (outcome unknown): %v", rec.SandboxID, err)
+		return rec, reconcileUnknown
 	}
 	if _, err := restoreplace.ValidateEvictionRecord(evictionIdentity(rec, digest), raw); err != nil {
-		log.G(ctx).Warnf("paused eviction reconcile sandbox=%s: eviction record does not bind this binding: %v", rec.SandboxID, err)
-		return rec, false
+		log.G(ctx).Warnf("paused eviction reconcile sandbox=%s: eviction record does not bind this binding (outcome unknown): %v", rec.SandboxID, err)
+		return rec, reconcileUnknown
 	}
 	if err := evictMarkFn(ctx, rec.SandboxID, rec.SnapshotID, digest, string(raw)); err != nil {
 		log.G(ctx).Warnf("paused eviction reconcile sandbox=%s: record eviction: %v", rec.SandboxID, err)
-		return rec, false
+		return rec, reconcileUnknown
 	}
 	now := time.Now()
 	out := *rec
 	out.EvictedAt, out.CheckpointDigest, out.EvictionRecord = &now, digest, string(raw)
 	log.G(ctx).Infof("paused eviction reconciled sandbox=%s snap=%s origin=%s digest=%s",
 		rec.SandboxID, rec.SnapshotID, rec.NodeIP, digest)
-	return &out, true
+	return &out, reconcileEvicted
 }
 
 // EvictionIneligibleReason returns "" when a pause binding is a valid LRU
@@ -207,7 +230,14 @@ func evictPausedSandbox(ctx context.Context, req *types.UpdateRequest) *types.Re
 	if code := cubeRsp.GetRet().GetRetCode(); code != cubeleterrorcode.ErrorCode_Success && code != cubeleterrorcode.ErrorCode_OK {
 		// A retry after an earlier lost response lands here: the node no
 		// longer holds the sandbox. Reconcile before reporting a refusal.
-		if _, ok := reconcilePausedEviction(ctx, rec); ok {
+		switch _, outcome := reconcilePausedEvictionOutcome(ctx, rec); outcome {
+		case reconcileEvicted:
+			return rsp
+		case reconcileUnknown:
+			// Gone on the origin without a valid record (crash window), or
+			// origin unreachable: retryable, never a definite refusal.
+			rsp.Ret.RetCode = int(errorcode.ErrorCode_ReqCubeAPIFailed)
+			rsp.Ret.RetMsg = fmt.Sprintf("cubelet evict %s: outcome unknown, retry later: %s", req.SandboxID, cubeRsp.GetRet().GetRetMsg())
 			return rsp
 		}
 		return refuse("origin refused eviction of %s: %s", req.SandboxID, cubeRsp.GetRet().GetRetMsg())

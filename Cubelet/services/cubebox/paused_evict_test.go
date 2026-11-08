@@ -62,6 +62,9 @@ func pausedS3Sandbox(id, snap, backend string, status cubeboxstore.Status) *cube
 	return sb
 }
 
+// lastEvictionRoot is the eviction store root evictTestStores installed last.
+var lastEvictionRoot string
+
 // evictTestStores installs fresh, separate fence and eviction record roots.
 func evictTestStores(t *testing.T) (fences, evictions *sourcefence.Store) {
 	t.Helper()
@@ -69,7 +72,8 @@ func evictTestStores(t *testing.T) (fences, evictions *sourcefence.Store) {
 	var err error
 	fences, err = sourcefence.Open(filepath.Join(root, "fences"))
 	require.NoError(t, err)
-	evictions, err = sourcefence.Open(filepath.Join(root, "evictions"))
+	lastEvictionRoot = filepath.Join(root, "evictions")
+	evictions, err = sourcefence.Open(lastEvictionRoot)
 	require.NoError(t, err)
 	origF, origE := workflow.SourceFences, workflow.EvictionRecords
 	workflow.SourceFences, workflow.EvictionRecords = fences, evictions

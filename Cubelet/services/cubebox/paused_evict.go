@@ -6,6 +6,7 @@ package cubebox
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -18,6 +19,7 @@ import (
 	"github.com/tencentcloud/CubeSandbox/Cubelet/pkg/log"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/pkg/sourcefence"
 	cubeboxstore "github.com/tencentcloud/CubeSandbox/Cubelet/pkg/store/cubebox"
+	"github.com/tencentcloud/CubeSandbox/Cubelet/pkg/utils"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/plugins/cube/internals/cubes"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/plugins/workflow"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/storage"
@@ -141,17 +143,24 @@ func (s *service) evictPausedSandbox(ctx context.Context, req *cubebox.UpdateCub
 		}
 	}
 	if err := s.cubeboxMgr.dropEvictedTombstone(ctx, sb); err != nil {
+		// A partial drop may already have removed the tombstone. Then the
+		// stage is the only proof: keep it for startup recovery.
+		if _, gerr := s.cubeboxMgr.cubeboxManger.Get(ctx, sb.ID); errors.Is(gerr, utils.ErrorKeyNotFound) {
+			stage.Retain()
+		}
 		rsp.Ret.RetCode = errorcode.ErrorCode_Unknown
 		rsp.Ret.RetMsg = fmt.Sprintf("drop paused state: %v", err)
 		return rsp, nil
 	}
 	_, record, err := stage.Publish()
 	if err != nil {
-		// The tombstone is gone but no proof exists: Master must not mark the
-		// binding evicted (it never does without a record), and reconcile will
-		// keep refusing until an operator resolves it. Fail closed.
+		// The tombstone is gone but the record is not published. Keep the
+		// staged record: startup recovery re-validates and publishes it.
+		// Until then Master gets no proof (reconcile reports outcome
+		// unknown, retryable) and origin restore of the sandbox is refused.
+		stage.Retain()
 		rsp.Ret.RetCode = errorcode.ErrorCode_Unknown
-		rsp.Ret.RetMsg = fmt.Sprintf("paused state dropped but eviction record not published: %v", err)
+		rsp.Ret.RetMsg = fmt.Sprintf("paused state dropped but eviction record not published (kept staged for recovery): %v", err)
 		log.G(ctx).Errorf("evict paused sandbox %s: %s", sb.ID, rsp.Ret.RetMsg)
 		return rsp, nil
 	}
