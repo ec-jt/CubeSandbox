@@ -250,6 +250,26 @@ func (c *Client) AcquireResume(ctx context.Context, sandboxID string, ttl time.D
 	return c.acquireIf(ctx, sandboxID, "resuming", ttl, allowEmptyOrPaused)
 }
 
+// StateEvicting is the transition marker held while LRU paused eviction drops
+// a paused sandbox's node-local state. It excludes resume/kill/pause the same
+// way the other transition markers do and always resolves back to paused.
+const StateEvicting = "evicting"
+
+// AcquireEvict CAS-claims evicting from terminal paused only. It writes no
+// owner token: eviction publishes no lifecycle stream receipt, so it is
+// released with WriteStateCAS(evicting -> paused).
+func (c *Client) AcquireEvict(ctx context.Context, sandboxID string, ttl time.Duration) (state string, acquired bool, err error) {
+	return c.acquireIf(lifecycle.WithOperationID(ctx, ""), sandboxID, StateEvicting, ttl,
+		func(v string) bool { return v == lifecycle.StatePaused })
+}
+
+// ReleaseEvict returns an evicting marker to terminal paused. It is a CAS, so
+// it never clobbers a different owner. An evicted sandbox is still paused from
+// the dataplane's point of view: resume restores it cross-node.
+func (c *Client) ReleaseEvict(ctx context.Context, sandboxID string) (bool, error) {
+	return c.WriteStateCAS(ctx, sandboxID, StateEvicting, lifecycle.StatePaused, 0)
+}
+
 // AcquireKill claims only known running/paused terminal state. Unknown is not
 // permission to destroy. Resume, pause and kill owners exclude one another.
 func (c *Client) AcquireKill(ctx context.Context, sandboxID string, ttl time.Duration) (state string, acquired bool, err error) {

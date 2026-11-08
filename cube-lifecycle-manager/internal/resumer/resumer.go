@@ -313,6 +313,21 @@ func (r *Resumer) acquireResumeOwnership(ctx context.Context, sandboxID string) 
 	if acquired {
 		return nil
 	}
+	if cur == redisstream.StateEvicting {
+		// LRU paused eviction holds the sandbox. It always resolves back to
+		// paused (evicted or not); wait it out, then claim the resume. An
+		// evicted sandbox is restored cross-node by CubeMaster.
+		if err := r.waitWhileEvicting(ctx, sandboxID); err != nil {
+			return err
+		}
+		cur, acquired, err = r.o.Redis.AcquireResume(ctx, sandboxID, r.o.StateLockTTL)
+		if err != nil {
+			return err
+		}
+		if acquired {
+			return nil
+		}
+	}
 
 	switch cur {
 	case "running":
@@ -348,6 +363,26 @@ func (r *Resumer) acquireResumeOwnership(ctx context.Context, sandboxID string) 
 			return err
 		}
 		return errAlreadyRunning
+	}
+}
+
+// waitWhileEvicting polls until the evicting marker is gone.
+func (r *Resumer) waitWhileEvicting(ctx context.Context, sandboxID string) error {
+	t := time.NewTicker(waitPollInterval)
+	defer t.Stop()
+	for {
+		state, _, err := r.o.Redis.GetState(ctx, sandboxID)
+		if err != nil {
+			return err
+		}
+		if state != redisstream.StateEvicting {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-t.C:
+		}
 	}
 }
 

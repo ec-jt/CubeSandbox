@@ -388,6 +388,11 @@ func resumeFromPauseSnapshot(ctx context.Context, req *types.UpdateRequest, host
 			cubeletReq.Annotations[constants.CubeAnnotationSnapshotRemoteUUIDs] = raw
 		}
 	}
+	if rec.Evicted() && (placement == nil || !placement.CrossNode) {
+		rsp.Ret.RetCode = int(errorcode.ErrorCode_SelectNodesFailed)
+		rsp.Ret.RetMsg = fmt.Sprintf("evicted sandbox %s must restore cross-node", req.SandboxID)
+		return rsp
+	}
 	if placement != nil && placement.CrossNode {
 		// Only Master knows the target holds no replica. Saying so lets
 		// Cubelet import the package up front instead of inferring it from a
@@ -612,8 +617,20 @@ func resolvePauseHostIP(ctx context.Context, sandboxID string) (string, bool) {
 // (XFS, S3 not remote-ready, host-mount) use the pause row's node and
 // never consult the in-memory heartbeat cache. Only S3 remote=ready may
 // leave the origin via restoreplace.Decide.
+//
+// An evicted binding (LRU paused eviction) has no local pause state on its
+// origin any more, so it can never be placed home: it goes through Decide
+// with ExcludeOrigin, which still applies the S3 remote_ready rule and the
+// cross-node source-quiesced gate.
 func resumePlacement(ctx context.Context, rec *pausesnap.Record, instanceType string, createReq *types.CreateCubeSandboxReq) (*restoreplace.Placement, error) {
 	in := pauseResumePlacementInput(rec, instanceType, createReq)
+	if rec.Evicted() {
+		if in.PinToOrigin || !restoreplace.CanCrossNode(in.Backend, in.RemoteStatus) {
+			return nil, fmt.Errorf("evicted sandbox %s cannot be restored: checkpoint is not cross-node restorable", rec.SandboxID)
+		}
+		in.ExcludeOrigin = true
+		return decidePauseResumePlacementFn(ctx, in)
+	}
 	if in.PinToOrigin || !restoreplace.CanCrossNode(in.Backend, in.RemoteStatus) {
 		return homeResumePlacement(rec), nil
 	}
@@ -651,6 +668,9 @@ func pauseResumePlacementInput(rec *pausesnap.Record, instanceType string, creat
 		// left empty so the precondition refuses rather than guesses.
 		in.SourceSandboxID = strings.TrimSpace(rec.SandboxID)
 		in.SourceCheckpointID = strings.TrimSpace(rec.SnapshotID)
+		// An evicted binding carries the digest the origin Cubelet verified
+		// against the committed native record at eviction time.
+		in.SourceCheckpointDigest = strings.TrimSpace(rec.CheckpointDigest)
 	}
 	if createReq != nil && config.GetConfig() != nil {
 		if reqRes, rerr := checkAndGetReqResource(createReq); rerr == nil {

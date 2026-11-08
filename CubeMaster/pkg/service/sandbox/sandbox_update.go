@@ -44,9 +44,9 @@ func Update(ctx context.Context, req *types.UpdateRequest) (rsp *types.Res) {
 		rsp.Ret.RetMsg = "should provide InstanceType,SandboxID,Action"
 		return
 	}
-	if req.Action != "pause" && req.Action != "resume" && !isPortAction(req.Action) {
+	if req.Action != "pause" && req.Action != "resume" && req.Action != UpdateActionEvict && !isPortAction(req.Action) {
 		rsp.Ret.RetCode = int(errorcode.ErrorCode_MasterParamsError)
-		rsp.Ret.RetMsg = "action should be pause, resume, exposePort, or closePort"
+		rsp.Ret.RetMsg = "action should be pause, resume, evict, exposePort, or closePort"
 		return
 	}
 	if isPortAction(req.Action) {
@@ -74,6 +74,8 @@ func Update(ctx context.Context, req *types.UpdateRequest) (rsp *types.Res) {
 		lockOpts.TTL = sandboxlock.PauseTTL
 	case "resume":
 		lockOpts.TTL = sandboxlock.ResumeTTL
+	case UpdateActionEvict:
+		lockOpts.TTL = sandboxlock.LifecycleTTL
 	}
 	err := sandboxlock.WithLock(ctx, req.SandboxID, lockOpts, func(ctx context.Context) error {
 		// Client/HTTP cancel must not abort bookkeeping or release the lock
@@ -87,6 +89,12 @@ func Update(ctx context.Context, req *types.UpdateRequest) (rsp *types.Res) {
 		// inventory or pause bindings. Never enter the opt-in legacy pause bridge.
 		if isPortAction(req.Action) {
 			*rsp = *updateSandboxPorts(ctx, req, defaultPortUpdateDeps())
+			return nil
+		}
+		// Eviction is resolved from the pause binding only (the sandbox has no
+		// shim), and the shared lock above serializes it with resume/pause.
+		if req.Action == UpdateActionEvict {
+			*rsp = *evictPausedSandbox(ctx, req)
 			return nil
 		}
 		var hostIP string

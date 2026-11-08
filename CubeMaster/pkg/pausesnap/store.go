@@ -87,8 +87,50 @@ type Record struct {
 	RemoteStatus        string
 	OriginHostFactsJSON string
 	ExportUUIDs         string
-	CreatedAt           time.Time
-	UpdatedAt           time.Time
+	// EvictedAt is non-nil once LRU paused eviction dropped the node-local
+	// pause state. Resume must then restore the S3 checkpoint cross-node.
+	EvictedAt *time.Time
+	// CheckpointDigest is the committed native checkpoint digest captured at
+	// eviction; consumed by the cross-node source-quiesced gate.
+	CheckpointDigest string
+	CreatedAt        time.Time
+	UpdatedAt        time.Time
+}
+
+// Evicted reports whether the pause binding's node-local state was evicted.
+func (r *Record) Evicted() bool { return r != nil && r.EvictedAt != nil }
+
+// MarkEvicted records a completed eviction on a READY S3 binding. It refuses
+// any row that is not READY, not S3, not remote-ready, or already evicted, so a
+// concurrent resume (which deletes the row) or a stale request cannot mark the
+// wrong binding. Callers hold the per-sandbox lifecycle lock.
+func MarkEvicted(ctx context.Context, sandboxID, snapshotID, digest string) error {
+	client := getDB()
+	if client == nil {
+		return ErrNotReady
+	}
+	ctx = context.WithoutCancel(ctx)
+	sandboxID = strings.TrimSpace(sandboxID)
+	snapshotID = strings.TrimSpace(snapshotID)
+	digest = strings.TrimSpace(digest)
+	if sandboxID == "" || snapshotID == "" || digest == "" {
+		return errors.New("sandboxID, snapshotID and digest are required")
+	}
+	res := client.WithContext(ctx).Table(constants.PauseSnapshotTableName).
+		Where("snapshot_id = ? AND sandbox_id = ? AND status = ? AND backend = ? AND remote_status = ? AND evicted_at IS NULL",
+			snapshotID, sandboxID, statusReady, constants.SnapshotBackendS3, constants.RemoteStatusReady).
+		Updates(map[string]any{
+			"evicted_at":        gorm.Expr("CURRENT_TIMESTAMP"),
+			"checkpoint_digest": digest,
+			"updated_at":        gorm.Expr("CURRENT_TIMESTAMP"),
+		})
+	if res.Error != nil {
+		return res.Error
+	}
+	if res.RowsAffected == 0 {
+		return fmt.Errorf("%w: no evictable binding %s", ErrNotFound, snapshotID)
+	}
+	return nil
 }
 
 // ListOptions narrows List. Empty fields match every binding.
@@ -374,6 +416,8 @@ func recordFromModel(row *models.PauseSnapshotRecord) *Record {
 		RemoteStatus:        row.RemoteStatus,
 		OriginHostFactsJSON: row.OriginHostFactsJSON,
 		ExportUUIDs:         row.ExportUUIDs,
+		EvictedAt:           row.EvictedAt,
+		CheckpointDigest:    strings.TrimSpace(row.CheckpointDigest),
 		CreatedAt:           row.CreatedAt,
 		UpdatedAt:           row.UpdatedAt,
 	}

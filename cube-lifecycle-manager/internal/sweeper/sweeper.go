@@ -419,7 +419,7 @@ func (s *Sweeper) tryKill(ctx context.Context, e registry.Entry) error {
 // on_timeout=kill a paused sandbox is not finished work.
 func skipSweepState(state string, autoPause bool) bool {
 	switch state {
-	case redisstream.UnknownState, "pausing", "resuming", "killing", lifecycle.StateKilled:
+	case redisstream.UnknownState, "pausing", "resuming", "killing", lifecycle.StateKilled, redisstream.StateEvicting:
 		return true
 	case lifecycle.StatePaused:
 		return autoPause

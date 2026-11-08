@@ -104,6 +104,17 @@ type Config struct {
 	LeaderLeaseTTL        time.Duration
 	LeaderRenewInterval   time.Duration
 	LeaderRetryInterval   time.Duration
+
+	// Paused LRU eviction (pressure-driven). Off by default; CubeMaster's
+	// CUBE_PAUSED_EVICTION_ENABLED and the Cubelet paused_eviction_enabled
+	// key must also be on for anything to be evicted.
+	PausedEvictionEnabled      bool
+	PausedEvictionInterval     time.Duration
+	PausedEvictionMaxPerNode   int
+	PausedEvictionMinPausedAge time.Duration
+	PausedEvictionMemHigh      float64
+	PausedEvictionCPUHigh      float64
+	PausedEvictionDiskHighPct  float64
 }
 
 // Default returns a config populated with safe defaults; callers then override
@@ -138,6 +149,14 @@ func Default() *Config {
 		LeaderLeaseTTL:        10 * time.Second,
 		LeaderRenewInterval:   3 * time.Second,
 		LeaderRetryInterval:   time.Second,
+
+		PausedEvictionEnabled:      false,
+		PausedEvictionInterval:     30 * time.Second,
+		PausedEvictionMaxPerNode:   1,
+		PausedEvictionMinPausedAge: 10 * time.Minute,
+		PausedEvictionMemHigh:      0.85,
+		PausedEvictionCPUHigh:      0.90,
+		PausedEvictionDiskHighPct:  80,
 	}
 }
 
@@ -285,6 +304,48 @@ func Load() (*Config, error) {
 			addErr("CUBE_LCM_LEADER_RETRY_INTERVAL", err)
 		} else {
 			c.LeaderRetryInterval = d
+		}
+	}
+	if v := os.Getenv("CUBE_PAUSED_EVICTION_ENABLED"); v != "" {
+		enabled, err := strconv.ParseBool(v)
+		if err != nil {
+			addErr("CUBE_PAUSED_EVICTION_ENABLED", err)
+		} else {
+			c.PausedEvictionEnabled = enabled
+		}
+	}
+	if v := os.Getenv("CUBE_LCM_PAUSED_EVICTION_INTERVAL"); v != "" {
+		if d, err := time.ParseDuration(v); err != nil {
+			addErr("CUBE_LCM_PAUSED_EVICTION_INTERVAL", err)
+		} else {
+			c.PausedEvictionInterval = d
+		}
+	}
+	if v := os.Getenv("CUBE_LCM_PAUSED_EVICTION_MIN_PAUSED_AGE"); v != "" {
+		if d, err := time.ParseDuration(v); err != nil {
+			addErr("CUBE_LCM_PAUSED_EVICTION_MIN_PAUSED_AGE", err)
+		} else {
+			c.PausedEvictionMinPausedAge = d
+		}
+	}
+	if v := os.Getenv("CUBE_LCM_PAUSED_EVICTION_MAX_PER_NODE"); v != "" {
+		if n, err := strconv.Atoi(v); err != nil {
+			addErr("CUBE_LCM_PAUSED_EVICTION_MAX_PER_NODE", err)
+		} else {
+			c.PausedEvictionMaxPerNode = n
+		}
+	}
+	for name, dst := range map[string]*float64{
+		"CUBE_LCM_PAUSED_EVICTION_MEM_HIGH":      &c.PausedEvictionMemHigh,
+		"CUBE_LCM_PAUSED_EVICTION_CPU_HIGH":      &c.PausedEvictionCPUHigh,
+		"CUBE_LCM_PAUSED_EVICTION_DISK_HIGH_PCT": &c.PausedEvictionDiskHighPct,
+	} {
+		if v := os.Getenv(name); v != "" {
+			if f, err := strconv.ParseFloat(v, 64); err != nil {
+				addErr(name, err)
+			} else {
+				*dst = f
+			}
 		}
 	}
 	if c.ConsumerName == "" {

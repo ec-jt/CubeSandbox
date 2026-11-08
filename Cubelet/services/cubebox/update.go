@@ -133,6 +133,8 @@ func (s *service) Update(ctx context.Context, req *cubebox.UpdateCubeSandboxRequ
 			return rsp, nil
 		}
 		return s.updateWithPauseCow(ctx, req, sb)
+	case pausedEvictAction:
+		return s.evictPausedSandbox(ctx, req, sb, rsp)
 	case constants.UpdateActionNetwork:
 		return s.updateNetworkPolicy(ctx, req, sb, rsp)
 	case constants.UpdateActionExposePort, constants.UpdateActionClosePort:

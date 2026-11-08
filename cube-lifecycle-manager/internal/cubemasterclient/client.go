@@ -185,6 +185,82 @@ func (c *Client) Resume(ctx context.Context, sandboxID, instanceType string) err
 	return c.update(ctx, sandboxID, instanceType, "resume")
 }
 
+// Evict asks CubeMaster to evict a paused sandbox whose S3 checkpoint is
+// committed (LRU paused eviction). Same error semantics as Pause.
+func (c *Client) Evict(ctx context.Context, sandboxID, instanceType string) error {
+	return c.update(ctx, sandboxID, instanceType, "evict")
+}
+
+// PausedEvictionNode mirrors CubeMaster sandbox.PausedEvictionNode.
+type PausedEvictionNode struct {
+	NodeID              string  `json:"node_id"`
+	NodeIP              string  `json:"node_ip"`
+	Healthy             bool    `json:"healthy"`
+	QuotaCpu            int64   `json:"quota_cpu"`
+	QuotaCpuUsage       int64   `json:"quota_cpu_usage"`
+	QuotaMem            int64   `json:"quota_mem"`
+	QuotaMemUsage       int64   `json:"quota_mem_usage"`
+	StorageDiskUsagePer float64 `json:"storage_disk_usage_per"`
+}
+
+// PausedEvictionBinding mirrors CubeMaster sandbox.PausedEvictionBinding.
+type PausedEvictionBinding struct {
+	SandboxID     string `json:"sandbox_id"`
+	SnapshotID    string `json:"snapshot_id"`
+	NodeID        string `json:"node_id"`
+	NodeIP        string `json:"node_ip"`
+	InstanceType  string `json:"instance_type"`
+	Backend       string `json:"backend"`
+	RemoteStatus  string `json:"remote_status"`
+	Status        string `json:"status"`
+	Evicted       bool   `json:"evicted"`
+	Eligible      bool   `json:"eligible"`
+	Reason        string `json:"reason,omitempty"`
+	PausedAtMilli int64  `json:"paused_at_ms"`
+}
+
+// PausedEvictionView mirrors GET /internal/paused_eviction.
+type PausedEvictionView struct {
+	Ret struct {
+		RetCode int    `json:"ret_code"`
+		RetMsg  string `json:"ret_msg"`
+	} `json:"ret"`
+	Enabled  bool                    `json:"enabled"`
+	Nodes    []PausedEvictionNode    `json:"nodes"`
+	Bindings []PausedEvictionBinding `json:"bindings"`
+}
+
+// PausedEvictionView reads node pressure inputs and pause bindings.
+func (c *Client) PausedEvictionView(ctx context.Context) (*PausedEvictionView, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+"/internal/paused_eviction", nil)
+	if err != nil {
+		return nil, err
+	}
+	if err := c.sign(req); err != nil {
+		return nil, err
+	}
+	resp, err := c.httpc.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, 16<<20))
+	if err != nil {
+		return nil, fmt.Errorf("read body: %w", err)
+	}
+	if resp.StatusCode/100 != 2 {
+		return nil, fmt.Errorf("http %d: %s", resp.StatusCode, raw)
+	}
+	var v PausedEvictionView
+	if err := json.Unmarshal(raw, &v); err != nil {
+		return nil, fmt.Errorf("decode response: %w", err)
+	}
+	if v.Ret.RetCode != RetCodeSuccess {
+		return nil, &APIError{RetCode: v.Ret.RetCode, RetMsg: v.Ret.RetMsg}
+	}
+	return &v, nil
+}
+
 // Kill asks CubeMaster to destroy the given sandbox.
 func (c *Client) Kill(ctx context.Context, sandboxID, instanceType, reason string) error {
 	if sandboxID == "" || instanceType == "" {

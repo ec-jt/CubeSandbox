@@ -54,6 +54,13 @@ type PauseSnapshotRecord struct {
 	RemoteStatus        string    `json:"remote_status" gorm:"column:remote_status"`
 	OriginHostFactsJSON string    `json:"origin_host_facts_json" gorm:"column:origin_host_facts_json"`
 	ExportUUIDs         string    `json:"export_uuids" gorm:"column:export_uuids"`
+	// EvictedAt is set when LRU paused eviction dropped the node-local pause
+	// state. The S3 checkpoint stays; resume must restore it cross-node.
+	EvictedAt *time.Time `json:"evicted_at,omitempty" gorm:"column:evicted_at"`
+	// CheckpointDigest is the sha256 of the committed native checkpoint record
+	// reported by the origin Cubelet at eviction; the cross-node
+	// source-quiesced gate binds to it.
+	CheckpointDigest string `json:"checkpoint_digest" gorm:"column:checkpoint_digest"`
 }
 
 func (PauseSnapshotRecord) TableName() string {

@@ -64,6 +64,11 @@ type CubeConfig struct {
 	RootPath           string                     `toml:"root_path"`
 	StatePath          string                     `toml:"state_path"`
 
+	// PausedEvictionEnabled admits the private EvictPausedSandbox action
+	// (LRU eviction of paused sandboxes whose S3 checkpoint is committed).
+	// Default false: the action is refused and nothing is ever evicted.
+	PausedEvictionEnabled bool `toml:"paused_eviction_enabled"`
+
 	CubeHostSharedDir  string `toml:"cube_host_shared_dir"`
 	CubeHyperVisorPath string `toml:"cube_hypervisor_path"`
 	CubeShimPath       string `toml:"cube_shim_path"`

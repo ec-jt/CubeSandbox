@@ -40,6 +40,11 @@ type Input struct {
 	// PinToOrigin forbids cross-node restore even when the snapshot is S3
 	// remote_ready (e.g. host-mount is bound to the origin host path).
 	PinToOrigin bool
+	// ExcludeOrigin skips the origin-first step: the origin no longer holds
+	// the restore source (LRU paused eviction dropped its local pause state),
+	// so restore must leave it. It never overrides PinToOrigin or the S3
+	// remote_ready rule, and the cross-node source-quiesced gate still runs.
+	ExcludeOrigin bool
 	// SourceSandboxID, SourceCheckpointID and SourceCheckpointDigest are the
 	// expected origin-side identity of the checkpoint being restored. They are
 	// consumed only by the cross-node source-quiesced precondition
@@ -95,7 +100,7 @@ func CanCrossNode(backend, remoteStatus string) bool {
 // when origin cannot, PinToOrigin is false, and CanCrossNode is true.
 func Decide(ctx context.Context, in Input) (*Placement, error) {
 	origin := lookupNodeFn(in.OriginNodeID, in.OriginNodeIP)
-	if origin != nil && nodeInRequestedScope(origin, in.RequestedScope) && originSchedulable(ctx, origin, in) {
+	if !in.ExcludeOrigin && origin != nil && nodeInRequestedScope(origin, in.RequestedScope) && originSchedulable(ctx, origin, in) {
 		return placementFromNode(origin, false), nil
 	}
 

@@ -22,6 +22,7 @@ import (
 	"github.com/tencentcloud/CubeSandbox/cube-lifecycle-manager/internal/cubemasterclient"
 	"github.com/tencentcloud/CubeSandbox/cube-lifecycle-manager/internal/discovery"
 	"github.com/tencentcloud/CubeSandbox/cube-lifecycle-manager/internal/eventbus"
+	"github.com/tencentcloud/CubeSandbox/cube-lifecycle-manager/internal/evictor"
 	"github.com/tencentcloud/CubeSandbox/cube-lifecycle-manager/internal/httpapi"
 	"github.com/tencentcloud/CubeSandbox/cube-lifecycle-manager/internal/leader"
 	"github.com/tencentcloud/CubeSandbox/cube-lifecycle-manager/internal/lifecycle"
@@ -201,12 +202,31 @@ func run() error {
 		Leader:             activeLeader,
 	})
 
+	evict := evictor.New(evictor.Options{
+		Enabled:    cfg.PausedEvictionEnabled,
+		Registry:   reg,
+		Redis:      stream,
+		CubeMaster: masterClient,
+		Thresholds: evictor.Thresholds{
+			MemQuotaHigh: cfg.PausedEvictionMemHigh,
+			CPUQuotaHigh: cfg.PausedEvictionCPUHigh,
+			DiskHighPct:  cfg.PausedEvictionDiskHighPct,
+		},
+		MaxPerNodePerTick: cfg.PausedEvictionMaxPerNode,
+		MinPausedAge:      cfg.PausedEvictionMinPausedAge,
+		Interval:          cfg.PausedEvictionInterval,
+		StateLockTTL:      cfg.StateLockTTL,
+		ActionTimeout:     cfg.HTTPTimeout + cfg.LeaderRenewInterval,
+		Log:               logger.Named("evictor"),
+		Leader:            activeLeader,
+	})
+
 	apiSrv := httpapi.New(cfg.ListenAddr, resumeImpl, reg, logger.Named("http")).
 		WithFleetSizer(fleetSizer{fleet}).
 		WithLeaderStatus(activeLeader)
 
 	// 3. Run all background loops concurrently. First error cancels the rest.
-	loopCount := 6
+	loopCount := 7
 	if discSvc != nil {
 		loopCount++
 	}
@@ -231,6 +251,7 @@ func run() error {
 	}()
 	go func() { errs <- pollLastActive(rootCtx, pushClient, reg, cfg.LastActivePoll, logger.Named("active")) }()
 	go func() { errs <- sweep.Run(rootCtx) }()
+	go func() { errs <- evict.Run(rootCtx) }()
 	go func() { errs <- apiSrv.Run(rootCtx) }()
 	go func() { errs <- lease.Run(rootCtx) }()
 	go func() {
