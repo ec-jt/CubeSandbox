@@ -300,7 +300,10 @@ func expandPauseSnapshotPackage(req *cubebox.RunCubeSandboxRequest) error {
 	thinRuntimeHandler := req.GetRuntimeHandler()
 	thinExposedPorts := append([]int64(nil), req.GetExposedPorts()...)
 
-	*req = *packed
+	// Replace req in place with the packed spec. proto.Reset + Merge is the
+	// lock-safe equivalent of *req = *packed for generated messages.
+	proto.Reset(req)
+	proto.Merge(req, packed)
 	binding.applyTo(req)
 
 	// Prefer packed values; fall back to thin Create for older pause snaps.

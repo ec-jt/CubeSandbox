@@ -12,6 +12,7 @@ import (
 	"github.com/tencentcloud/CubeSandbox/Cubelet/pkg/constants"
 	cubeboxstore "github.com/tencentcloud/CubeSandbox/Cubelet/pkg/store/cubebox"
 	"github.com/tencentcloud/CubeSandbox/pkgs/proto/services/cubebox/v1"
+	"google.golang.org/protobuf/proto"
 )
 
 func TestResumeFromPauseSandboxID(t *testing.T) {
@@ -111,7 +112,7 @@ func TestPauseRestoreBindingSurvivesPackedSpecSwap(t *testing.T) {
 		},
 	}
 	req := &cubebox.RunCubeSandboxRequest{}
-	*req = *packed
+	proto.Merge(req, packed)
 	binding.applyTo(req)
 
 	assert.Equal(t, "yes", req.Annotations["kept"])

@@ -19,15 +19,15 @@ import (
 // the typed ownership marker, and the inventory contains that live volume plus
 // an unrelated sandbox volume and the selected native objects.
 func freshImageMembershipFixture() (sourcefence.Binding, *SourceStorageBinding, map[string]*StorageInfo, SourceMembership, map[string]*cubecow.Volume) {
-	b := sourcefence.Binding{"op", "sb", "node", strings.Repeat("b", 64), "cp", strings.Repeat("a", 64)}
+	b := sourcefence.Binding{OperationID: "op", SandboxID: "sb", NodeID: "node", Incarnation: strings.Repeat("b", 64), CheckpointID: "cp", CheckpointDigest: strings.Repeat("a", 64)}
 	e := &SourceStorageBinding{
-		Version:     2,
-		Cohort:      sourcefence.CohortFreshImageS3,
-		RootfsMount: "root",
+		Version:      2,
+		Cohort:       sourcefence.CohortFreshImageS3,
+		RootfsMount:  "root",
 		CommitSHA256: b.CheckpointDigest,
-		LiveName:    "sb-sb-root",
-		LiveUUID:    "live",
-		LiveSize:    4096,
+		LiveName:     "sb-sb-root",
+		LiveUUID:     "live",
+		LiveSize:     4096,
 		Commit: CheckpointCommit{Binding: CheckpointDiskBinding{SandboxID: "sb", CheckpointID: "cp"}, Objects: map[string]CheckpointExport{
 			"rootfs": {Snapshot: "cp-root", SnapshotUUID: "selected", SizeBytes: 4096, Endpoint: "native:9000", Bucket: "bucket", Prefix: "store", LvsName: "store"},
 		}},
@@ -44,11 +44,11 @@ func freshImageMembershipFixture() (sourcefence.Binding, *SourceStorageBinding, 
 		"other": {SandboxID: "other", Backend: cow.BackendS3, Volumes: map[string]*BackendFileInfo{"disk": {VolumeName: "other", Kind: cowKindVolume}}},
 	}
 	n := SourceMembership{
-		StoreUUID: "store-uuid",
+		StoreUUID:  "store-uuid",
 		OwnerNonce: "owner",
-		Endpoint:  "native:9000",
-		Bucket:    "bucket",
-		Prefix:    "store",
+		Endpoint:   "native:9000",
+		Bucket:     "bucket",
+		Prefix:     "store",
 		Members: []SourceMember{
 			{"sb-sb-root", "live", 4096, false, false},
 			{"other", "other-uuid", 4096, false, false},

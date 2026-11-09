@@ -14,7 +14,7 @@ import (
 func TestRecoveryMembership(t *testing.T) {
 	for _, scenario := range []string{"valid-shared-store", "shared-source-disk", "missing", "additional", "generation", "kind", "foreign-uuid", "endpoint", "caller-source", "missing-selected", "orphan-metadata"} {
 		t.Run(scenario, func(t *testing.T) {
-			b := sourcefence.Binding{"op", "sb", "node", strings.Repeat("b", 64), "cp", strings.Repeat("a", 64)}
+			b := sourcefence.Binding{OperationID: "op", SandboxID: "sb", NodeID: "node", Incarnation: strings.Repeat("b", 64), CheckpointID: "cp", CheckpointDigest: strings.Repeat("a", 64)}
 			e := &SourceStorageBinding{CommitSHA256: b.CheckpointDigest, LiveName: "root", LiveUUID: "live", LiveGeneration: 7, LiveSize: 4096, Commit: CheckpointCommit{Binding: CheckpointDiskBinding{SandboxID: "sb", CheckpointID: "cp"}, Objects: map[string]CheckpointExport{"rootfs": {Snapshot: "cp-root", SnapshotUUID: "selected", SizeBytes: 4096, Endpoint: "native:9000", Bucket: "bucket", Prefix: "store", LvsName: "store"}}}}
 			all := map[string]*StorageInfo{"sb": {SandboxID: "sb", Backend: cow.BackendS3, Volumes: map[string]*BackendFileInfo{"root": {VolumeName: "root", Kind: cowKindVolume, Gen: 7}}}, "other": {SandboxID: "other", Backend: cow.BackendS3, Volumes: map[string]*BackendFileInfo{"disk": {VolumeName: "other", Kind: cowKindVolume}}}}
 			n := SourceMembership{StoreUUID: "store-uuid", OwnerNonce: "owner", Endpoint: "native:9000", Bucket: "bucket", Prefix: "store", Members: []SourceMember{{"root", "live", 4096, false, false}, {"other", "other-uuid", 4096, false, false}, {"cp-root", "selected", 4096, true, false}}}

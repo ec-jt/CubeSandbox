@@ -17,6 +17,7 @@ import (
 	"github.com/tencentcloud/CubeSandbox/Cubelet/storage"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/storage/cow"
 	"github.com/tencentcloud/CubeSandbox/pkgs/proto/services/cubebox/v1"
+	"google.golang.org/protobuf/proto"
 )
 
 // isCrossNodeRestore reports Master's verdict that it placed this restore on
@@ -117,9 +118,9 @@ func createLifecycleSandboxID(req *cubebox.RunCubeSandboxRequest) (string, error
 		req.Annotations = map[string]string{}
 	}
 	if strings.TrimSpace(req.Annotations[constants.MasterAnnotationDesiredSandboxID]) == "" {
-		copy := *req
-		copy.InstanceType = constants.GetInstanceTypeWithDefault(copy.InstanceType)
-		opts := &workflow.CreateContext{ReqInfo: &copy}
+		reqCopy := proto.Clone(req).(*cubebox.RunCubeSandboxRequest)
+		reqCopy.InstanceType = constants.GetInstanceTypeWithDefault(reqCopy.InstanceType)
+		opts := &workflow.CreateContext{ReqInfo: reqCopy}
 		if opts.IsCreateSnapshot() {
 			templateID, _ := opts.GetSnapshotTemplateID()
 			req.Annotations[constants.MasterAnnotationDesiredSandboxID] = templateID + "_0"

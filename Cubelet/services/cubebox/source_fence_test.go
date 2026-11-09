@@ -25,8 +25,8 @@ func seedSourceFence(t *testing.T, id string) {
 	s, e := sourcefence.Open(filepath.Join(t.TempDir(), "fences"))
 	require.NoError(t, e)
 	workflow.SourceFences = s
-	_, e = s.Stop(context.Background(), true, sourcefence.Binding{"op", id, "node", "epoch", "v1", strings.Repeat("a", 64)}, func() ([]sourcefence.Process, error) {
-		return []sourcefence.Process{{20, "1", "boot", "shim"}, {21, "2", "boot", "vmm"}}, nil
+	_, e = s.Stop(context.Background(), true, sourcefence.Binding{OperationID: "op", SandboxID: id, NodeID: "node", Incarnation: "epoch", CheckpointID: "v1", CheckpointDigest: strings.Repeat("a", 64)}, func() ([]sourcefence.Process, error) {
+		return []sourcefence.Process{{PID: 20, StartTime: "1", BootID: "boot", Executable: "shim"}, {PID: 21, StartTime: "2", BootID: "boot", Executable: "vmm"}}, nil
 	}, func(context.Context, []sourcefence.Process) error { return errors.New("cannot stop") })
 	require.Error(t, e)
 }
@@ -75,7 +75,7 @@ func TestSourceFenceIncarnationAndUnreachable(t *testing.T) {
 	s, _, _ := newDestroyLifecycleServiceForTest(cb)
 	s.cubeboxMgr.config.SourceFenceEnabled = true
 	s.cubeboxMgr.config.SourceFenceNodeID = "node"
-	b := sourcefence.Binding{"op", "source", "node", inc, "v1", strings.Repeat("a", 64)}
+	b := sourcefence.Binding{OperationID: "op", SandboxID: "source", NodeID: "node", Incarnation: inc, CheckpointID: "v1", CheckpointDigest: strings.Repeat("a", 64)}
 	request := func() *cubebox.UpdateCubeSandboxRequest {
 		raw, _ := json.Marshal(b)
 		return &cubebox.UpdateCubeSandboxRequest{RequestID: "op", SandboxID: "source", Annotations: map[string]string{constants.MasterAnnotationsUpdateAction: sourceFenceAction, sourceFenceBindingAnnotation: string(raw)}}
@@ -166,7 +166,7 @@ func TestRootfsVolumeMountNameIsTyped(t *testing.T) {
 func TestSourceFenceWaitsForLifecycleAndHonorsCancel(t *testing.T) {
 	s, _, _ := newDestroyLifecycleServiceForTest(nil)
 	s.cubeboxMgr.config.SourceFenceNodeID = "node"
-	b := sourcefence.Binding{"op", "source", "node", "epoch", "v1", strings.Repeat("a", 64)}
+	b := sourcefence.Binding{OperationID: "op", SandboxID: "source", NodeID: "node", Incarnation: "epoch", CheckpointID: "v1", CheckpointDigest: strings.Repeat("a", 64)}
 	raw, _ := json.Marshal(b)
 	u := s.sandboxLifecycleLocks.Lock("source")
 	defer u()
@@ -180,7 +180,7 @@ func TestSourceFenceWaitsForLifecycleAndHonorsCancel(t *testing.T) {
 func TestSourceFencePackageWaitReleasesLifecycle(t *testing.T) {
 	s, _, _ := newDestroyLifecycleServiceForTest(nil)
 	s.cubeboxMgr.config.SourceFenceNodeID = "node"
-	b := sourcefence.Binding{"op", "source", "node", "epoch", "v1", strings.Repeat("a", 64)}
+	b := sourcefence.Binding{OperationID: "op", SandboxID: "source", NodeID: "node", Incarnation: "epoch", CheckpointID: "v1", CheckpointDigest: strings.Repeat("a", 64)}
 	raw, _ := json.Marshal(b)
 	sourcefence.Barrier.RLock()
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)

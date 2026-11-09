@@ -174,9 +174,12 @@ func requestFromSnapshotJSON(raw string) (*sandboxtypes.CreateCubeSandboxReq, er
 
 // RestoreSource is the subset of a snapshot row needed by restoreplace.Decide.
 type RestoreSource struct {
-	SnapshotID          string
-	Backend             string
-	RemoteStatus        string
+	SnapshotID   string
+	Backend      string
+	RemoteStatus string
+	// OriginSandboxID is the sandbox the snapshot was taken from. It is the
+	// source identity the cross-node source-quiesced gate binds against.
+	OriginSandboxID     string
 	OriginNodeID        string
 	OriginNodeIP        string
 	OriginHostFactsJSON string
@@ -198,6 +201,7 @@ func GetSnapshotRestoreSource(ctx context.Context, snapshotID string) (*RestoreS
 		SnapshotID:          rec.SnapshotID,
 		Backend:             rec.Backend,
 		RemoteStatus:        rec.RemoteStatus,
+		OriginSandboxID:     rec.OriginSandboxID,
 		OriginNodeID:        rec.OriginNodeID,
 		OriginNodeIP:        rec.OriginNodeIP,
 		OriginHostFactsJSON: rec.OriginHostFactsJSON,

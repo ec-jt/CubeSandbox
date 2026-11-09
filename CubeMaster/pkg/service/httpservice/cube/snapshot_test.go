@@ -740,3 +740,33 @@ func TestCompatibleNodesBareFactorUnderspecified(t *testing.T) {
 	}
 	assert.False(t, called, "factors fn must not be called for under-specified query")
 }
+
+// The cross-node source-quiesced gate must bind against the sandbox the
+// snapshot was taken from (snapshot row origin_sandbox_id), never against any
+// id on the create request, which describes the new sandbox.
+func TestFromSnapshotPlacementSourceIdentityFromSnapshotOrigin(t *testing.T) {
+	origDecide := decideRestorePlacementFn
+	t.Cleanup(func() { decideRestorePlacementFn = origDecide })
+	var got restoreplace.Input
+	decideRestorePlacementFn = func(_ context.Context, in restoreplace.Input) (*restoreplace.Placement, error) {
+		got = in
+		return &restoreplace.Placement{NodeID: "node-b", NodeIP: "10.0.0.2", CrossNode: true}, nil
+	}
+	src := &templatecenter.RestoreSource{
+		SnapshotID: "snap-1", Backend: constants.SnapshotBackendS3,
+		RemoteStatus: constants.RemoteStatusReady, OriginSandboxID: " sb-origin ",
+		OriginNodeID: "node-a", OriginNodeIP: "10.0.0.1",
+	}
+	req := &types.CreateCubeSandboxReq{InsId: "new-instance"}
+	_, err := fromSnapshotPlacement(context.Background(), "snap-1", req, src, "cubebox", nil, false)
+	require.NoError(t, err)
+	assert.Equal(t, "sb-origin", got.SourceSandboxID)
+	assert.Equal(t, "snap-1", got.SourceCheckpointID)
+	assert.Empty(t, got.SourceCheckpointDigest)
+
+	// Unknown origin sandbox: identity stays empty so the gate refuses.
+	src.OriginSandboxID = ""
+	_, err = fromSnapshotPlacement(context.Background(), "snap-1", req, src, "cubebox", nil, false)
+	require.NoError(t, err)
+	assert.Empty(t, got.SourceSandboxID)
+}

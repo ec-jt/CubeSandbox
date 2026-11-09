@@ -136,7 +136,7 @@ func TestRecoveryMembershipLiveRPC(t *testing.T) {
 	e := &SourceStorageBinding{LiveName: root.Name, LiveUUID: root.UUID, LiveGeneration: 7, LiveSize: root.Size, Commit: CheckpointCommit{Binding: CheckpointDiskBinding{SandboxID: "integrated", CheckpointID: "selected"}, Objects: map[string]CheckpointExport{"rootfs": {Snapshot: selected.Name, SnapshotUUID: selected.UUID, SizeBytes: selected.Size, Endpoint: n.Endpoint, Bucket: n.Bucket, Prefix: n.Prefix, LvsName: n.Prefix}}}}
 	h := sha256.Sum256([]byte(raw))
 	e.CommitSHA256 = hex.EncodeToString(h[:])
-	b := sourcefence.Binding{"integrated-live-01", "integrated", "private-node", strings.Repeat("b", 64), "selected", e.CommitSHA256}
+	b := sourcefence.Binding{OperationID: "integrated-live-01", SandboxID: "integrated", NodeID: "private-node", Incarnation: strings.Repeat("b", 64), CheckpointID: "selected", CheckpointDigest: e.CommitSHA256}
 	membership, err := BindRecoveryMembership(ctx, b, e)
 	require.NoError(t, err)
 	body, err := json.Marshal(membership)
