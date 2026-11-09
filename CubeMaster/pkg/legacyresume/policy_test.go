@@ -46,3 +46,14 @@ func TestValidateCohort(t *testing.T) {
 		}
 	}
 }
+
+func TestIsLegacyCubeletVersion(t *testing.T) {
+	for v, want := range map[string]bool{
+		"v0.6.0": true, "0.5.1": true, "v0.6.0-dirty": true, "v0.6": true,
+		"v0.7.1": false, "v0.7.0": false, "v1.0.0": false, "": false, "unknown": false, "v0.x": false,
+	} {
+		if got := IsLegacyCubeletVersion(v); got != want {
+			t.Errorf("%q: got %v want %v", v, got, want)
+		}
+	}
+}

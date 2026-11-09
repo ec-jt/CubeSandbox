@@ -45,8 +45,11 @@ var setSandboxProxyMapFn = localcache.SetSandboxProxyMap
 var getSandboxProxyMapFn = localcache.GetSandboxProxyMap
 
 type createSandboxContext struct {
-	selctx           *selctx.SelectorCtx
-	directHost       bool
+	selctx     *selctx.SelectorCtx
+	directHost bool
+	// nodeGateProbe: a debug create pinned to one node (ins_id/ins_ip) by the
+	// upgrade node gate. It may land on a cordoned node; nothing else may.
+	nodeGateProbe    bool
 	selectHost       *node.Node
 	startTime        time.Time
 	endTime          time.Time
@@ -249,7 +252,7 @@ func (c *createSandboxContext) handleCubelet() {
 }
 
 func (c *createSandboxContext) refreshAndAdmitHost() error {
-	current, err := admitSelectedHost(c.selectHost, localcache.GetNode)
+	current, err := admitSelectedHostWithGate(c.selectHost, localcache.GetNode, c.directHost && c.nodeGateProbe)
 	if err != nil {
 		return err
 	}
@@ -261,6 +264,14 @@ func (c *createSandboxContext) refreshAndAdmitHost() error {
 // nodes. getNode is injected so unit tests cover all admission paths without a
 // live localcache.
 func admitSelectedHost(selected *node.Node, getNode func(string) (*node.Node, bool)) (*node.Node, error) {
+	return admitSelectedHostWithGate(selected, getNode, false)
+}
+
+// admitSelectedHostWithGate is admitSelectedHost with one exception: a pinned
+// node-gate probe (debug create with an explicit ins_id/ins_ip and the
+// node-gate annotation) is admitted on a cordoned node, so an upgraded node can
+// be verified with a real create before it is uncordoned.
+func admitSelectedHostWithGate(selected *node.Node, getNode func(string) (*node.Node, bool), nodeGateProbe bool) (*node.Node, error) {
 	if selected == nil {
 		return nil, ret.Err(errorcode.ErrorCode_SelectNodesFailed, "no selected host")
 	}
@@ -268,7 +279,7 @@ func admitSelectedHost(selected *node.Node, getNode func(string) (*node.Node, bo
 	if !ok {
 		return nil, ret.Errorf(errorcode.ErrorCode_SelectNodesFailed, "selected host missing from cache: %s", selected.ID())
 	}
-	if !current.SchedulingAllowed() {
+	if !current.SchedulingAllowed() && !nodeGateProbe {
 		return nil, ret.Errorf(errorcode.ErrorCode_SelectNodesFailed,
 			"node %s is scheduling-disabled (cordon); new sandboxes are not admitted", current.ID())
 	}
@@ -661,6 +672,7 @@ func (c *createSandboxContext) newContext(ctx context.Context, req *types.Create
 		}
 		c.selectHost = tmpResult
 		c.directHost = true
+		c.nodeGateProbe = isNodeGateProbe(req.Annotations)
 	case req.InsIp != "":
 		if !isDebug(req.Annotations) {
 			return ret.Errorf(errorcode.ErrorCode_MasterParamsError, "invalid debug req:%s", req.InsIp)
@@ -671,6 +683,7 @@ func (c *createSandboxContext) newContext(ctx context.Context, req *types.Create
 		}
 		c.selectHost = tmpResult
 		c.directHost = true
+		c.nodeGateProbe = isNodeGateProbe(req.Annotations)
 	default:
 
 	}
@@ -719,6 +732,11 @@ func (c *createSandboxContext) setProbeInfo() {
 			c.masterRsp.ExtInfo["all-probe"] = strconv.FormatInt(probe, 10)
 		}
 	}
+}
+
+// isNodeGateProbe: debug create explicitly marked as an upgrade node-gate probe.
+func isNodeGateProbe(annotation map[string]string) bool {
+	return isDebug(annotation) && strings.EqualFold(strings.TrimSpace(annotation[constants.AnnotationsNodeGateProbe]), "true")
 }
 
 func isDebug(annotation map[string]string) bool {

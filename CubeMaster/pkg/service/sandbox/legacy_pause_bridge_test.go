@@ -146,3 +146,54 @@ func TestLegacyBridgeRoutingSafety(t *testing.T) {
 		})
 	}
 }
+
+// Nodes that still run a pre-0.7 Cubelet only speak the in-place pausevm
+// protocol, so every pause/resume for them is routed through the legacy RPC
+// even when the sandbox is not in the manifest.
+func TestLegacyBridgeAutoRoutesLegacyCubeletNodes(t *testing.T) {
+	oldVer, oldPause, oldSpec := legacyNodeCubeletVersion, legacyPauseLookup, legacySpecLookup
+	oldAddr, oldUpdate := legacyCubeletAddr, legacyCubeletUpdate
+	oldHook, oldTimeout := legacyAfterUpdate, legacyPublishTimeout
+	t.Cleanup(func() {
+		legacyNodeCubeletVersion, legacyPauseLookup, legacySpecLookup = oldVer, oldPause, oldSpec
+		legacyCubeletAddr, legacyCubeletUpdate = oldAddr, oldUpdate
+		legacyAfterUpdate, legacyPublishTimeout = oldHook, oldTimeout
+	})
+	t.Setenv("CUBE_LEGACY_PAUSE_MANIFEST", "")
+	legacyPauseLookup = func(context.Context, string) (*pausesnap.Record, error) { return nil, pausesnap.ErrNotFound }
+	legacySpecLookup = func(context.Context, string) (*types.CreateCubeSandboxReq, error) {
+		return &types.CreateCubeSandboxReq{}, nil
+	}
+	legacyCubeletAddr = func(host string) string { return host + ":test" }
+	legacyAfterUpdate = func(context.Context, string, string, string, string) {}
+	legacyPublishTimeout = func(context.Context, *types.UpdateRequest) {}
+	for _, tc := range []struct {
+		version string
+		handled bool
+	}{{"v0.6.0", true}, {"v0.5.1", true}, {"v0.7.1", false}, {"", false}} {
+		t.Run(tc.version, func(t *testing.T) {
+			legacyNodeCubeletVersion = func(string) string { return tc.version }
+			rpcs := 0
+			legacyCubeletUpdate = func(ctx context.Context, endpoint string, req *cubebox.UpdateCubeSandboxRequest, timeout time.Duration) (*cubebox.UpdateCubeSandboxResponse, error) {
+				rpcs++
+				if endpoint != "10.0.1.2:test" || req.Annotations[constants.CubeAnnotationsUpdateAction] != "pause" {
+					t.Fatalf("wrong RPC %s %+v", endpoint, req)
+				}
+				if _, ok := req.Annotations[constants.CubeAnnotationPauseSnapshotID]; ok {
+					t.Fatal("legacy pause must not carry a native snapshot id")
+				}
+				return &cubebox.UpdateCubeSandboxResponse{Ret: &retcode.Ret{RetCode: retcode.ErrorCode_Success}}, nil
+			}
+			rsp, handled := tryLegacyPauseUpdate(context.Background(), &types.UpdateRequest{SandboxID: "sb-new", Action: "pause"}, "10.0.1.2")
+			if handled != tc.handled {
+				t.Fatalf("handled=%v", handled)
+			}
+			if handled && (rpcs != 1 || rsp.Ret.RetCode != int(errorcode.ErrorCode_Success)) {
+				t.Fatalf("rpcs=%d rsp=%+v", rpcs, rsp)
+			}
+			if !handled && rpcs != 0 {
+				t.Fatal("native node reached legacy RPC")
+			}
+		})
+	}
+}

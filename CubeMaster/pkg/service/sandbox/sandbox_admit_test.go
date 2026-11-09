@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/base/constants"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/base/node"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/base/ret"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/errorcode"
@@ -76,4 +77,22 @@ func assertAdmitFailed(t *testing.T, err error, msgSubstr string) {
 	assert.True(t, ok)
 	assert.Equal(t, errorcode.ErrorCode_SelectNodesFailed, status.Code())
 	assert.True(t, strings.Contains(status.Message(), msgSubstr), "msg=%q want substr %q", status.Message(), msgSubstr)
+}
+
+func TestAdmitSelectedHostNodeGateProbe(t *testing.T) {
+	n := &node.Node{InsID: "n1", IP: "10.0.0.1"}
+	n.SetSchedulingDisabled(true)
+	get := func(id string) (*node.Node, bool) { return n, id == "n1" }
+	if _, err := admitSelectedHostWithGate(n, get, false); err == nil {
+		t.Fatal("cordoned node admitted without the node-gate probe")
+	}
+	got, err := admitSelectedHostWithGate(n, get, true)
+	assert.NoError(t, err)
+	assert.Equal(t, "n1", got.ID())
+}
+
+func TestIsNodeGateProbeNeedsDebug(t *testing.T) {
+	assert.False(t, isNodeGateProbe(map[string]string{constants.AnnotationsNodeGateProbe: "true"}))
+	assert.True(t, isNodeGateProbe(map[string]string{constants.AnnotationsDebug: "true", constants.AnnotationsNodeGateProbe: "true"}))
+	assert.False(t, isNodeGateProbe(map[string]string{constants.AnnotationsDebug: "true"}))
 }

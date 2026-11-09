@@ -11,6 +11,7 @@ import (
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/cubelet"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/errorcode"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/legacyresume"
+	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/localcache"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/pausesnap"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/sandboxspec"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/service/sandbox/types"
@@ -19,12 +20,13 @@ import (
 
 // Narrow dependency seams keep bridge routing tests independent of live DB/RPC.
 var (
-	legacyPauseLookup    = pausesnap.GetBySandbox
-	legacySpecLookup     = sandboxspec.Get
-	legacyCubeletAddr    = cubelet.GetCubeletAddr
-	legacyCubeletUpdate  = cubelet.UpdateWithTimeout
-	legacyAfterUpdate    = runAfterUpdateSandboxSuccessHook
-	legacyPublishTimeout = publishUpdateTimeout
+	legacyNodeCubeletVersion = nodeCubeletVersion
+	legacyPauseLookup        = pausesnap.GetBySandbox
+	legacySpecLookup         = sandboxspec.Get
+	legacyCubeletAddr        = cubelet.GetCubeletAddr
+	legacyCubeletUpdate      = cubelet.UpdateWithTimeout
+	legacyAfterUpdate        = runAfterUpdateSandboxSuccessHook
+	legacyPublishTimeout     = publishUpdateTimeout
 )
 
 // tryLegacyPauseUpdate runs under the caller's lifecycle lock. It never creates
@@ -40,7 +42,14 @@ func tryLegacyPauseUpdate(ctx context.Context, req *types.UpdateRequest, hostIP 
 	}
 	origin, enabled := cohort[req.SandboxID]
 	if !enabled {
-		return nil, false
+		// A node that still runs a pre-0.7 Cubelet only speaks the in-place
+		// pausevm protocol: a native pause would record a snapshot the node
+		// never produced and the next resume would fail. Route every
+		// lifecycle update for such a node through the legacy RPC.
+		if !legacyresume.IsLegacyCubeletVersion(legacyNodeCubeletVersion(hostIP)) {
+			return nil, false
+		}
+		origin = hostIP
 	}
 	if req.Action != "pause" && req.Action != "resume" {
 		return fail("unsupported legacy lifecycle action")
@@ -83,4 +92,18 @@ func tryLegacyPauseUpdate(ctx context.Context, req *types.UpdateRequest, hostIP 
 		legacyAfterUpdate(ctx, req.SandboxID, req.InstanceType, req.Action, req.RequestID)
 	}
 	return result, true
+}
+
+// nodeCubeletVersion returns the cubelet version the node last reported, or "".
+func nodeCubeletVersion(hostIP string) string {
+	n, ok := localcache.GetNodesByIp(hostIP)
+	if !ok || n == nil {
+		return ""
+	}
+	for _, v := range n.Versions {
+		if v.Component == "cubelet" {
+			return v.Version
+		}
+	}
+	return ""
 }

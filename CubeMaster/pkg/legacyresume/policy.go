@@ -8,6 +8,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"strconv"
 	"strings"
 )
 
@@ -96,4 +97,32 @@ func Validate(origin, observedHost, backend string, nativeBinding bool) error {
 		return fmt.Errorf("legacy session origin differs from observed owner")
 	}
 	return nil
+}
+
+// IsLegacyCubeletVersion reports whether a node's reported cubelet version
+// predates v0.7 (in-place pausevm protocol, no CubeCow pause snapshots).
+// Accepts "v0.6.0", "0.6.0", "v0.6.0-dirty" style values. Unknown or
+// unparsable versions are NOT legacy: the native path is the default.
+func IsLegacyCubeletVersion(v string) bool {
+	v = strings.TrimPrefix(strings.TrimSpace(v), "v")
+	if v == "" {
+		return false
+	}
+	parts := strings.SplitN(v, ".", 3)
+	if len(parts) < 2 {
+		return false
+	}
+	major, err1 := strconv.Atoi(parts[0])
+	minorStr := parts[1]
+	for i, r := range minorStr {
+		if r < '0' || r > '9' {
+			minorStr = minorStr[:i]
+			break
+		}
+	}
+	minor, err2 := strconv.Atoi(minorStr)
+	if err1 != nil || err2 != nil {
+		return false
+	}
+	return major == 0 && minor < 7
 }

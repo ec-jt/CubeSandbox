@@ -21,11 +21,15 @@ const (
 )
 
 const (
-	AnnotationsNetID            = "com.netid"
-	AnnotationsInvokePort       = "com.invoke_port"
-	AnnotationsExposedPort      = "com.exposed_ports"
-	AnnotationsVIPs             = "com.vips"
-	AnnotationsDebug            = "com.cube.debug"
+	AnnotationsNetID       = "com.netid"
+	AnnotationsInvokePort  = "com.invoke_port"
+	AnnotationsExposedPort = "com.exposed_ports"
+	AnnotationsVIPs        = "com.vips"
+	AnnotationsDebug       = "com.cube.debug"
+	// AnnotationsNodeGateProbe marks a debug create pinned with ins_id/ins_ip
+	// as an upgrade node-gate probe; only such a create may land on a cordoned
+	// node.
+	AnnotationsNodeGateProbe    = "com.cube.node-gate-probe"
 	AnnotationsCollectMemOnExit = "com.cube.collect_memory"
 
 	AnnotationsNodeAffinityClusterLabel = "com.nodeaffinity.cluster.label"

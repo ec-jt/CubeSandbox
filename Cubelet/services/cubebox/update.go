@@ -120,6 +120,15 @@ func (s *service) Update(ctx context.Context, req *cubebox.UpdateCubeSandboxRequ
 		return rsp, nil
 	}
 	rt.CalleeAction = action
+	// Rolling upgrade from v0.6: sandboxes created and paused in place by the
+	// old Cubelet are still driven by their original shim (see
+	// legacy_pausevm_compat.go). Native sandboxes never take this path.
+	if legacyUpdateRoute(action, sb) {
+		if action == constants.UpdateActionResume {
+			return s.legacyResume(ctx, req, sb)
+		}
+		return s.legacyPause(ctx, req, sb)
+	}
 	switch action {
 	case constants.UpdateActionAddDevice, constants.UpdateActionRemoveDevice:
 		rsp.Ret.RetMsg = "cloud disk hotplug is not supported in the open source build"
