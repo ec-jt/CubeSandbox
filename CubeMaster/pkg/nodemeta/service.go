@@ -14,6 +14,7 @@ import (
 	"sync/atomic"
 
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/base/config"
+	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/base/db"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/base/log"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/base/node"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/localcache"
@@ -60,7 +61,12 @@ func Init(ctx context.Context) error {
 		}
 		localcache.RegisterNodeLoader(cubeopsNodeLoader(loader))
 	} else {
-		log.G(ctx).Warnf("nodemeta: cube_ops_addr not configured; localcache will fall back to its own DB loader")
+		// No CubeOps: CubeMaster owns node registration/heartbeats itself
+		// (pre-#1384 behaviour). Without this the node view is empty because
+		// localcache's own fallback reads the long-unused t_cube_host_info.
+		if err := initLegacy(ctx, db.Init(config.GetDbConfig())); err != nil {
+			return err
+		}
 	}
 
 	initialized.Store(true)

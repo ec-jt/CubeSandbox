@@ -22,6 +22,7 @@ import (
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/base/recov"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/service/httpservice/cube"
 	inner "github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/service/httpservice/inner"
+	metahttp "github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/service/httpservice/meta"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/service/httpservice/middleware"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/service/httpservice/notify"
 	"github.com/tencentcloud/CubeSandbox/pkgs/CubeLog"
@@ -117,6 +118,10 @@ func (s *internalHttp) registerRoutes() {
 	notify.RegisterNotifyRoutes(root.Group(notify.NotifyURI()))
 	cube.RegisterCubeRoutes(root.Group(cube.CubeURI()))
 	inner.RegisterInnerRoutes(root.Group(inner.InnerURI()))
+	// Node-agent API for CubeOps-less deployments (nodemeta legacy mode).
+	// Served on both the pre-CubeOps and the CubeOps-era paths.
+	metahttp.RegisterRoutes(root.Group(metahttp.LegacyMetaURI))
+	metahttp.RegisterRoutes(root.Group(metahttp.NodeAgentURI))
 }
 
 func (s *internalHttp) Start() error {
