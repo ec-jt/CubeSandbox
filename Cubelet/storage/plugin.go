@@ -417,6 +417,15 @@ func init() {
 					CubeLog.Errorf("plugin %s cubecow dependency check fail:%v", constants.StorageID, err)
 					return nil, err
 				}
+				// Pre-v0.7 template objects live under <work>/cubecow-reflink;
+				// reflink them into the current pool before cubecow scans it.
+				work := stripStoragePluginDataDir(filepath.Clean(localStorage.config.DataPath))
+				if imp, err := importLegacyReflinkTemplates(work); err != nil {
+					CubeLog.Errorf("plugin %s legacy template import fail:%v", constants.StorageID, err)
+					return nil, err
+				} else if len(imp.Imported) > 0 {
+					CubeLog.Infof("imported %d legacy template objects into the xfs reflink pool: %v", len(imp.Imported), imp.Imported)
+				}
 				eng, initSource, err := initCowEngine(localStorage.config)
 				if err != nil {
 					CubeLog.Errorf("plugin %s cubecow init fail:%v", constants.StorageID, err)
@@ -437,7 +446,9 @@ func init() {
 			// Register catalog roots before storage init: init starts the S3
 			// retry loop, whose metadata step enumerates local packages and
 			// would silently find none with the roots still unset.
-			SetSnapshotCatalogRootsFor(cow.BackendXFS, catalogKindRoots(cow.BackendXFS)...)
+			// DefaultSnapshotDir keeps pre-v0.7 template catalogs
+			// (<dir>/cubebox/<id>/<spec>/catalog.json) resolvable.
+			SetSnapshotCatalogRootsFor(cow.BackendXFS, append(catalogKindRoots(cow.BackendXFS), constants.DefaultSnapshotDir)...)
 			SetSnapshotCatalogRootsFor(cow.BackendS3, catalogKindRoots(cow.BackendS3)...)
 
 			if err := localStorage.init(ic); err != nil {
