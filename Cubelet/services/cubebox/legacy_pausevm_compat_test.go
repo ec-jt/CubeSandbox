@@ -130,6 +130,52 @@ func TestLegacyPauseTaskLockedReconcilesOnError(t *testing.T) {
 	}
 }
 
+type fakeLegacyContainer struct{ containerd.Container }
+
+type fakeContainerLoader struct {
+	ids []string
+	err error
+}
+
+func (f *fakeContainerLoader) LoadContainer(_ context.Context, id string) (containerd.Container, error) {
+	f.ids = append(f.ids, id)
+	if f.err != nil {
+		return nil, f.err
+	}
+	return fakeLegacyContainer{}, nil
+}
+
+// Startup recovery never attaches containers of paused sandboxes; the legacy
+// path must load the handle itself (live failure: "failed to load task for
+// paused sandbox" on the app1 canary).
+func TestEnsureLegacyContainerLoadsMissingHandle(t *testing.T) {
+	cb := legacyTestBox(t, "sb-l", true)
+	if fc := cb.FirstContainer(); fc == nil || fc.Container != nil {
+		t.Fatalf("precondition: first container without handle, got %+v", fc)
+	}
+	loader := &fakeContainerLoader{}
+	if err := ensureLegacyContainer(context.Background(), loader, cb); err != nil {
+		t.Fatal(err)
+	}
+	if len(loader.ids) != 1 || loader.ids[0] != "sb-l" || cb.FirstContainer().Container == nil {
+		t.Fatalf("ids=%v handle=%v", loader.ids, cb.FirstContainer().Container)
+	}
+	// Already attached: no second load.
+	if err := ensureLegacyContainer(context.Background(), loader, cb); err != nil || len(loader.ids) != 1 {
+		t.Fatalf("err=%v ids=%v", err, loader.ids)
+	}
+}
+
+func TestEnsureLegacyContainerReportsLoadError(t *testing.T) {
+	cb := legacyTestBox(t, "sb-e", true)
+	if err := ensureLegacyContainer(context.Background(), &fakeContainerLoader{err: errors.New("not found")}, cb); err == nil {
+		t.Fatal("expected error")
+	}
+	if err := ensureLegacyContainer(context.Background(), nil, legacyTestBox(t, "sb-n", true)); err == nil {
+		t.Fatal("nil client must error, not panic")
+	}
+}
+
 // The forwarded resume reuses the native resume core on the original shim task.
 func TestLegacyResumeUsesOriginalShimTask(t *testing.T) {
 	cb := legacyTestBox(t, "sb-r", true)

@@ -75,10 +75,61 @@ func legacyUpdateRoute(action string, sb *cubeboxstore.CubeBox) bool {
 	return false
 }
 
+// containerLoader is the narrow containerd.Client surface used to attach a
+// legacy sandbox's container handle.
+type containerLoader interface {
+	LoadContainer(ctx context.Context, id string) (containerd.Container, error)
+}
+
+// ensureLegacyContainer attaches the containerd container handle of a legacy
+// sandbox. Startup recovery (RecoverPod) treats every paused sandbox as a
+// shim-less CubeCow tombstone and never loads its container, but a v0.6
+// in-place pause keeps the VM inside its still-running shim. Without the
+// handle Resume fails with "failed to load task for paused sandbox".
+func ensureLegacyContainer(ctx context.Context, client containerLoader, sb *cubeboxstore.CubeBox) error {
+	fc := sb.FirstContainer()
+	if fc == nil {
+		return fmt.Errorf("legacy sandbox %s has no first container", sb.ID)
+	}
+	if fc.Container != nil {
+		return nil
+	}
+	if client == nil {
+		return fmt.Errorf("legacy sandbox %s: no containerd client", sb.ID)
+	}
+	ns := sb.Namespace
+	if ns == "" {
+		ns = namespaces.Default
+	}
+	loadCtx, cancel := context.WithTimeout(namespaces.WithNamespace(ctx, ns), reconcileStatusTimeout)
+	defer cancel()
+	id := fc.ID
+	if id == "" {
+		id = sb.ID
+	}
+	cntr, err := client.LoadContainer(loadCtx, id)
+	if err != nil {
+		return fmt.Errorf("load legacy container %s: %w", id, err)
+	}
+	fc.Container = cntr
+	return nil
+}
+
+func (s *service) legacyContainerClient() containerLoader {
+	if s == nil || s.cubeboxMgr == nil || s.cubeboxMgr.client == nil {
+		return nil
+	}
+	return s.cubeboxMgr.client
+}
+
 // legacyResume resumes a v0.6 in-place paused sandbox through its own shim.
 func (s *service) legacyResume(ctx context.Context, req *cubebox.UpdateCubeSandboxRequest, sb *cubeboxstore.CubeBox) (*cubebox.UpdateCubeSandboxResponse, error) {
 	rsp := &cubebox.UpdateCubeSandboxResponse{RequestID: req.RequestID}
 	log.G(ctx).Warnf("legacy pausevm resume via original shim sandbox=%s", sb.ID)
+	if err := ensureLegacyContainer(ctx, s.legacyContainerClient(), sb); err != nil {
+		rsp.Ret = &errorcode.Ret{RetCode: errorcode.ErrorCode_TaskResumeFailed, RetMsg: err.Error()}
+		return rsp, nil
+	}
 	now := time.Now()
 	result := s.resumeLocked(ctx, sb, resumeOptions{
 		taskDeadline:      now.Add(taskResumeTimeout),
@@ -105,6 +156,10 @@ func (s *service) legacyPause(ctx context.Context, req *cubebox.UpdateCubeSandbo
 	ns := sb.Namespace
 	if ns == "" {
 		ns = namespaces.Default
+	}
+	if err := ensureLegacyContainer(ctx, s.legacyContainerClient(), sb); err != nil {
+		rsp.Ret = &errorcode.Ret{RetCode: errorcode.ErrorCode_TaskPauseFailed, RetMsg: err.Error()}
+		return rsp, nil
 	}
 	ctx = namespaces.WithNamespace(ctx, ns)
 	ctx = constants.WithPreStopType(ctx, constants.PreStopTypePause)
