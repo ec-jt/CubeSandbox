@@ -436,6 +436,27 @@ func (e *Engine) ExportSnapshot(snapshotName string) (string, error) {
 	return takeCString(cUUID), nil
 }
 
+// AbandonUnpublishedExport drops an export reservation stuck at
+// publication_pending (B16). The native side refuses unless the manifest and
+// the admission document both read 404 and no export of the uuid is running.
+func (e *Engine) AbandonUnpublishedExport(exportUUID string) error {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+
+	ptr, err := e.openHandle()
+	if err != nil {
+		return err
+	}
+	defer e.mu.RUnlock()
+
+	cUUID := C.CString(exportUUID)
+	defer C.free(unsafe.Pointer(cUUID))
+	if rc := C.cubecow_abandon_unpublished_export(C.CubecowEngineHandle(ptr), cUUID); rc != 0 {
+		return makeError(rc)
+	}
+	return nil
+}
+
 func (e *Engine) CheckpointRecord(request string) (string, error) {
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()

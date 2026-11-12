@@ -1145,6 +1145,25 @@ impl Engine for S3Engine {
         Ok(export_uuid)
     }
 
+    fn abandon_unpublished_export(&self, export_uuid: &str) -> CubecowResult<()> {
+        if export_uuid.is_empty() {
+            return Err(CubecowError::InvalidArg(
+                "export_uuid must not be empty".to_string(),
+            ));
+        }
+        // The native side refuses unless the manifest and the admission
+        // document both read 404 and nothing of that uuid is running.
+        self.rpc.call_raw(
+            "rcow_abandon_unpublished_export",
+            &serde_json::json!({ "export_uuid": export_uuid }),
+        )?;
+        // The snapshot keeps its export_uuid in the name index; the next
+        // get_volume_info then reads NONE for it (rcow_get_snapshot_status
+        // of an unknown uuid), which is what lets the caller resubmit.
+        info!(%export_uuid, "s3 unpublished export abandoned");
+        Ok(())
+    }
+
     fn import_lvol(&self, lvol_name: &str, export_uuid: &str) -> CubecowResult<Volume> {
         Self::validate_name(lvol_name, "volume")?;
         if export_uuid.is_empty() {

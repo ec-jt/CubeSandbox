@@ -296,6 +296,16 @@ int32_t cubecow_export_snapshot(
     char** out_export_uuid);
 
 /*
+ * Drop an export reservation stuck at publication_pending (B16). Refused
+ * unless the backend proves nothing was published: no export of the uuid
+ * running, manifest and admission document both absent. Backends without
+ * cross-node recovery return COW_ERR_PRECONDITION_FAILED.
+ */
+int32_t cubecow_abandon_unpublished_export(
+    CubecowEngineHandle engine,
+    const char* export_uuid);
+
+/*
  * Instantiate a writable volume from an export_uuid produced by a
  * remote node's cubecow_export_snapshot().
  *

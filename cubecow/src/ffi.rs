@@ -1058,6 +1058,36 @@ pub extern "C" fn cubecow_export_snapshot(
     }
 }
 
+/// Drop an export reservation stuck at publication_pending (B16). The
+/// backend refuses unless it can prove nothing was published.
+///
+/// # Returns
+/// 0 on success, negative error code on failure.
+#[no_mangle]
+pub extern "C" fn cubecow_abandon_unpublished_export(
+    engine: *mut std::ffi::c_void,
+    export_uuid: *const c_char,
+) -> i32 {
+    let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+        // SAFETY: `engine` was created by `cubecow_init` and is valid.
+        let eng = unsafe { engine_ref(engine) }?;
+        // SAFETY: `export_uuid` is a valid C string provided by the caller.
+        let uuid = unsafe { c_str_to_str(export_uuid) }?;
+        match eng.abandon_unpublished_export(uuid) {
+            Ok(()) => Ok(COW_OK),
+            Err(e) => Err(handle_cow_error(&e)),
+        }
+    }));
+    match result {
+        Ok(Ok(code)) => code,
+        Ok(Err(code)) => code,
+        Err(_) => {
+            set_last_error("panic during cubecow_abandon_unpublished_export");
+            COW_ERR_PANIC
+        }
+    }
+}
+
 /// Additive checkpoint record API. Inputs/outputs are bounded native JSON.
 #[no_mangle]
 pub extern "C" fn cubecow_checkpoint_record(

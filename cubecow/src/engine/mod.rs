@@ -122,6 +122,16 @@ pub trait Engine: Send + Sync {
         ))
     }
 
+    /// Drop an export reservation stuck at publication_pending (B16).
+    /// Succeeds only when the backend proves nothing was published
+    /// (manifest and admission document both absent) and no export of
+    /// the uuid is running. Every other answer is an error.
+    fn abandon_unpublished_export(&self, _export_uuid: &str) -> CubecowResult<()> {
+        Err(CubecowError::PreconditionFailed(
+            "abandon_unpublished_export is not implemented by this backend".to_string(),
+        ))
+    }
+
     /// Import a writable volume from an `export_uuid` produced by a remote node.
     fn import_lvol(&self, _lvol_name: &str, _export_uuid: &str) -> CubecowResult<Volume> {
         Err(CubecowError::PreconditionFailed(
