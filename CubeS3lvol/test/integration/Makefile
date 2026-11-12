@@ -74,7 +74,7 @@ APPS = s3_client_test s3_spawner_test s3_thread_bounce_test s3_bs_dev_test \
        s3_journal_test s3_wal_test s3_wal_geometry_test s3_cache_test s3_flush_test s3_export_test \
        s3_statefile_test s3_local_dev_test s3_checkpoint_test s3_export_swap_test \
        s3_copy_xml_test s3_pending_persist_test s3_recovery_test \
-       s3_put_etag_test s3_put_etag_request_test
+       s3_put_etag_test s3_put_etag_request_test s3_b16_ctl_test
 
 # (a) minimal library set for the stubbed path
 STUB_SRCS      = spdk_thread_stub.c
@@ -166,8 +166,10 @@ s3_put_etag_test: s3_put_etag_test.c $(S3BSDEV_DIR)/s3_put_etag.h
 # Includes the production client TU, intercepting only client/submission and
 # header-failure boundaries. Real CRT messages, no network or DPDK init.
 s3_put_etag_request_test: s3_put_etag_request_test.c $(STUB_SRCS) \
-                        $(S3BSDEV_DIR)/s3_client_aws.c $(S3BSDEV_DIR)/s3_put_etag.h
+                        $(S3BSDEV_DIR)/s3_client_aws.c $(S3BSDEV_DIR)/s3_deadline.c \
+                        $(S3BSDEV_DIR)/s3_put_etag.h
 	$(CC) $(COMMON_CFLAGS) s3_put_etag_request_test.c $(STUB_SRCS) \
+	    $(S3BSDEV_DIR)/s3_deadline.c \
 	    $(AWS_LIBS) -Wl,--start-group $(STUB_SPDK_LIBS) -Wl,--end-group \
 	    $(TEST_SYS_LIBS) -o $@
 
@@ -257,6 +259,12 @@ s3_flush_test: s3_flush_test.c $(S3BSDEV_DIR)/libs3bsdev.a
 	    $(JOURNAL_DPDK_ARGS) \
 	    $(SYS_LIBS) $(TEST_SYS_LIBS) -o $@
 
+# B16: deadline watchdog + export decisions. Pure C and pthreads: the deadline
+# module is compiled in directly and the decisions are a header.
+s3_b16_ctl_test: s3_b16_ctl_test.c $(S3BSDEV_DIR)/s3_deadline.c $(MODULE_DIR)/export_b16_ctl.h
+	$(CC) $(COMMON_CFLAGS) -I$(MODULE_DIR) s3_b16_ctl_test.c \
+	    $(S3BSDEV_DIR)/s3_deadline.c -lpthread -o $@
+
 # manifest only: no S3, no local device, no threads, no DPDK init.
 #
 # It still has to be linked against spdk_blob and the environment, because the
@@ -333,7 +341,8 @@ s3_recovery_test: s3_recovery_test.c $(S3BSDEV_DIR)/libs3bsdev.a
 check: s3_spawner_test s3_thread_bounce_test s3_journal_test s3_wal_test s3_wal_geometry_test s3_cache_test \
        s3_flush_test s3_export_test s3_statefile_test s3_local_dev_test \
        s3_checkpoint_test s3_export_swap_test s3_copy_xml_test \
-       s3_pending_persist_test s3_recovery_test s3_put_etag_test s3_put_etag_request_test
+       s3_pending_persist_test s3_recovery_test s3_put_etag_test s3_put_etag_request_test \
+       s3_b16_ctl_test
 	./s3_spawner_test
 	./s3_thread_bounce_test
 	./s3_journal_test
@@ -351,6 +360,7 @@ check: s3_spawner_test s3_thread_bounce_test s3_journal_test s3_wal_test s3_wal_
 	./s3_put_etag_request_test
 	./s3_pending_persist_test
 	./s3_recovery_test
+	./s3_b16_ctl_test
 
 .PHONY: $(S3BSDEV_DIR)/libs3bsdev.a
 $(S3BSDEV_DIR)/libs3bsdev.a:

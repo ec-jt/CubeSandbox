@@ -685,9 +685,11 @@ test_flusher(void)
 	flush_without_holding_back(ov);
 	fake.ov = ov;
 
-	/* Two at a time, so the limit is observable. */
+	/* Two at a time, so the limit is observable. Retry backoff off: section
+	 * [8] asserts the pre-B16 immediate retry; [10] covers the backoff. */
 	opts.max_concurrent = 2;
 	opts.poll_period_us = 100;
+	opts.retry_backoff_disabled = true;
 	rc = s3_flusher_create(ov, NULL, fake_upload, &fake, &opts, &fl);
 	check_true("s3_flusher_create", rc == 0 && fl != NULL, NULL);
 	if (rc != 0) {
@@ -824,6 +826,162 @@ out:
 	}
 }
 
+/* Poll the current thread until \p cond holds or \p ms pass. */
+#define POLL_UNTIL(cond, ms) do {						\
+		uint64_t _dl = spdk_get_ticks() + (uint64_t)(ms) * spdk_get_ticks_hz() / 1000; \
+		while (!(cond) && spdk_get_ticks() < _dl) {			\
+			spdk_thread_poll(spdk_get_thread(), 0, 0);		\
+		}								\
+	} while (0)
+
+static uint64_t
+ms_since(uint64_t tsc)
+{
+	return (spdk_get_ticks() - tsc) * 1000 / spdk_get_ticks_hz();
+}
+
+/* B16: a failed chunk waits out an exponential backoff before it is retried,
+ * without holding an upload slot, and a drain still counts it. */
+static void
+test_flusher_backoff(void)
+{
+	struct s3_flusher_opts opts = {0};
+	struct s3_flusher_stats st;
+	struct s3_overlay *ov = NULL;
+	struct s3_flusher *fl = NULL;
+	struct fake_uploader fake;
+	void *blk = malloc(BLOCK_SIZE);
+	uint64_t t0;
+	int rc;
+
+	printf("\n[10] failed chunks back off (B16)\n");
+
+	check_u64("backoff(0) is none", s3_flusher_backoff_us(0, 100, 10000), 0);
+	check_u64("backoff(1) is min", s3_flusher_backoff_us(1, 100, 10000), 100);
+	check_u64("backoff(2) doubles", s3_flusher_backoff_us(2, 100, 10000), 200);
+	check_u64("backoff(5) doubles again", s3_flusher_backoff_us(5, 100, 10000), 1600);
+	check_u64("backoff(8) capped", s3_flusher_backoff_us(8, 100, 10000), 10000);
+	check_u64("backoff(64) capped, no overflow",
+		  s3_flusher_backoff_us(64, 100, 10000), 10000);
+	check_u64("default min 100 ms", S3_FLUSHER_RETRY_BACKOFF_MIN_US, 100000);
+	check_u64("default max 10 s", S3_FLUSHER_RETRY_BACKOFF_MAX_US, 10000000);
+
+	memset(&fake, 0, sizeof(fake));
+	for (uint32_t i = 0; i < TEST_CHUNKS; i++) {
+		fake.image[i] = malloc(CHUNK_SIZE);
+	}
+	rc = s3_overlay_create(TOTAL_BLOCKS, BLOCK_SIZE, CHUNK_SIZE, 256 * 1024, &ov);
+	check_true("s3_overlay_create", rc == 0, NULL);
+	if (rc != 0) {
+		goto out;
+	}
+	flush_without_holding_back(ov);
+	fake.ov = ov;
+
+	opts.max_concurrent = 1;
+	opts.poll_period_us = 100;
+	opts.retry_backoff_min_us = 40 * 1000;
+	opts.retry_backoff_max_us = 80 * 1000;
+	rc = s3_flusher_create(ov, NULL, fake_upload, &fake, &opts, &fl);
+	check_true("s3_flusher_create", rc == 0, NULL);
+	if (rc != 0) {
+		goto out;
+	}
+
+	fill_pattern(blk, 1, 4 * BLOCKS_PER_CHUNK, 0xA4);
+	s3_overlay_write(ov, 4 * BLOCKS_PER_CHUNK, 1, blk, 600);
+	s3_flusher_kick(fl);
+	check_u64("first attempt started", fake.started, 1);
+	t0 = spdk_get_ticks();
+	fake_complete_all(&fake, -EIO);
+
+	s3_flusher_get_stats(fl, &st);
+	check_u64("failed round is backing off", st.backing_off, 1);
+	check_u64("and holds no upload slot", st.in_flight, 0);
+	check_u64("backoff counted", st.backoffs, 1);
+	s3_flusher_kick(fl);
+	check_u64("not re-picked immediately", fake.started, 1);
+
+	/* Another chunk uploads meanwhile: the only slot is free. */
+	fill_pattern(blk, 1, 5 * BLOCKS_PER_CHUNK, 0xA5);
+	s3_overlay_write(ov, 5 * BLOCKS_PER_CHUNK, 1, blk, 601);
+	s3_flusher_kick(fl);
+	check_u64("other chunk not starved", fake.started, 2);
+	check_u64("other chunk is chunk 5", fake.pending[0].chunk_index, 5);
+	fake_complete_all(&fake, 0);
+
+	/* A drain started now must not finish while chunk 4 waits. */
+	{
+		struct drain_probe probe = { .status = -1, .done = false };
+
+		s3_flusher_drain(fl, 5ULL * 1000 * 1000, drain_cb, &probe);
+		check_true("drain waits for the backed-off chunk", !probe.done, NULL);
+
+		POLL_UNTIL(fake.started >= 3, 2000);
+		check_u64("retried after the backoff", fake.started, 3);
+		check_true("first backoff >= 40 ms", ms_since(t0) >= 40, NULL);
+		check_u64("retry is chunk 4", fake.pending[0].chunk_index, 4);
+
+		t0 = spdk_get_ticks();
+		fake_complete_all(&fake, -EIO);
+		check_true("drain still waiting after second failure", !probe.done, NULL);
+		POLL_UNTIL(fake.started >= 4, 2000);
+		check_u64("retried again", fake.started, 4);
+		check_true("second backoff doubled (>= 80 ms)", ms_since(t0) >= 80, NULL);
+
+		fake_complete_all(&fake, 0);
+		POLL_UNTIL(probe.done, 1000);
+		check_true("drain completed after the retry succeeded", probe.done, NULL);
+		check_true("drain reported success", probe.status == 0, NULL);
+		check_true("retried upload had the data",
+			   check_pattern(fake.image[4], 1, 4 * BLOCKS_PER_CHUNK, 0xA4), NULL);
+		s3_flusher_get_stats(fl, &st);
+		check_u64("nothing backing off", st.backing_off, 0);
+		check_u64("completions counted", st.completions, 4);
+		check_u64("chunks_flushed advanced twice", st.chunks_flushed, 2);
+	}
+
+	/* A drain with a short deadline times out while a chunk backs off, and
+	 * retirement releases the waiting round at once (data stays dirty). */
+	{
+		struct drain_probe probe = { .status = -1, .done = false };
+		struct drain_probe retired = { .status = -1, .done = false };
+
+		fill_pattern(blk, 1, 6 * BLOCKS_PER_CHUNK, 0xA6);
+		s3_overlay_write(ov, 6 * BLOCKS_PER_CHUNK, 1, blk, 602);
+		s3_flusher_kick(fl);
+		fake_complete_all(&fake, -EIO);
+		fake_complete_all(&fake, -EIO); /* nothing parked: no-op */
+		s3_flusher_drain(fl, 1000, drain_cb, &probe);
+		POLL_UNTIL(probe.done, 1000);
+		check_true("short drain times out during backoff",
+			   probe.done && probe.status == -ETIMEDOUT, NULL);
+
+		s3_flusher_retire(fl, drain_cb, &retired);
+		POLL_UNTIL(retired.done, 2000);
+		check_true("retirement completes without waiting the backoff",
+			   retired.done, NULL);
+		check_true("and reports the chunk still dirty (-EAGAIN)",
+			   retired.status == -EAGAIN, NULL);
+		check_true("chunk 6 still dirty in the overlay", s3_overlay_has_dirty(ov), NULL);
+		if (!retired.done) {
+			abort();
+		}
+	}
+	s3_flusher_destroy(fl);
+	s3_overlay_destroy(ov);
+	ov = NULL;
+
+out:
+	if (ov) {
+		s3_overlay_destroy(ov);
+	}
+	free(blk);
+	for (uint32_t i = 0; i < TEST_CHUNKS; i++) {
+		free(fake.image[i]);
+	}
+}
+
 /* ==========================================================================
  * main
  * ========================================================================== */
@@ -873,6 +1031,7 @@ main(void)
 	test_concurrent_partial_writes();
 	test_flush_handshake();
 	test_flusher();
+	test_flusher_backoff();
 	test_flush_policy();
 
 	spdk_thread_exit(thread);

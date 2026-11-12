@@ -26,6 +26,7 @@
 #include <aws/io/tls_channel_handler.h>
 
 #include "s3lvol/s3_client.h"
+#include "s3lvol/s3_deadline.h"
 #include "s3lvol/s3_spawner.h"
 #include "s3_copy_xml.h"
 #include "s3_put_etag.h"
@@ -210,6 +211,13 @@ struct s3_request {
 	char                             request_id[96];
 	const char                      *op;
 
+	/* B16: total time limit for this request, NULL when disabled. Set at
+	 * submit, armed with the meta request once CRT accepted it, finished at
+	 * the top of the finish callback. See s3_deadline.h for the ownership
+	 * rules that make the cancel safe against the finish callback. */
+	struct s3_deadline              *deadline;
+	uint64_t                         deadline_ms;
+
 	/* SPDK thread that submitted the request, captured at submit time.
 	 *
 	 * CRT completes requests on its own IO threads, but callers touch
@@ -375,6 +383,135 @@ s3_stats_record_error(struct s3_client *client, int http_status)
 	} else if (http_status >= 500) {
 		S3_STAT_INC(client, errors_5xx);
 	}
+}
+
+/* ==========================================================================
+ * Per-request deadline (B16)
+ *
+ * CRT bounds a connect (connect_timeout_ms) and a stalled transfer (the
+ * throughput monitor), but not a request as a whole: its retry strategy retries
+ * up to 5 times and every attempt may stall for the full monitoring window, so
+ * a 1 MiB PUT against a struggling endpoint could take minutes, and the drain
+ * or export waiting on it waited with it. Live: 22 "failure to meet throughput
+ * minimum" stalls in 24 h against Hetzner Object Storage.
+ *
+ * Each request now gets a total deadline; a watchdog cancels the meta request
+ * when it passes and the finish callback, which still runs exactly once,
+ * reports -ETIMEDOUT. Defaults, overridable per process (0 disables):
+ *
+ *   S3LVOL_S3_CONNECT_TIMEOUT_MS   3000   TCP+TLS connect, handed to CRT
+ *   S3LVOL_S3_REQUEST_TIMEOUT_MS  60000   GET / PUT / COPY base
+ *   S3LVOL_S3_META_TIMEOUT_MS     30000   HEAD / DELETE
+ *
+ * GET and PUT add one second per 256 KiB of payload on top of the base, so a
+ * large ranged GET (a manifest of tens of MiB) is not cut off by a limit sized
+ * for 1 MiB chunk objects.
+ * ========================================================================== */
+
+#define S3_DEFAULT_CONNECT_TIMEOUT_MS 3000
+#define S3_DEFAULT_REQUEST_TIMEOUT_MS 60000
+#define S3_DEFAULT_META_TIMEOUT_MS    30000
+#define S3_DEADLINE_BYTES_PER_SEC     (256u * 1024)
+
+static uint32_t g_connect_timeout_ms = S3_DEFAULT_CONNECT_TIMEOUT_MS;
+static uint64_t g_request_timeout_ms = S3_DEFAULT_REQUEST_TIMEOUT_MS;
+static uint64_t g_meta_timeout_ms    = S3_DEFAULT_META_TIMEOUT_MS;
+
+static uint64_t
+s3_env_ms(const char *name, uint64_t dflt)
+{
+	const char *v = getenv(name);
+	char *end = NULL;
+	unsigned long long n;
+
+	if (!v || !*v) {
+		return dflt;
+	}
+	errno = 0;
+	n = strtoull(v, &end, 10);
+	if (errno || !end || *end != '\0' || n > 24ULL * 3600 * 1000) {
+		SPDK_WARNLOG("%s='%s' is not a millisecond count; using %" PRIu64 "\n",
+			     name, v, dflt);
+		return dflt;
+	}
+	return (uint64_t)n;
+}
+
+static void
+s3_deadline_config_load(void)
+{
+	g_connect_timeout_ms = (uint32_t)s3_env_ms("S3LVOL_S3_CONNECT_TIMEOUT_MS",
+						   S3_DEFAULT_CONNECT_TIMEOUT_MS);
+	g_request_timeout_ms = s3_env_ms("S3LVOL_S3_REQUEST_TIMEOUT_MS",
+					 S3_DEFAULT_REQUEST_TIMEOUT_MS);
+	g_meta_timeout_ms = s3_env_ms("S3LVOL_S3_META_TIMEOUT_MS",
+				      S3_DEFAULT_META_TIMEOUT_MS);
+	SPDK_NOTICELOG("S3 request limits: connect %u ms, data %" PRIu64 " ms "
+		       "(+1 s per 256 KiB), head/delete %" PRIu64 " ms (0 = none)\n",
+		       g_connect_timeout_ms, g_request_timeout_ms, g_meta_timeout_ms);
+}
+
+static void
+s3_meta_ops_acquire(void *t)
+{
+	aws_s3_meta_request_acquire(t);
+}
+
+static void
+s3_meta_ops_release(void *t)
+{
+	aws_s3_meta_request_release(t);
+}
+
+static void
+s3_meta_ops_cancel(void *t)
+{
+	aws_s3_meta_request_cancel(t);
+}
+
+static const struct s3_deadline_ops g_meta_deadline_ops = {
+	.acquire = s3_meta_ops_acquire,
+	.release = s3_meta_ops_release,
+	.cancel  = s3_meta_ops_cancel,
+};
+
+/* At submit, before the meta request exists. \p bytes is the payload size for
+ * GET/PUT and 0 otherwise. */
+static uint64_t s3_trace_elapsed_ms(const struct s3_request *req);
+
+static void
+s3_req_deadline_start(struct s3_request *req, bool data, uint64_t bytes)
+{
+	uint64_t ms = data ? g_request_timeout_ms : g_meta_timeout_ms;
+
+	if (ms > 0 && data) {
+		ms += bytes * 1000 / S3_DEADLINE_BYTES_PER_SEC;
+	}
+	req->deadline_ms = ms;
+	req->deadline = s3_deadline_new(ms);
+}
+
+/* At the top of every finish callback, before the meta request is released.
+ * Returns true when the deadline fired, in which case the caller reports
+ * -ETIMEDOUT for a failed request. */
+static bool
+s3_req_deadline_finish(struct s3_request *req,
+		       const struct aws_s3_meta_request_result *result)
+{
+	bool fired = s3_deadline_finish(req->deadline);
+
+	req->deadline = NULL;
+	if (fired) {
+		SPDK_ERRLOG("S3 %s deadline exceeded: key=%s limit_ms=%" PRIu64
+			    " elapsed_ms=%" PRIu64 " attempts=%u crt=%d (%s); "
+			    "cancelled, reported as %s\n", req->op ? req->op : "?",
+			    req->key_buf, req->deadline_ms,
+			    s3_trace_elapsed_ms(req), req->attempts,
+			    result->error_code, aws_error_str(result->error_code),
+			    result->error_code == AWS_ERROR_SUCCESS ?
+			    "success (completed while being cancelled)" : "-ETIMEDOUT");
+	}
+	return fired && result->error_code != AWS_ERROR_SUCCESS;
 }
 
 /* ==========================================================================
@@ -833,6 +970,8 @@ s3_crt_global_init_body(uint32_t event_loop_threads)
 		event_loop_threads = 4;
 	}
 
+	s3_deadline_config_load();
+
 	allocator = aws_default_allocator();
 	aws_s3_library_init(allocator);
 
@@ -1027,6 +1166,8 @@ s3_crt_global_fini_body(void)
 	aws_host_resolver_release(g_app_ctx.resolver);
 	aws_event_loop_group_release(g_app_ctx.event_loop_group);
 	aws_s3_library_clean_up();
+	/* After every meta request is gone: nothing can reach a deadline now. */
+	s3_deadline_shutdown();
 
 	/* Detach before tearing the logger down: aws_logger_clean_up() joins
 	 * the background log thread, and anything logging afterwards would
@@ -1293,6 +1434,9 @@ s3_client_get_or_create(const struct s3_target *target, struct s3_client **out)
 		.signing_config         = &client->signing_config,
 		.memory_limit_in_bytes  = 4ULL * 1024 * 1024 * 1024,
 		.throughput_target_gbps = 30.0,
+		/* Explicit rather than CRT's implicit default (also 3 s), so the
+		 * value is visible and tunable: S3LVOL_S3_CONNECT_TIMEOUT_MS. */
+		.connect_timeout_ms     = g_connect_timeout_ms,
 	};
 
 	/* part_size is left at CRT's default (8 MiB). Worth knowing that this is what
@@ -1553,6 +1697,7 @@ s3_get_finished(struct aws_s3_meta_request *meta_request,
 		void *user_data)
 {
 	struct s3_request *req = user_data;
+	bool timed_out = s3_req_deadline_finish(req, result);
 
 	s3_trace_finish(req, result, req->bytes_read);
 
@@ -1571,6 +1716,9 @@ s3_get_finished(struct aws_s3_meta_request *meta_request,
 	}
 
 	S3_STAT_INC(req->client, get_ops);
+	if (timed_out && req->status != 0) {
+		req->status = -ETIMEDOUT;
+	}
 	assert(S3_STAT_GET(req->client, inflight) > 0);
 	S3_STAT_DEC(req->client, inflight);
 
@@ -1679,9 +1827,23 @@ s3_get_range_ex(struct s3_client *client, const char *key,
 
 	S3_STAT_INC(client, inflight);
 
+	struct s3_deadline *dl;
+
+	s3_req_deadline_start(req, true, len);
+	dl = req->deadline;
+
 	struct aws_s3_meta_request *meta_req =
 		aws_s3_client_make_meta_request(client->aws_client, &options);
 	aws_http_message_release(options.message);
+
+	if (meta_req) {
+		/* req may already be freed (the finish callback can run before
+		 * this returns); dl stays valid until armed. */
+		s3_deadline_arm(dl, meta_req, &g_meta_deadline_ops);
+	} else {
+		s3_deadline_abandon(dl);
+		req->deadline = NULL;
+	}
 
 	if (!meta_req) {
 		SPDK_ERRLOG("GetObject: failed to create meta request for key=%s: %s\n",
@@ -1706,6 +1868,7 @@ s3_put_finished(struct aws_s3_meta_request *meta_request,
 		void *user_data)
 {
 	struct s3_request *req = user_data;
+	bool timed_out = s3_req_deadline_finish(req, result);
 
 	s3_trace_finish(req, result, req->bytes_read);
 
@@ -1756,6 +1919,9 @@ s3_put_finished(struct aws_s3_meta_request *meta_request,
 	}
 
 	S3_STAT_INC(req->client, put_ops);
+	if (timed_out && req->status != 0) {
+		req->status = -ETIMEDOUT;
+	}
 	assert(S3_STAT_GET(req->client, inflight) > 0);
 	S3_STAT_DEC(req->client, inflight);
 
@@ -1933,9 +2099,23 @@ s3_put_common(struct s3_client *client, const char *key,
 
 	S3_STAT_INC(client, inflight);
 
+	struct s3_deadline *dl;
+
+	s3_req_deadline_start(req, true, total_size);
+	dl = req->deadline;
+
 	struct aws_s3_meta_request *meta_req =
 		aws_s3_client_make_meta_request(client->aws_client, &options);
 	aws_http_message_release(options.message);
+
+	if (meta_req) {
+		/* req may already be freed (the finish callback can run before
+		 * this returns); dl stays valid until armed. */
+		s3_deadline_arm(dl, meta_req, &g_meta_deadline_ops);
+	} else {
+		s3_deadline_abandon(dl);
+		req->deadline = NULL;
+	}
 
 	if (!meta_req) {
 		SPDK_ERRLOG("PutObject: failed to create meta request for key=%s: %s\n",
@@ -2021,6 +2201,7 @@ s3_head_finished(struct aws_s3_meta_request *meta_request,
 		 void *user_data)
 {
 	struct s3_request *req = user_data;
+	bool timed_out = s3_req_deadline_finish(req, result);
 
 	s3_trace_finish(req, result, 0);
 
@@ -2042,6 +2223,9 @@ s3_head_finished(struct aws_s3_meta_request *meta_request,
 	}
 
 	S3_STAT_INC(req->client, head_ops);
+	if (timed_out && req->status != 0) {
+		req->status = -ETIMEDOUT;
+	}
 	assert(S3_STAT_GET(req->client, inflight) > 0);
 	S3_STAT_DEC(req->client, inflight);
 
@@ -2129,9 +2313,23 @@ s3_head(struct s3_client *client, const char *key,
 
 	S3_STAT_INC(client, inflight);
 
+	struct s3_deadline *dl;
+
+	s3_req_deadline_start(req, false, 0);
+	dl = req->deadline;
+
 	struct aws_s3_meta_request *meta_req =
 		aws_s3_client_make_meta_request(client->aws_client, &options);
 	aws_http_message_release(options.message);
+
+	if (meta_req) {
+		/* req may already be freed (the finish callback can run before
+		 * this returns); dl stays valid until armed. */
+		s3_deadline_arm(dl, meta_req, &g_meta_deadline_ops);
+	} else {
+		s3_deadline_abandon(dl);
+		req->deadline = NULL;
+	}
 
 	if (!meta_req) {
 		SPDK_ERRLOG("HeadObject: failed to create meta request for key=%s: %s\n",
@@ -2158,6 +2356,7 @@ s3_delete_finished(struct aws_s3_meta_request *meta_request,
 		   void *user_data)
 {
 	struct s3_request *req = user_data;
+	bool timed_out = s3_req_deadline_finish(req, result);
 
 	s3_trace_finish(req, result, 0);
 
@@ -2197,6 +2396,9 @@ s3_delete_finished(struct aws_s3_meta_request *meta_request,
 	}
 
 	S3_STAT_INC(req->client, delete_ops);
+	if (timed_out && req->status != 0) {
+		req->status = -ETIMEDOUT;
+	}
 	assert(S3_STAT_GET(req->client, inflight) > 0);
 	S3_STAT_DEC(req->client, inflight);
 
@@ -2279,9 +2481,23 @@ s3_delete_submit_one(struct s3_client *client, struct s3_request *req)
 
 	S3_STAT_INC(client, inflight);
 
+	struct s3_deadline *dl;
+
+	s3_req_deadline_start(req, false, 0);
+	dl = req->deadline;
+
 	struct aws_s3_meta_request *meta_req =
 		aws_s3_client_make_meta_request(client->aws_client, &options);
 	aws_http_message_release(options.message);
+
+	if (meta_req) {
+		/* req may already be freed (the finish callback can run before
+		 * this returns); dl stays valid until armed. */
+		s3_deadline_arm(dl, meta_req, &g_meta_deadline_ops);
+	} else {
+		s3_deadline_abandon(dl);
+		req->deadline = NULL;
+	}
 
 	if (!meta_req) {
 		SPDK_ERRLOG("DeleteObject: failed to create meta request for key=%s: %s\n",
@@ -2662,6 +2878,7 @@ s3_copy_finished(struct aws_s3_meta_request *meta_request,
 		 void *user_data)
 {
 	struct s3_request *req = user_data;
+	bool timed_out = s3_req_deadline_finish(req, result);
 
 	s3_trace_finish(req, result, 0);
 
@@ -2684,6 +2901,9 @@ s3_copy_finished(struct aws_s3_meta_request *meta_request,
 	}
 
 	S3_STAT_INC(req->client, copy_ops);
+	if (timed_out && req->status != 0) {
+		req->status = -ETIMEDOUT;
+	}
 	assert(S3_STAT_GET(req->client, inflight) > 0);
 	S3_STAT_DEC(req->client, inflight);
 
@@ -2792,9 +3012,23 @@ s3_copy_object(struct s3_client *client,
 
 	S3_STAT_INC(client, inflight);
 
+	struct s3_deadline *dl;
+
+	s3_req_deadline_start(req, true, 0);
+	dl = req->deadline;
+
 	struct aws_s3_meta_request *meta_req =
 		aws_s3_client_make_meta_request(client->aws_client, &options);
 	aws_http_message_release(options.message);
+
+	if (meta_req) {
+		/* req may already be freed (the finish callback can run before
+		 * this returns); dl stays valid until armed. */
+		s3_deadline_arm(dl, meta_req, &g_meta_deadline_ops);
+	} else {
+		s3_deadline_abandon(dl);
+		req->deadline = NULL;
+	}
 
 	if (!meta_req) {
 		SPDK_ERRLOG("CopyObject: failed to create meta request for %s -> %s: %s\n",

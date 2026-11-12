@@ -593,6 +593,11 @@ struct s3_export_opts {
 	 * deleted rather than copied. */
 	uint32_t                generation;
 
+	/* Optional (B16). Set to true right before the manifest PUT is handed to
+	 * the client, so the caller can tell "failed before anything could name
+	 * the export" from "a manifest may exist". Must outlive the run. */
+	bool                   *manifest_put_started;
+
 	struct s3_export_source src;
 };
 

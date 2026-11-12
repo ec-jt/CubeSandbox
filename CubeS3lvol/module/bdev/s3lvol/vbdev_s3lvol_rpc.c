@@ -26,6 +26,10 @@
  *     rcow_create_snapshot / rcow_create_clone
  *     rcow_export_snapshot / rcow_get_snapshot_status / rcow_import_lvol
  *     rcow_release_export / rcow_get_exports / rcow_get_imports / rcow_decouple_lvol
+ *     rcow_abandon_unpublished_export {export_uuid, lvs_name?}: drops a
+ *       registry entry stuck at publication_pending, only when no export of
+ *       the uuid is running and both exports/<uuid>.json and
+ *       exports/admission/<uuid> read 404 (B16)
  *     rcow_get_decouple
  *     rcow_active_bdev / rcow_deactive_bdev / rcow_get_bdev
  *
@@ -2867,6 +2871,34 @@ out:
 	free(req.lvs_name); free(req.export_uuid);
 }
 SPDK_RPC_REGISTER("rcow_reconcile_export", rpc_rcow_reconcile_export, SPDK_RPC_RUNTIME)
+
+static void
+rpc_rcow_abandon_unpublished_export(struct spdk_jsonrpc_request *request,
+				    const struct spdk_json_val *params)
+{
+	struct rpc_export_id req = {0};
+	struct rpc_lvol_op_ctx *ctx;
+	struct s3lvol_lvstore *lvs;
+	int rc;
+	if (spdk_json_decode_object(params, rpc_export_id_decoders,
+		SPDK_COUNTOF(rpc_export_id_decoders), &req)) {
+		rpc_lvol_respond_err(request, -EINVAL, NULL);
+		goto out;
+	}
+	lvs = rpc_lvstore_for(request, req.lvs_name);
+	if (!lvs) goto out;
+	ctx = calloc(1, sizeof(*ctx));
+	if (!ctx) { rpc_lvol_respond_err(request, -ENOMEM, NULL); goto out; }
+	ctx->request = request;
+	ctx->lvol_name = strdup(req.export_uuid);
+	if (!ctx->lvol_name) { free(ctx); rpc_lvol_respond_err(request, -ENOMEM, NULL); goto out; }
+	rc = s3lvol_export_abandon_unpublished(lvs, req.export_uuid, rpc_lvol_op_cb, ctx);
+	if (rc) { free(ctx->lvol_name); free(ctx); rpc_lvol_respond_err(request, rc, NULL); }
+out:
+	free(req.lvs_name); free(req.export_uuid);
+}
+SPDK_RPC_REGISTER("rcow_abandon_unpublished_export", rpc_rcow_abandon_unpublished_export,
+		  SPDK_RPC_RUNTIME)
 
 /* Publish copies without revoking old references. Direct importers can refetch
  * the higher generation; derived readers may retain old refs, so REF source

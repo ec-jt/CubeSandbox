@@ -1929,6 +1929,8 @@ struct s3_export_ctx {
 
 	s3_export_cb               cb_fn;
 	void                      *cb_arg;
+
+	bool                      *manifest_put_started;
 };
 
 static void export_pump(struct s3_export_ctx *ctx);
@@ -2039,6 +2041,9 @@ export_finish(struct s3_export_ctx *ctx)
 	s3_export_manifest_key(ctx->uuid_str, ctx->manifest_key,
 			       sizeof(ctx->manifest_key));
 
+	if (ctx->manifest_put_started) {
+		*ctx->manifest_put_started = true;
+	}
 	rc = s3_put(ctx->client, ctx->manifest_key, &ctx->manifest_iov, 1, false,
 		    export_manifest_uploaded, ctx);
 	if (rc != 0) {
@@ -2199,6 +2204,7 @@ s3_export_run(const struct s3_export_opts *opts, s3_export_cb cb, void *cb_arg)
 			    S3_EXPORT_DEFAULT_INFLIGHT;
 	ctx->cb_fn        = cb;
 	ctx->cb_arg       = cb_arg;
+	ctx->manifest_put_started = opts->manifest_put_started;
 	snprintf(ctx->prefix, sizeof(ctx->prefix), "%s", opts->prefix);
 	snprintf(ctx->uuid_str, sizeof(ctx->uuid_str), "%s", opts->uuid_str);
 

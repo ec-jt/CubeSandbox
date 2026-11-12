@@ -53,6 +53,7 @@
 #include "vbdev_s3lvol.h"
 #include "source_control_ticket.h"
 #include "export_admission_io.h"
+#include "export_b16_ctl.h"
 
 /* Serializes admission/detach with local publication and store lifetime. */
 struct admission_work {
@@ -1243,12 +1244,74 @@ struct export_ctx {
 	uint64_t                  start_tsc;
 	const char               *step;
 
+	/* B16: a drain that times out while the flusher is still getting
+	 * uploads through is extended rather than failed. */
+	struct export_drain_progress drain_progress;
+	uint64_t                  drain_last_log_ms;
+
+	/* B16: whether anything that could name this export was handed to S3.
+	 * Until then a failure may drop the REF reservation (see
+	 * export_reservation_ctl_drop()); afterwards it is kept, fail closed. */
+	struct export_attempts    attempts;
+	bool                      manifest_put_started;
+
 	s3lvol_export_cb          cb_fn;
 	void                     *cb_arg;
 };
 
 static void export_copy(struct export_ctx *ctx);
 static void export_ref(struct export_ctx *ctx);
+
+static uint64_t
+export_now_ms(void)
+{
+	return spdk_get_ticks() * 1000 / spdk_get_ticks_hz();
+}
+
+/* B16: a failed export whose reservation never reached anything an importer
+ * could see. Drop it from the registry so the uuid reads NONE again and a
+ * resubmit of the snapshot is admitted, instead of the entry staying
+ * publication_pending (INPROGRESS) forever.
+ *
+ * Only when nothing was handed to S3 that could name the export: no admission
+ * document write and no manifest PUT. The chunk objects a copy engine may have
+ * uploaded are unreferenced without a manifest. The registry save is
+ * best-effort: if it fails, the persisted registry may still carry the pending
+ * entry after a restart, which rcow_abandon_unpublished_export clears with
+ * positive S3 proof. If the registry is busy right now the entry is kept as
+ * before and the same RPC applies. */
+static void
+export_drop_unpublished(struct export_ctx *ctx, int status)
+{
+	struct s3lvol_export *exp = s3lvol_export_find(ctx->lvs, ctx->info.export_uuid);
+	struct s3lvol_export_entry e;
+	int rc;
+
+	if (!exp) {
+		return;
+	}
+	s3lvol_export_get(exp, &e);
+	ctx->attempts.publish_started = ctx->attempts.publish_started ||
+					ctx->manifest_put_started;
+	if (!export_reservation_ctl_drop(&ctx->attempts, status,
+					 e.publication_pending)) {
+		return;
+	}
+	if (!s3lvol_lvstore_exports_ready(ctx->lvs) ||
+	    s3lvol_export_registry_busy(ctx->lvs)) {
+		SPDK_WARNLOG("Export %s failed before anything was published, but the "
+			     "registry of '%s' is busy; its reservation is kept. Clear "
+			     "it with rcow_abandon_unpublished_export.\n",
+			     ctx->info.export_uuid, s3lvol_lvstore_get_name(ctx->lvs));
+		return;
+	}
+	s3lvol_export_forget(exp);
+	rc = s3lvol_export_registry_save(ctx->lvs, NULL, NULL);
+	SPDK_NOTICELOG("Export %s failed at step '%s' before any manifest or admission "
+		       "write; its reservation was dropped (status NONE, resubmit "
+		       "allowed)%s\n", ctx->info.export_uuid, ctx->step ? ctx->step : "?",
+		       rc ? ", but the registry rewrite could not be submitted" : "");
+}
 
 /* Diagnostics only: ms since lvol_export_start(), 0 before it ran. */
 static uint64_t
@@ -1286,6 +1349,9 @@ export_report(struct export_ctx *ctx, int status)
 	 * The step that failed often logs something more specific as well. The two
 	 * are not redundant: that one says which step, this one says which export it
 	 * took down. */
+	if (status != 0) {
+		export_drop_unpublished(ctx, status);
+	}
 	if (status != 0) {
 		struct s3lvol_export *left = s3lvol_export_find(ctx->lvs, ctx->info.export_uuid);
 		struct s3lvol_export_entry left_info;
@@ -1344,8 +1410,15 @@ static void
 export_legacy_admission_checked(void *arg, int status)
 {
 	struct export_ctx *ctx = arg;
-	if (status == -ENOENT) export_drain(ctx);
-	else export_report(ctx, status ? status : -EBUSY);
+	if (status == -ENOENT) {
+		export_drain(ctx);
+		return;
+	}
+	/* An admission document for this uuid exists, or its absence could not
+	 * be proven: something may already name the export. Fail closed and
+	 * keep the reservation (B16). */
+	ctx->attempts.admission_write = true;
+	export_report(ctx, status ? status : -EBUSY);
 }
 
 static void
@@ -1373,6 +1446,9 @@ export_reserved(void *cb_arg, int status)
 		snprintf(doc.prefix, sizeof(doc.prefix), "%s", s3lvol_lvstore_get_name(ctx->lvs));
 		for (i = 0; i < 8; i++) doc.chunks_be[7-i] = chunks >> (8*i);
 		doc.state = EA_OPEN;
+		/* From here an importer may find this export's admission
+		 * document: a later failure keeps the reservation. */
+		ctx->attempts.admission_write = true;
 		int rc = admission_start(s3lvol_lvstore_get_client(ctx->lvs), ctx->info.export_uuid,
 			EA_CLOSE, NULL, &doc, export_admission_created, ctx);
 		if (rc) export_report(ctx, rc);
@@ -1738,6 +1814,10 @@ export_ref(struct export_ctx *ctx)
 	}
 
 	rc = s3_export_run_ref(&opts, export_copy_done, ctx);
+	if (rc == 0) {
+		/* run_ref submits the manifest PUT before it returns 0. */
+		ctx->attempts.publish_started = true;
+	}
 	if (rc == -ENOTSUP) {
 		SPDK_NOTICELOG("Export %s: ref engine declined (%s); layout dense\n",
 			       ctx->info.export_uuid, spdk_strerror(ENOTSUP));
@@ -1805,7 +1885,11 @@ export_ref(struct export_ctx *ctx)
 static void
 export_drain(struct export_ctx *ctx)
 {
+	struct s3_bs_dev_stats st = {0};
+
 	ctx->step = "drain";
+	s3_bs_dev_get_stats(s3lvol_lvstore_get_bs_dev(ctx->lvs), &st);
+	export_drain_ctl_start(&ctx->drain_progress, export_now_ms(), st.chunks_flushed);
 	s3lvol_lvstore_flush(ctx->lvs, export_drained, ctx);
 }
 
@@ -1861,6 +1945,59 @@ export_drained(void *cb_arg, int status)
 		/* Could not even wait; fall through and report the -EBUSY. */
 		SPDK_ERRLOG("Export %s could not schedule a drain retry\n",
 			    ctx->info.export_uuid);
+	}
+
+	/* B16: the flusher's own drain deadline (30 s) passed. That is a verdict
+	 * about time, not about progress: with S3 slow but working, uploads keep
+	 * completing and a re-drain finishes. Extend while chunks_flushed keeps
+	 * moving; fail only after EXPORT_DRAIN_NO_PROGRESS_MS without a single
+	 * completed upload, or EXPORT_DRAIN_PROGRESS_CAP_MS overall. The
+	 * background flusher is unchanged: a drain is only an observation. */
+	if (status == -ETIMEDOUT) {
+		struct s3_bs_dev_stats st = {0};
+		uint64_t now = export_now_ms();
+		bool moved = false;
+
+		s3_bs_dev_get_stats(s3lvol_lvstore_get_bs_dev(ctx->lvs), &st);
+		if (export_drain_ctl_next(&ctx->drain_progress, now, st.chunks_flushed,
+					  EXPORT_DRAIN_NO_PROGRESS_MS,
+					  EXPORT_DRAIN_PROGRESS_CAP_MS, &moved) ==
+		    EXPORT_DRAIN_AGAIN) {
+			/* At most one line per 30 s per export. */
+			if (ctx->drain_last_log_ms == 0 ||
+			    now - ctx->drain_last_log_ms >= 30 * 1000) {
+				ctx->drain_last_log_ms = now;
+				SPDK_NOTICELOG("Export %s: drain of '%s' timed out but the "
+					       "flusher %s (chunks_flushed=%" PRIu64 ", %u in "
+					       "flight, failures=%" PRIu64 "); draining again "
+					       "(extension %u, %" PRIu64 " ms since first drain, "
+					       "last progress %" PRIu64 " ms ago)\n",
+					       ctx->info.export_uuid,
+					       s3lvol_lvstore_get_name(ctx->lvs),
+					       moved ? "is making progress" :
+					       "made progress recently",
+					       st.chunks_flushed, st.flush_in_flight,
+					       st.flush_failures, ctx->drain_progress.extensions,
+					       now - ctx->drain_progress.start_ms,
+					       now - ctx->drain_progress.last_progress_ms);
+			}
+			ctx->drain_retry_poller = SPDK_POLLER_REGISTER(export_drain_retry,
+								       ctx, 0);
+			if (ctx->drain_retry_poller) {
+				return;
+			}
+			SPDK_ERRLOG("Export %s could not schedule a re-drain\n",
+				    ctx->info.export_uuid);
+		} else {
+			SPDK_ERRLOG("Export %s: no drain progress on '%s' for %" PRIu64
+				    " ms (limit %llu) or overall cap %llu ms reached after "
+				    "%u extension(s); giving up\n", ctx->info.export_uuid,
+				    s3lvol_lvstore_get_name(ctx->lvs),
+				    now - ctx->drain_progress.last_progress_ms,
+				    (unsigned long long)EXPORT_DRAIN_NO_PROGRESS_MS,
+				    (unsigned long long)EXPORT_DRAIN_PROGRESS_CAP_MS,
+				    ctx->drain_progress.extensions);
+		}
 	}
 
 	if (status != 0) {
@@ -1941,6 +2078,9 @@ export_copy(struct export_ctx *ctx)
 	opts.channel      = ctx->channel;
 	opts.chunk_size   = (uint32_t)cluster_size;
 	opts.cluster_size = (uint32_t)cluster_size;
+	/* Set by the engine right before the manifest PUT. Chunk objects alone
+	 * are unreferenced, so a failure before that may drop the reservation. */
+	opts.manifest_put_started = &ctx->manifest_put_started;
 
 	rc = export_fill_src(ctx, &opts.src);
 	if (rc != 0) {
@@ -5214,6 +5354,167 @@ s3lvol_export_reconcile(struct s3lvol_lvstore *lvs, const char *uuid,
 	rc = s3_head(s3lvol_lvstore_get_client(lvs), r->key, &r->size,
 		     reconcile_manifest_head, r);
 	if (rc) { TAILQ_REMOVE(&g_admission_work, &r->work, link); free(r); }
+	return rc;
+}
+
+/* B16: drop a registry entry stuck at publication_pending, with proof.
+ *
+ * An export that failed before B16 left its REF reservation behind for good:
+ * export_report() only dropped the in-flight marker, status read INPROGRESS
+ * forever, admission refused every new export of the snapshot ("publication
+ * pending"), reconcile needs a v4 manifest and release needs an admission
+ * document. Neither existed.
+ *
+ * The entry may go only when nobody can hold the export: no export or rewrite
+ * of the uuid is running here, and both the manifest (exports/<uuid>.json) and
+ * the admission document (exports/admission/<uuid>) read 404. Any other answer,
+ * a transport error included, refuses: absence is never inferred from a failed
+ * lookup. Dropping the entry also drops the source obligation it held on the
+ * snapshot, exactly as a completed release does. */
+struct abandon_ctx {
+	struct admission_work         work;
+	char                          uuid[SPDK_UUID_STRING_LEN];
+	char                          key[S3_EXPORT_KEY_MAX];
+	uint64_t                      size;
+	struct export_abandon_facts   facts;
+	spdk_lvol_op_complete         cb;
+	void                         *arg;
+};
+
+static void
+abandon_facts_local(struct s3lvol_lvstore *lvs, const char *uuid,
+		    struct export_abandon_facts *f)
+{
+	struct s3lvol_export *exp = s3lvol_export_find(lvs, uuid);
+	struct s3lvol_export_entry e;
+
+	f->entry_exists = exp != NULL;
+	if (exp) {
+		s3lvol_export_get(exp, &e);
+		f->publication_pending = e.publication_pending;
+		f->reaping = e.reaping;
+	}
+	f->inflight = export_inflight_find(uuid) != NULL;
+	f->rewriting = export_rewrite_find(uuid) != NULL;
+}
+
+static void
+abandon_done(void *arg, int status)
+{
+	struct abandon_ctx *a = arg;
+
+	TAILQ_REMOVE(&g_admission_work, &a->work, link);
+	if (status == 0) {
+		SPDK_NOTICELOG("Export %s abandoned: manifest and admission document "
+			       "both absent, registry entry dropped\n", a->uuid);
+	} else {
+		SPDK_ERRLOG("Abandoning export %s refused or failed: %s\n", a->uuid,
+			    spdk_strerror(-status));
+	}
+	a->cb(a->arg, status);
+	free(a);
+}
+
+static void
+abandon_admission_head(void *arg, int status)
+{
+	struct abandon_ctx *a = arg;
+	struct s3lvol_export *exp;
+	int rc;
+
+	a->facts.admission_checked = true;
+	a->facts.admission_head = status;
+	/* Re-read the local facts: the S3 round trips gave other work a chance
+	 * to start (an export cannot, admission_work blocks it, but be exact). */
+	abandon_facts_local(a->work.lvs, a->uuid, &a->facts);
+	rc = export_abandon_ctl_verdict(&a->facts);
+	if (rc != 0) {
+		abandon_done(a, rc);
+		return;
+	}
+	if (s3lvol_export_registry_busy(a->work.lvs)) {
+		abandon_done(a, -EBUSY);
+		return;
+	}
+	exp = s3lvol_export_find(a->work.lvs, a->uuid);
+	s3lvol_export_forget(exp);
+	rc = s3lvol_export_registry_save(a->work.lvs, abandon_done, a);
+	if (rc != 0) {
+		/* Memory already dropped; the persisted registry still has it and
+		 * the next load brings it back, where this RPC applies again. */
+		abandon_done(a, rc);
+	}
+}
+
+static void
+abandon_manifest_head(void *arg, int status)
+{
+	struct abandon_ctx *a = arg;
+	int rc;
+
+	a->facts.manifest_checked = true;
+	a->facts.manifest_head = status;
+	rc = export_abandon_ctl_verdict(&a->facts);
+	if (rc != -EAGAIN) {
+		abandon_done(a, rc ? rc : -EIO);
+		return;
+	}
+	snprintf(a->key, sizeof(a->key), "exports/admission/%s", a->uuid);
+	rc = s3_head(s3lvol_lvstore_get_client(a->work.lvs), a->key, &a->size,
+		     abandon_admission_head, a);
+	if (rc != 0) {
+		abandon_done(a, rc);
+	}
+}
+
+int
+s3lvol_export_abandon_unpublished(struct s3lvol_lvstore *lvs, const char *uuid,
+				  spdk_lvol_op_complete cb, void *arg)
+{
+	struct export_abandon_facts f = {0};
+	struct abandon_ctx *a;
+	struct spdk_uuid parsed;
+	int rc;
+
+	if (!lvs || !uuid || !cb || spdk_uuid_parse(&parsed, uuid)) {
+		return -EINVAL;
+	}
+	if (s3lvol_lvstore_source_closed(lvs)) {
+		return -ESHUTDOWN;
+	}
+	if (!s3lvol_lvstore_xfer_allowed(lvs) || admission_busy(lvs) ||
+	    s3lvol_export_registry_busy(lvs)) {
+		return -EBUSY;
+	}
+	if (!s3lvol_lvstore_exports_ready(lvs)) {
+		return -EIO;
+	}
+	abandon_facts_local(lvs, uuid, &f);
+	rc = export_abandon_ctl_precheck(&f);
+	if (rc != 0) {
+		SPDK_NOTICELOG("Abandoning export %s refused: %s (entry=%d pending=%d "
+			       "inflight=%d rewriting=%d reaping=%d)\n", uuid,
+			       spdk_strerror(-rc), f.entry_exists, f.publication_pending,
+			       f.inflight, f.rewriting, f.reaping);
+		return rc;
+	}
+	a = calloc(1, sizeof(*a));
+	if (!a) {
+		return -ENOMEM;
+	}
+	a->work.lvs = lvs;
+	a->facts = f;
+	a->cb = cb;
+	a->arg = arg;
+	snprintf(a->uuid, sizeof(a->uuid), "%s", uuid);
+	TAILQ_INSERT_TAIL(&g_admission_work, &a->work, link);
+	s3_export_manifest_key(uuid, a->key, sizeof(a->key));
+	rc = s3_head(s3lvol_lvstore_get_client(lvs), a->key, &a->size,
+		     abandon_manifest_head, a);
+	if (rc != 0) {
+		TAILQ_REMOVE(&g_admission_work, &a->work, link);
+		free(a);
+	}
 	return rc;
 }
 

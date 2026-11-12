@@ -41,6 +41,15 @@
  * retrying. Freeing anything requires s3_flusher_retire(). */
 #define S3_FLUSHER_DRAIN_TIMEOUT_US (30ULL * 1000 * 1000)
 
+/* Per-chunk retry backoff after a failed upload (B16): exponential from MIN,
+ * doubling per consecutive failure of the same chunk, capped at MAX. Before this
+ * a failed chunk was re-picked on the next tick, so a chunk failing against a
+ * stalling endpoint was retried back to back. The backoff holds the chunk's flush
+ * claim, never an upload slot, so other chunks are not starved, and a drain still
+ * counts the chunk as outstanding (it does not complete early). */
+#define S3_FLUSHER_RETRY_BACKOFF_MIN_US (100ULL * 1000)
+#define S3_FLUSHER_RETRY_BACKOFF_MAX_US (10ULL * 1000 * 1000)
+
 struct s3_flusher;
 struct s3_wal;
 
@@ -75,6 +84,9 @@ typedef void (*s3_flusher_upload_fn)(void *ctx,
 struct s3_flusher_opts {
 	uint32_t max_concurrent;   /* 0 selects the default */
 	uint32_t poll_period_us;   /* 0 selects the default */
+	uint64_t retry_backoff_min_us;  /* 0 selects S3_FLUSHER_RETRY_BACKOFF_MIN_US */
+	uint64_t retry_backoff_max_us;  /* 0 selects S3_FLUSHER_RETRY_BACKOFF_MAX_US */
+	bool     retry_backoff_disabled; /* retry on the next tick (pre-B16) */
 };
 
 struct s3_flusher_stats {
@@ -83,7 +95,20 @@ struct s3_flusher_stats {
 	uint64_t blocks_flushed;
 	uint64_t failures;
 	uint32_t in_flight;
+
+	/* B16. starts and completions only ever grow, so a caller can tell
+	 * "the flusher is getting uploads through" from "it is stuck" by
+	 * comparing two snapshots: chunks_flushed advancing is progress. */
+	uint64_t starts;           /* uploads handed to upload_fn */
+	uint64_t completions;      /* upload completions, either outcome */
+	uint64_t backoffs;         /* failed rounds put into retry backoff */
+	uint32_t backing_off;      /* rounds currently waiting out a backoff */
 };
+
+/** Backoff for the \p failures-th consecutive failure: min << (failures-1),
+ * capped at max; 0 when failures or min is 0. Unit-agnostic. Exposed for the
+ * unit test. */
+uint64_t s3_flusher_backoff_us(uint32_t failures, uint64_t min_us, uint64_t max_us);
 
 /**
  * Start the flusher. The poller is registered on the calling thread, which must

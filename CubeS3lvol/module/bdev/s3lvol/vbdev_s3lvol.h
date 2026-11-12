@@ -1486,6 +1486,11 @@ int s3lvol_export_publication_save(struct s3lvol_export *exp, struct s3_export_m
                                   spdk_lvs_op_complete cb, void *arg);
 /** Explicit read-only proof followed by registry commit. No republish or cleanup.
  * Only first-generation admission-enabled dense publications are supported. */
+/* B16: drop a publication_pending entry once the manifest and the admission
+ * document both read 404 and no export of the uuid is running. Refuses on any
+ * other answer. See vbdev_s3lvol_xfer.c. */
+int s3lvol_export_abandon_unpublished(struct s3lvol_lvstore *lvs, const char *uuid,
+				      spdk_lvol_op_complete cb, void *arg);
 int s3lvol_export_reconcile(struct s3lvol_lvstore *lvs, const char *uuid,
                             spdk_lvol_op_complete cb, void *arg);
 void s3lvol_export_forget(struct s3lvol_export *exp);

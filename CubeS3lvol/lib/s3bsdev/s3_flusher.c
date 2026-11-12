@@ -59,6 +59,18 @@ struct s3_flusher {
 
 	/* Uploads in flight, for the drain-timeout dump. Log only. */
 	TAILQ_HEAD(, flush_req)     inflight_reqs;
+
+	/* Failed rounds waiting out their retry backoff (B16). Each one still
+	 * holds its chunk's flush claim (flush_active), so the chunk is neither
+	 * re-picked nor freed, and its data stays in the overlay and the WAL. Not
+	 * counted in in_flight: a chunk waiting must not take an upload slot
+	 * from a chunk that could upload now. Ordered by due time only loosely
+	 * (insertion order); the poller scans it, and it holds at most one entry
+	 * per failing chunk. */
+	TAILQ_HEAD(, flush_req)     backoff_reqs;
+	uint32_t                    backing_off;
+	uint64_t                    backoff_min_tsc;
+	uint64_t                    backoff_max_tsc;
 	struct flusher_fail_slot    fail_slots[FLUSHER_TRACE_FAIL_SLOTS];
 	uint32_t                    fail_next;
 
@@ -119,6 +131,9 @@ struct flush_req {
 	uint64_t                        start_tsc;
 	uint32_t                        attempt;
 	TAILQ_ENTRY(flush_req)          link;
+
+	/* While on backoff_reqs: when the chunk may be retried. */
+	uint64_t                        retry_tsc;
 };
 
 static struct flusher_fail_slot *
@@ -168,6 +183,52 @@ flusher_dump_inflight(struct s3_flusher *f)
 
 static void flusher_check_drain(struct s3_flusher *f);
 static void flusher_check_retire(struct s3_flusher *f);
+
+/* Exponential: min << (failures - 1), capped at max. failures counts this
+ * chunk's consecutive failures including the one just seen. */
+uint64_t
+s3_flusher_backoff_us(uint32_t failures, uint64_t min_us, uint64_t max_us)
+{
+	uint64_t d = min_us;
+
+	if (failures == 0 || min_us == 0) {
+		return 0;
+	}
+	while (--failures > 0 && d < max_us) {
+		d <<= 1;
+	}
+	return d > max_us ? max_us : d;
+}
+
+/* Hand a backed-off round back to the overlay: its blocks become dirty again
+ * and the chunk is re-queued, so the next kick picks it up. */
+static void
+flusher_backoff_release(struct s3_flusher *f, struct flush_req *req)
+{
+	TAILQ_REMOVE(&f->backoff_reqs, req, link);
+	assert(f->backing_off > 0);
+	f->backing_off--;
+	s3_overlay_flush_end(f->overlay, req->view.chunk_index, false);
+	free(req);
+}
+
+/* Release every round whose backoff has elapsed (all of them when \p all).
+ * Returns how many were released. */
+static uint32_t
+flusher_backoff_expire(struct s3_flusher *f, bool all)
+{
+	struct flush_req *req, *tmp;
+	uint64_t now = spdk_get_ticks();
+	uint32_t n = 0;
+
+	TAILQ_FOREACH_SAFE(req, &f->backoff_reqs, link, tmp) {
+		if (all || now >= req->retry_tsc) {
+			flusher_backoff_release(f, req);
+			n++;
+		}
+	}
+	return n;
+}
 
 /* ==========================================================================
  * WAL truncation
@@ -256,6 +317,7 @@ flusher_upload_done(void *cb_arg, int status)
 	assert(f->in_flight > 0);
 	f->in_flight--;
 	TAILQ_REMOVE(&f->inflight_reqs, req, link);
+	f->stats.completions++;
 
 	if (status == 0) {
 		struct flusher_fail_slot *slot = flusher_fail_slot(f, chunk_index, false);
@@ -283,6 +345,29 @@ flusher_upload_done(void *cb_arg, int status)
 			    "block(s) (kept dirty, will retry)\n", chunk_index, status,
 			    spdk_strerror(-status), flusher_age_ms(req->start_tsc),
 			    req->attempt, slot->failures, req->view.nblocks);
+
+		/* Back off before retrying this chunk, instead of re-picking it on
+		 * the very next tick. Before B16 a chunk failing against an S3
+		 * endpoint that was stalling was retried back to back, every
+		 * retry a fresh connection and another full-length stall. The
+		 * claim is kept meanwhile, so nothing changes for the data: it is
+		 * still in the overlay and the WAL, a drain still sees it as
+		 * outstanding, and other chunks keep uploading. Retirement
+		 * releases waiting rounds at once. */
+		if (!f->stopping && f->backoff_min_tsc > 0) {
+			/* Unit-agnostic, so it is computed in ticks directly. */
+			uint64_t delay_tsc = s3_flusher_backoff_us(slot->failures,
+								   f->backoff_min_tsc,
+								   f->backoff_max_tsc);
+
+			req->retry_tsc = spdk_get_ticks() + delay_tsc;
+			TAILQ_INSERT_TAIL(&f->backoff_reqs, req, link);
+			f->backing_off++;
+			f->stats.backoffs++;
+			/* The slot this round held is free: let another chunk use it. */
+			s3_flusher_kick(f);
+			return;
+		}
 	}
 
 	/* Releases the claimed blocks on success, or re-dirties and re-queues
@@ -330,6 +415,7 @@ flusher_start_one(struct s3_flusher *f, uint64_t chunk_index)
 
 	f->in_flight++;
 	f->stats.rounds++;
+	f->stats.starts++;
 	req->start_tsc = spdk_get_ticks();
 	{
 		struct flusher_fail_slot *slot = flusher_fail_slot(f, chunk_index, false);
@@ -393,7 +479,14 @@ flusher_poll(void *arg)
 		return SPDK_POLLER_BUSY;
 	}
 
-	if (f->in_flight == 0 && !s3_overlay_has_dirty(f->overlay)) {
+	/* Rounds whose backoff elapsed go back on the queue first, so the kick
+	 * below can pick them up in the same tick. */
+	if (f->backing_off > 0) {
+		flusher_backoff_expire(f, false);
+	}
+
+	if (f->in_flight == 0 && f->backing_off == 0 &&
+	    !s3_overlay_has_dirty(f->overlay)) {
 		flusher_check_drain(f);
 		return SPDK_POLLER_IDLE;
 	}
@@ -435,16 +528,17 @@ flusher_check_drain(struct s3_flusher *f)
 		return;
 	}
 
-	if (f->in_flight == 0 && !f->super_sync_active &&
+	if (f->in_flight == 0 && f->backing_off == 0 && !f->super_sync_active &&
 	    !s3_overlay_has_dirty(f->overlay)) {
 		status = 0;
 	} else if (spdk_get_ticks() >= f->drain_deadline) {
 		status = -ETIMEDOUT;
-		SPDK_WARNLOG("Flusher drain timed out (%u upload(s) in flight, "
-			     "dirty=%d, super_sync=%d); the data stays in the WAL "
-			     "and the flusher keeps retrying\n", f->in_flight,
-			     (int)s3_overlay_has_dirty(f->overlay),
-			     (int)f->super_sync_active);
+		SPDK_WARNLOG("Flusher drain timed out (%u upload(s) in flight, %u "
+			     "chunk(s) in retry backoff, dirty=%d, super_sync=%d, "
+			     "%" PRIu64 " chunk(s) flushed so far); the data stays in "
+			     "the WAL and the flusher keeps retrying\n", f->in_flight,
+			     f->backing_off, (int)s3_overlay_has_dirty(f->overlay),
+			     (int)f->super_sync_active, f->stats.chunks_flushed);
 		flusher_dump_inflight(f);
 	} else {
 		return;
@@ -509,6 +603,11 @@ s3_flusher_retire(struct s3_flusher *f, s3_flusher_cb cb_fn, void *cb_arg)
 	f->retire_cb = cb_fn;
 	f->retire_arg = cb_arg;
 
+	/* Nothing waits out a backoff any more: the rounds go back to dirty
+	 * now, so retirement reports -EAGAIN for them (data still in the WAL)
+	 * instead of waiting for timers that would only re-queue them. */
+	flusher_backoff_expire(f, true);
+
 	/* A drain still waiting has to be answered now: no new round will start,
 	 * so it could only time out. */
 	if (f->drain_cb) {
@@ -517,7 +616,8 @@ s3_flusher_retire(struct s3_flusher *f, s3_flusher_cb cb_fn, void *cb_arg)
 
 		f->drain_cb = NULL;
 		f->drain_arg = NULL;
-		d_fn(d_arg, (f->in_flight == 0 && !f->super_sync_active &&
+		d_fn(d_arg, (f->in_flight == 0 && f->backing_off == 0 &&
+			     !f->super_sync_active &&
 			     !s3_overlay_has_dirty(f->overlay)) ? 0 : -ETIMEDOUT);
 	}
 
@@ -602,6 +702,7 @@ s3_flusher_create(struct s3_overlay *overlay, struct s3_wal *wal,
 	f->overlay    = overlay;
 	f->wal        = wal;
 	TAILQ_INIT(&f->inflight_reqs);
+	TAILQ_INIT(&f->backoff_reqs);
 	f->upload_fn  = upload_fn;
 	f->upload_ctx = upload_ctx;
 
@@ -609,6 +710,23 @@ s3_flusher_create(struct s3_overlay *overlay, struct s3_wal *wal,
 			    opts->max_concurrent : S3_FLUSHER_DEFAULT_MAX_CONCURRENT;
 	period_us = (opts && opts->poll_period_us) ?
 		    opts->poll_period_us : S3_FLUSHER_DEFAULT_POLL_US;
+	{
+		uint64_t min_us = (opts && opts->retry_backoff_min_us) ?
+				  opts->retry_backoff_min_us :
+				  S3_FLUSHER_RETRY_BACKOFF_MIN_US;
+		uint64_t max_us = (opts && opts->retry_backoff_max_us) ?
+				  opts->retry_backoff_max_us :
+				  S3_FLUSHER_RETRY_BACKOFF_MAX_US;
+
+		if (opts && opts->retry_backoff_disabled) {
+			min_us = 0;
+		}
+		if (max_us < min_us) {
+			max_us = min_us;
+		}
+		f->backoff_min_tsc = min_us * spdk_get_ticks_hz() / 1000000;
+		f->backoff_max_tsc = max_us * spdk_get_ticks_hz() / 1000000;
+	}
 
 	f->poller = SPDK_POLLER_REGISTER(flusher_poll, f, period_us);
 	if (!f->poller) {
@@ -631,6 +749,9 @@ s3_flusher_destroy(struct s3_flusher *f)
 	}
 
 	f->stopping = true;
+
+	/* Waiting rounds hold no request, only a claim: give it back. */
+	flusher_backoff_expire(f, true);
 
 	/* An upload completion would call back into a freed flusher. The caller
 	 * has to RETIRE first (s3_flusher_retire()); a drain is not enough, since
@@ -675,6 +796,7 @@ s3_flusher_get_stats(const struct s3_flusher *f, struct s3_flusher_stats *out)
 	}
 	*out = f->stats;
 	out->in_flight = f->in_flight;
+	out->backing_off = f->backing_off;
 }
 
 SPDK_LOG_REGISTER_COMPONENT(s3_flusher)
