@@ -119,17 +119,55 @@ func (s *service) Exec(ctx context.Context, req *cubebox.ExecCubeSandboxRequest)
 		return rsp, nil
 	}
 
+	// Wait must be registered before Start so a fast exit is not missed.
+	reapCtx := context.WithoutCancel(ctx)
+	exitCh, waitErr := process.Wait(reapCtx)
 	if err := process.Start(ctx); err != nil {
+		_, _ = process.Delete(reapCtx)
 		rsp.Ret.RetMsg = fmt.Sprintf("failed to start process: %v", err)
 		rsp.Ret.RetCode = errorcode.ErrorCode_ExecCommandInSandboxFailed
 		return rsp, nil
 	}
 	log.G(ctx).Info("process started successfully")
+	if waitErr != nil {
+		log.G(ctx).Warnf("exec %s: wait registration failed, not reaped: %v", execID, waitErr)
+	} else {
+		go reapExecProcess(reapCtx, execID, exitCh, process)
+	}
 
 	rsp.Ret.RetMsg = "exec success"
 	rsp.Ret.RetCode = errorcode.ErrorCode_Success
 	return rsp, nil
 
+}
+
+// execProcessDeleter is the subset of containerd.Process the reaper needs.
+type execProcessDeleter interface {
+	Delete(ctx context.Context, opts ...containerd.ProcessDeleteOpts) (*containerd.ExitStatus, error)
+}
+
+// execReapMaxWait bounds how long a reaper goroutine lives. A still-running
+// exec past this point is left to the shim (and still blocks pause, which is
+// correct: the guest process is live).
+var execReapMaxWait = 24 * time.Hour
+
+// reapExecProcess deletes an exec from the shim once it exits. Without this
+// the shim keeps every exited exec in its table and refuses every later
+// pause of the sandbox ("terminate exec tasks first").
+func reapExecProcess(ctx context.Context, execID string, exitCh <-chan containerd.ExitStatus, p execProcessDeleter) {
+	timer := time.NewTimer(execReapMaxWait)
+	defer timer.Stop()
+	select {
+	case <-exitCh:
+	case <-timer.C:
+		log.G(ctx).Warnf("exec %s still running after %s; not reaped", execID, execReapMaxWait)
+		return
+	}
+	dctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	if _, err := p.Delete(dctx); err != nil {
+		log.G(ctx).Warnf("exec %s: delete after exit failed: %v", execID, err)
+	}
 }
 
 func generateExecProcessSpec(ctx context.Context, tsk containerd.Task, req *cubebox.ExecCubeSandboxRequest) (*specs.Process, error) {
