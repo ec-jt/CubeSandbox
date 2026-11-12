@@ -35,6 +35,33 @@ type workerEngine struct {
 	ambiguous map[string]int
 	// onSubmit runs before acceptance (cleanup race tests).
 	onSubmit func(name string)
+	// stuck[name]: once accepted the export never settles, i.e. the native
+	// export died and left publication_pending behind (B16).
+	stuck map[string]bool
+	// abandonErr is returned by AbandonUnpublishedExport when set.
+	abandonErr error
+	abandoned  []string
+}
+
+func (e *workerEngine) AbandonUnpublishedExport(uuid string) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.abandonErr != nil {
+		return e.abandonErr
+	}
+	for name, info := range e.volumeInfos {
+		if info.ExportUUID == uuid && info.ExportStatus == cow.ExportStatusInProgress {
+			e.abandoned = append(e.abandoned, uuid)
+			info.ExportUUID = ""
+			info.ExportStatus = cow.ExportStatusNone
+			delete(e.stuck, name)
+			if e.active == name {
+				e.active = ""
+			}
+			return nil
+		}
+	}
+	return errors.New("not publication_pending")
 }
 
 func (e *workerEngine) ExportSnapshot(name string) (string, error) {
@@ -67,7 +94,7 @@ func (e *workerEngine) ExportSnapshot(name string) (string, error) {
 
 func (e *workerEngine) GetVolumeInfo(name string) (*cubecow.Volume, error) {
 	e.mu.Lock()
-	if e.active == name {
+	if e.active == name && !e.stuck[name] {
 		e.polls++
 		info := e.volumeInfos[name]
 		if e.polls > e.settlePoll {
@@ -98,7 +125,8 @@ func newTestWorker(t *testing.T) (*s3ExportWorker, *workerEngine, *SnapshotCatal
 		info.ExportStatus = cow.ExportStatusNone
 	}
 	AddSnapshotCatalogRootFor(cow.BackendS3, SnapshotKindRoot(cow.BackendS3, SnapshotKindNormal))
-	e := &workerEngine{commitEngine: ce, settlePoll: 2, drainFail: map[string]int{}, ambiguous: map[string]int{}}
+	e := &workerEngine{commitEngine: ce, settlePoll: 2, drainFail: map[string]int{}, ambiguous: map[string]int{},
+		stuck: map[string]bool{}}
 	m.engine = e
 	localStorage.s3CowManager = m
 	w := newS3ExportWorker(ExportWorkerConfig{
@@ -313,4 +341,78 @@ func TestPublishedPackageState(t *testing.T) {
 	require.NoError(t, err)
 	require.False(t, catalog)
 	require.False(t, sealed)
+}
+
+// B16: an accepted export that never settles (native publication_pending left
+// behind by a failed drain) is abandoned natively and resubmitted.
+func stuckRole(t *testing.T) (*s3ExportWorker, *workerEngine, *SnapshotCatalogEntry) {
+	t.Helper()
+	w, e, entry := newTestWorker(t)
+	w.cfg.OrphanAfter = 10 * time.Millisecond
+	w.cfg.MaxAbandons = 2
+	e.volumeInfos[entry.RootfsVol].ExportUUID = "exp-" + entry.RootfsVol
+	e.volumeInfos[entry.RootfsVol].ExportStatus = cow.ExportStatusDone
+	e.volumeInfos[entry.MemoryVol].ExportUUID = "orphan-" + entry.MemoryVol
+	e.volumeInfos[entry.MemoryVol].ExportStatus = cow.ExportStatusInProgress
+	e.active = entry.MemoryVol
+	e.stuck[entry.MemoryVol] = true
+	return w, e, entry
+}
+
+func TestExportWorkerAbandonsOrphanAndResubmits(t *testing.T) {
+	w, e, entry := stuckRole(t)
+	require.NoError(t, w.runOne(context.Background(), entry.SnapshotID))
+	require.Equal(t, []string{"orphan-" + entry.MemoryVol}, e.abandoned)
+	// Memory resubmitted exactly once after the abandon, then metadata.
+	require.Equal(t, []string{entry.MemoryVol, entry.MetadataVol}, e.submits)
+	require.Equal(t, cow.ExportStatusDone, e.volumeInfos[entry.MemoryVol].ExportStatus)
+	require.Equal(t, "exp-"+entry.MemoryVol, e.volumeInfos[entry.MemoryVol].ExportUUID)
+}
+
+func TestExportWorkerDoesNotResubmitWhenAbandonRefused(t *testing.T) {
+	w, e, entry := stuckRole(t)
+	w.cfg.RoleSettleTimeout = 50 * time.Millisecond
+	e.abandonErr = errors.New("manifest exists")
+	err := w.runOne(context.Background(), entry.SnapshotID)
+	require.Error(t, err)
+	require.Empty(t, e.abandoned)
+	// Never submitted memory again (and so never reached metadata).
+	require.Empty(t, e.submits)
+	require.Equal(t, "orphan-"+entry.MemoryVol, e.volumeInfos[entry.MemoryVol].ExportUUID)
+	require.Equal(t, cow.ExportStatusInProgress, e.volumeInfos[entry.MemoryVol].ExportStatus)
+}
+
+func TestExportWorkerAbandonBounded(t *testing.T) {
+	w, e, entry := stuckRole(t)
+	w.cfg.RoleSettleTimeout = 50 * time.Millisecond
+	w.cfg.MaxAbandons = 1
+	// Every resubmit gets stuck again.
+	e.onSubmit = func(name string) {
+		if name == entry.MemoryVol {
+			e.mu.Lock()
+			e.stuck[name] = true
+			e.mu.Unlock()
+		}
+	}
+	require.Error(t, w.runOne(context.Background(), entry.SnapshotID))
+	require.Len(t, e.abandoned, 1)
+	require.Equal(t, []string{entry.MemoryVol}, e.submits)
+}
+
+func TestExportWorkerOrphanWaitRespectsCancellation(t *testing.T) {
+	w, e, entry := stuckRole(t)
+	w.cfg.RoleSettleTimeout = time.Minute
+	e.abandonErr = errors.New("admission exists")
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- w.runOne(ctx, entry.SnapshotID) }()
+	time.Sleep(50 * time.Millisecond)
+	cancel()
+	select {
+	case err := <-done:
+		require.Error(t, err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("runOne did not return after cancellation")
+	}
+	require.Empty(t, e.submits)
 }

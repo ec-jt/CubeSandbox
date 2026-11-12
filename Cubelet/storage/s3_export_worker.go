@@ -63,6 +63,14 @@ type ExportWorkerConfig struct {
 	// BackoffBase/BackoffMax bound the exponential backoff between attempts.
 	BackoffBase time.Duration
 	BackoffMax  time.Duration
+	// OrphanAfter is how long an accepted export may read INPROGRESS with no
+	// completion before the worker asks the native layer to abandon it
+	// (B16). The native side refuses unless nothing was published and no
+	// export of the uuid is running, so a slow but live export is never
+	// dropped; a refusal just keeps the wait going as before.
+	OrphanAfter time.Duration
+	// MaxAbandons bounds successful abandon+resubmit cycles per role.
+	MaxAbandons int
 }
 
 func (c ExportWorkerConfig) withDefaults() ExportWorkerConfig {
@@ -80,6 +88,12 @@ func (c ExportWorkerConfig) withDefaults() ExportWorkerConfig {
 	}
 	if c.BackoffMax <= 0 {
 		c.BackoffMax = 2 * time.Minute
+	}
+	if c.OrphanAfter <= 0 {
+		c.OrphanAfter = exportOrphanWarnAfter
+	}
+	if c.MaxAbandons <= 0 {
+		c.MaxAbandons = 2
 	}
 	return c
 }
@@ -445,6 +459,7 @@ func (w *s3ExportWorker) readRole(ctx context.Context, m *S3Cow, id, name string
 // native read, so the decision to submit is never based on a stale view.
 func (w *s3ExportWorker) exportRole(ctx context.Context, m *S3Cow, id string, ref CowObjectRef) error {
 	var lastErr error
+	abandons := 0
 	for attempt := 0; attempt < w.cfg.MaxAttempts; attempt++ {
 		if attempt > 0 {
 			if err := w.sleep(ctx, w.backoff(attempt)); err != nil {
@@ -470,13 +485,19 @@ func (w *s3ExportWorker) exportRole(ctx context.Context, m *S3Cow, id string, re
 			return nil
 		case v.uuid != "" && (v.status == cow.ExportStatusInProgress || v.status == ""):
 			// Accepted earlier (this run, a previous run, or before a restart).
-			// Never resubmit; wait for it.
-			lastErr = w.waitSettled(ctx, m, id, ref, v.uuid)
+			// Never resubmit blind; wait for it. Only a native abandon, which
+			// proves nothing was published, licenses a resubmit (B16).
+			lastErr = w.waitSettled(ctx, m, id, ref, v.uuid, &abandons)
 			if lastErr == nil {
 				return nil
 			}
 			if errors.Is(lastErr, errExportCancelled) {
 				return lastErr
+			}
+			if errors.Is(lastErr, errExportAbandoned) {
+				// Re-read: the role now reads NONE and is submitted again
+				// right away, without spending a backoff on it.
+				attempt--
 			}
 			continue
 		case v.status == cow.ExportStatusNone || (v.status == "" && v.uuid == "") || cow.ExportStatusIsFailed(v.status):
@@ -502,12 +523,16 @@ func (w *s3ExportWorker) exportRole(ctx context.Context, m *S3Cow, id string, re
 			CubeLog.Warnf("async s3 export %s: %v (attempt %d/%d)", id, lastErr, attempt+1, w.cfg.MaxAttempts)
 			continue
 		}
-		lastErr = w.waitSettled(ctx, m, id, ref, uuid)
+		lastErr = w.waitSettled(ctx, m, id, ref, uuid, &abandons)
 		if lastErr == nil {
 			return nil
 		}
 		if errors.Is(lastErr, errExportCancelled) {
 			return lastErr
+		}
+		if errors.Is(lastErr, errExportAbandoned) {
+			attempt--
+			continue
 		}
 		CubeLog.Warnf("async s3 export %s: %v (attempt %d/%d)", id, lastErr, attempt+1, w.cfg.MaxAttempts)
 	}
@@ -517,14 +542,42 @@ func (w *s3ExportWorker) exportRole(ctx context.Context, m *S3Cow, id string, re
 	return fmt.Errorf("export %s %s: %w", ref.Role, ref.Name, lastErr)
 }
 
-// exportOrphanWarnAfter is how long an accepted export may read INPROGRESS
-// before the settle loop logs it as probably orphaned (B16). Log only: the
-// decision logic below is unchanged.
+// exportOrphanWarnAfter is the default OrphanAfter: how long an accepted
+// export may read INPROGRESS before the settle loop treats it as probably
+// orphaned and asks the native layer to abandon it (B16).
 const exportOrphanWarnAfter = 5 * time.Minute
+
+// errExportAbandoned ends a settle wait after the native layer dropped an
+// orphaned, never-published export. The caller re-reads and resubmits.
+var errExportAbandoned = errors.New("orphaned export abandoned natively")
+
+type cowExportAbandoner interface {
+	AbandonUnpublishedExport(exportUUID string) error
+}
+
+// abandonOrphan asks the native layer to drop an export that reads INPROGRESS
+// with no completion. It succeeds only when s3lvol proves nothing of it was
+// published; any refusal or error leaves everything as it was.
+func (w *s3ExportWorker) abandonOrphan(m *S3Cow, id, uuid string) error {
+	ab, ok := m.engine.(cowExportAbandoner)
+	if !ok || ab == nil {
+		return errors.New("cubecow engine does not support abandon_unpublished_export")
+	}
+	if !w.enter(id) {
+		return errExportCancelled
+	}
+	defer w.leave()
+	return ab.AbandonUnpublishedExport(uuid)
+}
 
 // waitSettled polls until the exact accepted export is DONE. A changed or
 // missing identity and a FAILED status end the wait so the caller re-reads.
-func (w *s3ExportWorker) waitSettled(ctx context.Context, m *S3Cow, id string, ref CowObjectRef, uuid string) error {
+//
+// abandons, when non-nil, counts abandon+resubmit cycles for this role; once
+// INPROGRESS has lasted OrphanAfter the worker tries one native abandon per
+// settle window while the count is below MaxAbandons, and returns
+// errExportAbandoned if it succeeded.
+func (w *s3ExportWorker) waitSettled(ctx context.Context, m *S3Cow, id string, ref CowObjectRef, uuid string, abandons *int) error {
 	wctx, cancel := context.WithTimeout(ctx, w.cfg.RoleSettleTimeout)
 	defer cancel()
 	// Diagnostics only (B16): log each status transition once, and warn once
@@ -550,12 +603,26 @@ func (w *s3ExportWorker) waitSettled(ctx context.Context, m *S3Cow, id string, r
 					time.Since(start).Truncate(time.Millisecond))
 				lastStatus = v.status
 			}
-			if !warnedOrphan && v.status == cow.ExportStatusInProgress && time.Since(start) > exportOrphanWarnAfter {
+			if !warnedOrphan && v.status == cow.ExportStatusInProgress && time.Since(start) > w.cfg.OrphanAfter {
 				warnedOrphan = true
 				CubeLog.Warnf("async s3 export %s: export appears orphaned: publication_pending without progress: "+
-					"%s snapshot %s uuid=%s INPROGRESS for %s with no completion; check rcow_get_exports "+
-					"(publication_pending, disposition) and the s3lvol journal for 'Export %s' failure lines",
-					id, ref.Role, ref.Name, uuid, time.Since(start).Truncate(time.Second), uuid)
+					"%s snapshot %s uuid=%s INPROGRESS for %s with no completion; asking s3lvol to abandon it",
+					id, ref.Role, ref.Name, uuid, time.Since(start).Truncate(time.Second))
+				if abandons != nil && *abandons < w.cfg.MaxAbandons && v.uuid == uuid {
+					aerr := w.abandonOrphan(m, id, uuid)
+					if errors.Is(aerr, errExportCancelled) {
+						return aerr
+					}
+					if aerr == nil {
+						*abandons++
+						CubeLog.Warnf("async s3 export %s: %s %s uuid=%s abandoned natively (nothing was "+
+							"published); resubmitting (abandon %d/%d)", id, ref.Role, ref.Name, uuid,
+							*abandons, w.cfg.MaxAbandons)
+						return errExportAbandoned
+					}
+					CubeLog.Warnf("async s3 export %s: abandon of %s uuid=%s refused: %v; still waiting",
+						id, ref.Name, uuid, aerr)
+				}
 			}
 			if !v.exists {
 				return fmt.Errorf("%s %s disappeared while exporting", ref.Role, ref.Name)
