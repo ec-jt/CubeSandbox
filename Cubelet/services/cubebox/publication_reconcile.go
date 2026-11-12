@@ -143,6 +143,14 @@ func (s *service) reconcilePublication(ctx context.Context, req *cubebox.UpdateC
 	if sb == nil {
 		return refuse("sandbox record missing")
 	}
+	// Same containerd context the pause path builds: the teardown and
+	// cleanup below talk to containerd, which requires a namespace.
+	ns := sb.Namespace
+	if ns == "" {
+		ns = namespaces.Default
+	}
+	ctx = namespaces.WithNamespace(ctx, ns)
+	ctx = constants.WithPreStopType(ctx, constants.PreStopTypePause)
 	in, err := parseReconcileRequest(req)
 	if err != nil {
 		return refuse("%v", err)
