@@ -150,6 +150,30 @@ func TestSnapshotPublicationTeardownSyncFailureNeverDestroys(t *testing.T) {
 	require.NotNil(t, cb.GetPublicationHold())
 }
 
+func TestPreCaptureRuntimeRefusalReleasesHold(t *testing.T) {
+	require.True(t, isPreCaptureRuntimeRefusal(errors.New("rpc error: sandbox pause forbidding, terminate exec tasks first")))
+	require.False(t, isPreCaptureRuntimeRefusal(errors.New("sandbox not running")))
+	require.False(t, isPreCaptureRuntimeRefusal(errors.New("ttrpc: closed")))
+	require.False(t, isPreCaptureRuntimeRefusal(nil))
+
+	cb := newCubeboxWithStatusForTest("sb-refused", cubeboxstore.Status{StartedAt: 1})
+	layout := snapshotWorkLayout{SnapshotID: "snap-refused", Backend: "s3", Home: t.TempDir()}
+	require.NoError(t, beginSnapshotPublication(cb, layout, "pause", func() error { return nil }))
+	require.Error(t, cb.PublicationError())
+
+	// Sync failure keeps the hold (fail closed).
+	require.Error(t, releasePreCapturePublication(cb, func() error { return errors.New("db down") }))
+	require.NotNil(t, cb.GetPublicationHold())
+
+	require.NoError(t, releasePreCapturePublication(cb, func() error { return nil }))
+	require.Nil(t, cb.GetPublicationHold())
+	require.NoError(t, cb.PublicationError())
+	markLocalPauseRefused(cb)
+	require.Equal(t, cubebox.ContainerState_CONTAINER_RUNNING, cb.GetStatus().Get().State())
+	// A later pause attempt is allowed again.
+	require.NoError(t, beginSnapshotPublication(cb, layout, "pause", func() error { return nil }))
+}
+
 func TestAcceptedSnapshotUUIDsRequiresAllRoles(t *testing.T) {
 	for _, uuids := range []*cow.RemoteUUIDs{nil, {}, {Rootfs: "root"}, {Rootfs: "root", Memory: "mem"}, {Rootfs: "root", Memory: "mem", Metadata: " "}} {
 		raw, err := acceptedSnapshotUUIDs(uuids)

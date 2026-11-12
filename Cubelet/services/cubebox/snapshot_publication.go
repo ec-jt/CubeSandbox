@@ -6,6 +6,7 @@ package cubebox
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/tencentcloud/CubeSandbox/Cubelet/pkg/constants"
@@ -58,6 +59,34 @@ func publishCapturedSnapshot(persist, seal func() error, upload func() (string, 
 		return "", fmt.Errorf("remote export acceptance: %w", err)
 	}
 	return raw, nil
+}
+
+// isPreCaptureRuntimeRefusal reports whether the runtime rejected a capture
+// request before touching the VM. The shim checks open exec tasks under its
+// state lock while still Normal and returns before entering Paused, so dirty
+// tracking and the destination directory are untouched. "sandbox not
+// running" is deliberately excluded: it can follow a completed capture.
+func isPreCaptureRuntimeRefusal(err error) bool {
+	if err == nil {
+		return false
+	}
+	return strings.Contains(err.Error(), "terminate exec tasks first")
+}
+
+// releasePreCapturePublication drops a hold that was set for a capture the
+// runtime refused before starting. Nothing was captured, so the hold fences
+// nothing. On sync failure the hold is retained (fail closed).
+func releasePreCapturePublication(cb *cubeboxstore.CubeBox, sync func() error) error {
+	h := cb.GetPublicationHold()
+	if h == nil {
+		return nil
+	}
+	cb.SetPublicationHold(nil)
+	if err := sync(); err != nil {
+		cb.SetPublicationHold(h)
+		return fmt.Errorf("persist pre-capture hold release (hold retained): %w", err)
+	}
+	return nil
 }
 
 func completeSnapshotPublication(cb *cubeboxstore.CubeBox, sync func() error) error {

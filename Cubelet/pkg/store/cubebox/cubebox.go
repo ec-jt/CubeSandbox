@@ -155,6 +155,9 @@ type CubeBox struct {
 
 	// PublicationHold is persisted before runtime capture. Never supplied by clients.
 	PublicationHold *PublicationHold `json:"publication_hold,omitempty"`
+	// HealedPublicationHold marks an in-memory startup release of an
+	// uncaptured pause hold that still needs to be persisted. Never stored.
+	HealedPublicationHold bool `json:"-"`
 
 	RequestSource string `json:"source,omitempty"`
 	UserDeleteMark

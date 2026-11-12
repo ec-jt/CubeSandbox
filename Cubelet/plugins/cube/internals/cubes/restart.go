@@ -62,6 +62,12 @@ func (l *local) RecoverAllCubebox(ctx context.Context, afterRecover func(ctx con
 		}
 
 		l.cubeboxStore.Add(cb)
+		if cb.HealedPublicationHold {
+			cb.HealedPublicationHold = false
+			if err := l.cubeboxStore.Sync(cb.ID); err != nil {
+				log.G(podCtx).Errorf("persist released pause hold: %v", err)
+			}
+		}
 		err = afterRecover(podCtx, cb)
 		if err != nil {
 			log.G(podCtx).Errorf("failed to recover pod, skip this pod: %v", err)
@@ -80,11 +86,19 @@ func RecoverPod(ctx context.Context, client *containerd.Client, cb *cubeboxstore
 	if cb.Version == "" {
 		cb.Version = cb.GetVersion()
 	}
-	if cb.GetPublicationHold() != nil {
-		// The runtime may have captured and reset dirty tracking before restart.
-		// Do not probe/reclassify it or permit automatic lifecycle recovery.
-		cb.SetPublicationHold(cb.GetPublicationHold())
-		return nil
+	if h := cb.GetPublicationHold(); h != nil {
+		if !UncapturedPauseHold(cb, h) {
+			// The runtime may have captured and reset dirty tracking before restart.
+			// Do not probe/reclassify it or permit automatic lifecycle recovery.
+			cb.SetPublicationHold(h)
+			return nil
+		}
+		// Provably nothing was captured: release the hold and recover the
+		// still-running sandbox normally.
+		log.G(ctx).Warnf("releasing uncaptured pause hold sandbox=%s snap=%s", cb.ID, h.SnapshotID)
+		cb.SetPublicationHold(nil)
+		clearPauseAttemptStatus(cb)
+		cb.HealedPublicationHold = true
 	}
 	// Paused tombstones have no live containerd/shim task; keep store as-is for List.
 	if cb.GetStatus() != nil && cb.GetStatus().IsPaused() {

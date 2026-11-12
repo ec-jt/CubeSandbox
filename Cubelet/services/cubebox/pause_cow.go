@@ -454,6 +454,20 @@ func (s *service) updateWithPauseCow(
 		shimUpdateActionAnnotation:        shimUpdatePauseToSnapshotAction,
 		shimUpdatePauseSnapshotAnnotation: string(cfgJSON),
 	})); err != nil {
+		if isPreCaptureRuntimeRefusal(err) {
+			// The shim refused before entering Paused: no capture, VM still
+			// running. Release the hold so the sandbox stays operable.
+			if relErr := releasePreCapturePublication(sb, syncPublication); relErr != nil {
+				return failPause(errorcode.ErrorCode_Unknown, relErr.Error())
+			}
+			stepLog.Warnf("pause refused by runtime before capture; hold released: %v", err)
+			cleanupArtifacts()
+			markLocalPauseRefused(sb)
+			_ = s.cubeboxMgr.cubeboxManger.SyncByID(workCtx, sb.ID)
+			rsp.Ret.RetCode = errorcode.ErrorCode_TaskPauseFailed
+			rsp.Ret.RetMsg = fmt.Sprintf("pause refused before capture (sandbox still running): %v", err)
+			return rsp, nil
+		}
 		return failPause(errorcode.ErrorCode_TaskPauseFailed, fmt.Sprintf("failed or ambiguous runtime capture: %v", err))
 	}
 	if err := persistCapturedLineage(sb, snapID, syncPublication); err != nil {
@@ -631,6 +645,26 @@ func (s *service) destroyLiveAfterPause(
 
 // markLocalPauseFailed records a terminal Pause failure without EXITED.
 // Master keeps the sandbox proxy + FAILED pausesnap for user visibility.
+// markLocalPauseRefused undoes the PausingAt stamp after a pre-capture
+// refusal: the VM never left the running state.
+func markLocalPauseRefused(sb *cubeboxstore.CubeBox) {
+	if sb == nil {
+		return
+	}
+	for _, c := range sb.AllContainers() {
+		if c == nil || c.Status == nil {
+			continue
+		}
+		_ = c.Status.Update(func(status cubeboxstore.Status) (cubeboxstore.Status, error) {
+			status.PausingAt = 0
+			status.Unknown = false
+			status.Reason = ""
+			status.Message = ""
+			return status, nil
+		})
+	}
+}
+
 func markLocalPauseFailed(sb *cubeboxstore.CubeBox, cause error) {
 	if sb == nil {
 		return
