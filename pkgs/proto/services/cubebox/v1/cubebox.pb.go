@@ -4705,10 +4705,16 @@ type CommitSandboxResponse struct {
 	// cube-shim (and sibling cube-runtime) version bound when this snapshot was created.
 	ShimVersion string `protobuf:"bytes,17,opt,name=shim_version,json=shimVersion,proto3" json:"shim_version,omitempty"`
 	// S3: cubecow_export_snapshot uuids JSON (rootfs/memory/metadata).
-	// Filled before this RPC returns. Empty on xfs.
-	RemoteUuids   string `protobuf:"bytes,18,opt,name=remote_uuids,json=remoteUuids,proto3" json:"remote_uuids,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	// Legacy Cubelets fill it before this RPC returns. Empty on xfs, and empty
+	// when remote_export_pending is true.
+	RemoteUuids string `protobuf:"bytes,18,opt,name=remote_uuids,json=remoteUuids,proto3" json:"remote_uuids,omitempty"`
+	// S3 only: the package is sealed locally and its export runs
+	// asynchronously on the node. Master records remote_status=inprogress with
+	// empty export_uuids and fills them from Snapshot.Status once ready. False
+	// with empty remote_uuids still means the export failed.
+	RemoteExportPending bool `protobuf:"varint,19,opt,name=remote_export_pending,json=remoteExportPending,proto3" json:"remote_export_pending,omitempty"`
+	unknownFields       protoimpl.UnknownFields
+	sizeCache           protoimpl.SizeCache
 }
 
 func (x *CommitSandboxResponse) Reset() {
@@ -4865,6 +4871,13 @@ func (x *CommitSandboxResponse) GetRemoteUuids() string {
 		return x.RemoteUuids
 	}
 	return ""
+}
+
+func (x *CommitSandboxResponse) GetRemoteExportPending() bool {
+	if x != nil {
+		return x.RemoteExportPending
+	}
+	return false
 }
 
 type RollbackSandboxRequest struct {
@@ -7064,7 +7077,7 @@ const file_services_cubebox_v1_cubebox_proto_rawDesc = "" +
 	"templateID\x18\x03 \x01(\tR\n" +
 	"templateID\x12!\n" +
 	"\fsnapshot_dir\x18\x04 \x01(\tR\vsnapshotDir\x12\x18\n" +
-	"\abackend\x18\x05 \x01(\tR\abackend\"\x9c\x05\n" +
+	"\abackend\x18\x05 \x01(\tR\abackend\"\xd0\x05\n" +
 	"\x15CommitSandboxResponse\x12\x1c\n" +
 	"\trequestID\x18\x01 \x01(\tR\trequestID\x124\n" +
 	"\x03ret\x18\x02 \x01(\v2\".cubelet.services.errorcode.v1.RetR\x03ret\x12\x1c\n" +
@@ -7092,7 +7105,8 @@ const file_services_cubebox_v1_cubebox_proto_rawDesc = "" +
 	"\x0ekernel_version\x18\x0f \x01(\tR\rkernelVersion\x12!\n" +
 	"\fenvd_version\x18\x10 \x01(\tR\venvdVersion\x12!\n" +
 	"\fshim_version\x18\x11 \x01(\tR\vshimVersion\x12!\n" +
-	"\fremote_uuids\x18\x12 \x01(\tR\vremoteUuids\"\xa3\x02\n" +
+	"\fremote_uuids\x18\x12 \x01(\tR\vremoteUuids\x122\n" +
+	"\x15remote_export_pending\x18\x13 \x01(\bR\x13remoteExportPending\"\xa3\x02\n" +
 	"\x16RollbackSandboxRequest\x12\x1c\n" +
 	"\trequestID\x18\x01 \x01(\tR\trequestID\x12\x1c\n" +
 	"\tsandboxID\x18\x02 \x01(\tR\tsandboxID\x12\x1e\n" +

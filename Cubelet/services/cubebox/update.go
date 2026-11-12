@@ -114,6 +114,11 @@ func (s *service) Update(ctx context.Context, req *cubebox.UpdateCubeSandboxRequ
 		rsp.Ret.RetCode = errorcode.ErrorCode_InvalidParamFormat
 		return rsp, nil
 	}
+	// Operator reconciliation is the one action that must reach a held
+	// sandbox: resolving the hold is its whole purpose (B15).
+	if action == publicationReconcileAction {
+		return s.reconcilePublication(ctx, req, sb, rsp)
+	}
 	if err := sb.PublicationError(); err != nil {
 		rsp.Ret.RetCode = errorcode.ErrorCode_PreConditionFailed
 		rsp.Ret.RetMsg = err.Error()

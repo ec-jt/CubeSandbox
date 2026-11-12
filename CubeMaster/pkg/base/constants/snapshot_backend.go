@@ -80,3 +80,21 @@ func SnapshotRemoteStatus(backend string) string {
 	}
 	return ""
 }
+
+// CompletionRemoteState maps a Cubelet pause/commit result on an S3 row to
+// (export_uuids, remote_status):
+//   - accepted uuids (legacy Cubelet): inprogress with those uuids;
+//   - empty uuids + exportPending (B15 async export): inprogress, empty uuids;
+//     the remotestatus reconciler fills them once every role is DONE;
+//   - empty uuids, no pending flag: export failed, remote_status=failed.
+//
+// Cross-node restore requires remote_status=ready and non-empty uuids.
+func CompletionRemoteState(exportUUIDs string, exportPending bool) (string, string) {
+	if raw := strings.TrimSpace(exportUUIDs); raw != "" {
+		return raw, RemoteStatusInProgress
+	}
+	if exportPending {
+		return "", RemoteStatusInProgress
+	}
+	return "", RemoteStatusFailed
+}

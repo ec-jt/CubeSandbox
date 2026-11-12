@@ -547,7 +547,7 @@ func skipTemplateLocalityReady(ctx context.Context, templateID string) bool {
 	if err != nil || src == nil {
 		return false
 	}
-	return restoreplace.CanCrossNode(src.Backend, src.RemoteStatus)
+	return restoreplace.CanCrossNodeWithExports(src.Backend, src.RemoteStatus, src.ExportUUIDs)
 }
 
 func constrainSnapshotCreateScope(ctx context.Context, snapshotID string, reqInOut *types.CreateCubeSandboxReq) error {
@@ -623,7 +623,7 @@ func fromSnapshotPlacement(ctx context.Context, snapshotID string, reqInOut *typ
 	if src == nil {
 		return nil, fmt.Errorf("snapshot %s: restore source is nil", snapshotID)
 	}
-	if !restoreplace.CanCrossNode(src.Backend, src.RemoteStatus) {
+	if !restoreplace.CanCrossNodeWithExports(src.Backend, src.RemoteStatus, src.ExportUUIDs) {
 		home := &restoreplace.Placement{
 			NodeID: strings.TrimSpace(src.OriginNodeID),
 			NodeIP: strings.TrimSpace(src.OriginNodeIP),

@@ -28,6 +28,12 @@ var ErrS3NotConfigured = errors.New("s3 storage is not configured (set [cow.s3] 
 // ensureS3MetadataReadyFn is swapped in tests to avoid real mkfs/mount.
 var ensureS3MetadataReadyFn = EnsureS3MetadataReady
 
+// resumePendingSnapshotExportsFn is swapped in tests.
+var (
+	resumePendingSnapshotExportsFn = ResumePendingSnapshotExports
+	startSnapshotExportWorkerFn    = StartSnapshotExportWorker
+)
+
 // s3CowOverride lets the init loop run EnsureS3MetadataReady before
 // publishing s3CowManager (so storeForBackend still returns ErrS3NotReady).
 var (
@@ -84,6 +90,20 @@ func (l *local) runS3CowInitLoop(ctx context.Context) {
 		// Boot recovery is deliberately not re-run here: it does nothing for
 		// an s3-backed entry (see recoverStorageInfo), so there is nothing
 		// waiting on this handle.
+		//
+		// Async S3 export (B15) is the exception: packages sealed before a
+		// restart whose roles are not all DONE are requeued from native state.
+		startSnapshotExportWorkerFn()
+		go func() {
+			n, err := resumePendingSnapshotExportsFn(ctx)
+			if err != nil {
+				CubeLog.Errorf("async s3 export resume scan failed: %v", err)
+				return
+			}
+			if n > 0 {
+				CubeLog.Warnf("async s3 export resumed %d package(s) after restart", n)
+			}
+		}()
 		return
 	}
 }

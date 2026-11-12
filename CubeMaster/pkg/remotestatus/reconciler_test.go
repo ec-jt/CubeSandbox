@@ -38,6 +38,7 @@ func TestReconcileOncePromotesInProgressOnly(t *testing.T) {
 	requireNoErr(t, db.Create(&models.SnapshotRecord{
 		SnapshotID:   "snap-up",
 		OriginNodeIP: "10.0.0.1",
+		ExportUUIDs:  `{"rootfs":"r","metadata":"m"}`,
 		Backend:      constants.SnapshotBackendS3,
 		RemoteStatus: constants.RemoteStatusInProgress,
 		Status:       "READY",
@@ -53,6 +54,7 @@ func TestReconcileOncePromotesInProgressOnly(t *testing.T) {
 		SnapshotID:   "pause-up",
 		SandboxID:    "sb-1",
 		NodeIP:       "10.0.0.2",
+		ExportUUIDs:  `{"rootfs":"r","metadata":"m"}`,
 		Backend:      constants.SnapshotBackendS3,
 		RemoteStatus: constants.RemoteStatusInProgress,
 		Status:       "READY",
@@ -201,4 +203,92 @@ func requireNoErr(t *testing.T, err error) {
 	if err != nil {
 		t.Fatal(err)
 	}
+}
+
+// B15: an async-export row is inprogress with empty export_uuids. Ready must
+// fill the uuids from Cubelet, and never flip to ready without them.
+func TestReconcileOnceFillsExportUUIDsOnReady(t *testing.T) {
+	db := setupReconcilerDB(t)
+	requireNoErr(t, db.Create(&models.PauseSnapshotRecord{
+		SnapshotID: "pause-async", SandboxID: "sb-a", NodeIP: "10.0.0.2",
+		Backend: constants.SnapshotBackendS3, RemoteStatus: constants.RemoteStatusInProgress, Status: "READY",
+	}).Error)
+	requireNoErr(t, db.Create(&models.SnapshotRecord{
+		SnapshotID: "snap-async", OriginNodeIP: "10.0.0.1",
+		Backend: constants.SnapshotBackendS3, RemoteStatus: constants.RemoteStatusInProgress, Status: "READY",
+	}).Error)
+	requireNoErr(t, db.Create(&models.PauseSnapshotRecord{
+		SnapshotID: "pause-nouuid", SandboxID: "sb-b", NodeIP: "10.0.0.2",
+		Backend: constants.SnapshotBackendS3, RemoteStatus: constants.RemoteStatusInProgress, Status: "READY",
+	}).Error)
+	prevQuery, prevAddr := queryStatus, cubeletAddr
+	queryStatus = func(_ context.Context, _ string, req *snapshotv1.StatusRequest) (*snapshotv1.StatusResponse, error) {
+		rsp := &snapshotv1.StatusResponse{SnapshotId: req.GetSnapshotId(), State: constants.RemoteStatusReady, RemoteReady: true}
+		if req.GetSnapshotId() != "pause-nouuid" {
+			rsp.RemoteUuids = `{"rootfs":"u-root","memory":"u-mem","metadata":"u-meta"}`
+		}
+		return rsp, nil
+	}
+	cubeletAddr = func(hostIP string) string { return hostIP }
+	t.Cleanup(func() { queryStatus, cubeletAddr = prevQuery, prevAddr })
+
+	ReconcileOnce(context.Background(), db)
+	assertRemote(t, db, constants.PauseSnapshotTableName, "pause-async", constants.RemoteStatusReady)
+	assertRemote(t, db, constants.SnapshotTableName, "snap-async", constants.RemoteStatusReady)
+	assertRemote(t, db, constants.PauseSnapshotTableName, "pause-nouuid", constants.RemoteStatusInProgress)
+	var p models.PauseSnapshotRecord
+	requireNoErr(t, db.Table(constants.PauseSnapshotTableName).Where("snapshot_id = ?", "pause-async").First(&p).Error)
+	if p.ExportUUIDs != `{"rootfs":"u-root","memory":"u-mem","metadata":"u-meta"}` {
+		t.Fatalf("pause export_uuids=%q", p.ExportUUIDs)
+	}
+	var sr models.SnapshotRecord
+	requireNoErr(t, db.Table(constants.SnapshotTableName).Where("snapshot_id = ?", "snap-async").First(&sr).Error)
+	if sr.ExportUUIDs == "" {
+		t.Fatal("snapshot export_uuids not filled")
+	}
+}
+
+// A legacy (old Cubelet) row already carries its accepted uuids; ready keeps
+// them even when the status response repeats a different JSON spelling.
+func TestReconcileOnceKeepsLegacyExportUUIDs(t *testing.T) {
+	db := setupReconcilerDB(t)
+	requireNoErr(t, db.Create(&models.PauseSnapshotRecord{
+		SnapshotID: "pause-legacy", SandboxID: "sb-l", NodeIP: "10.0.0.2", ExportUUIDs: "legacy",
+		Backend: constants.SnapshotBackendS3, RemoteStatus: constants.RemoteStatusInProgress, Status: "READY",
+	}).Error)
+	prevQuery, prevAddr := queryStatus, cubeletAddr
+	queryStatus = func(_ context.Context, _ string, _ *snapshotv1.StatusRequest) (*snapshotv1.StatusResponse, error) {
+		return &snapshotv1.StatusResponse{State: constants.RemoteStatusReady, RemoteReady: true}, nil
+	}
+	cubeletAddr = func(hostIP string) string { return hostIP }
+	t.Cleanup(func() { queryStatus, cubeletAddr = prevQuery, prevAddr })
+	ReconcileOnce(context.Background(), db)
+	assertRemote(t, db, constants.PauseSnapshotTableName, "pause-legacy", constants.RemoteStatusReady)
+	var p models.PauseSnapshotRecord
+	requireNoErr(t, db.Table(constants.PauseSnapshotTableName).Where("snapshot_id = ?", "pause-legacy").First(&p).Error)
+	if p.ExportUUIDs != "legacy" {
+		t.Fatalf("export_uuids=%q", p.ExportUUIDs)
+	}
+}
+
+// A retrying Cubelet reports running for a natively FAILED role; only its
+// terminal give-up is failed.
+func TestReconcileOnceRetryingStaysInProgress(t *testing.T) {
+	db := setupReconcilerDB(t)
+	requireNoErr(t, db.Create(&models.PauseSnapshotRecord{
+		SnapshotID: "pause-retry", SandboxID: "sb-r", NodeIP: "10.0.0.2",
+		Backend: constants.SnapshotBackendS3, RemoteStatus: constants.RemoteStatusInProgress, Status: "READY",
+	}).Error)
+	state := constants.RemoteStatusRunning
+	prevQuery, prevAddr := queryStatus, cubeletAddr
+	queryStatus = func(_ context.Context, _ string, _ *snapshotv1.StatusRequest) (*snapshotv1.StatusResponse, error) {
+		return &snapshotv1.StatusResponse{State: state, Message: "export retrying: drain timeout"}, nil
+	}
+	cubeletAddr = func(hostIP string) string { return hostIP }
+	t.Cleanup(func() { queryStatus, cubeletAddr = prevQuery, prevAddr })
+	ReconcileOnce(context.Background(), db)
+	assertRemote(t, db, constants.PauseSnapshotTableName, "pause-retry", constants.RemoteStatusInProgress)
+	state = constants.RemoteStatusFailed
+	ReconcileOnce(context.Background(), db)
+	assertRemote(t, db, constants.PauseSnapshotTableName, "pause-retry", constants.RemoteStatusFailed)
 }

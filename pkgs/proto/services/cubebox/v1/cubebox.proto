@@ -915,8 +915,14 @@ message CommitSandboxResponse {
   // cube-shim (and sibling cube-runtime) version bound when this snapshot was created.
   string shim_version = 17;
   // S3: cubecow_export_snapshot uuids JSON (rootfs/memory/metadata).
-  // Filled before this RPC returns. Empty on xfs.
+  // Legacy Cubelets fill it before this RPC returns. Empty on xfs, and empty
+  // when remote_export_pending is true.
   string remote_uuids = 18;
+  // S3 only: the package is sealed locally and its export runs
+  // asynchronously on the node. Master records remote_status=inprogress with
+  // empty export_uuids and fills them from Snapshot.Status once ready. False
+  // with empty remote_uuids still means the export failed.
+  bool remote_export_pending = 19;
 }
 
 message RollbackSandboxRequest {

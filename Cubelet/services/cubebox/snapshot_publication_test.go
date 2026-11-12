@@ -60,7 +60,7 @@ func TestSnapshotPublicationFailureBoundaries(t *testing.T) {
 					err = persistCapturedLineage(cb, layout.SnapshotID, persist("lineage"))
 				}
 				if err == nil {
-					_, err = publishCapturedSnapshot(func() error { return step("catalog") }, func() error { return step("seal") }, func() (string, error) { return "accepted-not-ready", step("upload") })
+					_, err = publishCapturedSnapshot(func() error { return step("catalog") }, func() error { return step("seal") }, func() (bool, error) { return true, step("upload") })
 				}
 				if err == nil {
 					err = completeSnapshotPublication(cb, persist("sync"))
@@ -183,7 +183,7 @@ func TestAcceptedSnapshotUUIDsRequiresAllRoles(t *testing.T) {
 	raw, err := acceptedSnapshotUUIDs(&cow.RemoteUUIDs{Rootfs: "root", Memory: "mem", Metadata: "meta"})
 	require.NoError(t, err)
 	require.NotEmpty(t, raw)
-	_, err = uploadRemoteUUIDsIfS3(context.Background(), "invalid-backend", "snap-id")
+	_, err = scheduleRemoteExportIfS3("invalid-backend", "snap-id")
 	require.Error(t, err)
 }
 

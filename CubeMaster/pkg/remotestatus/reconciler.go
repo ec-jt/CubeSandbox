@@ -26,11 +26,12 @@ import (
 const reconcileInterval = 5 * time.Second
 
 type workItem struct {
-	kind       string
-	table      string
-	snapshotID string
-	hostIP     string
-	backend    string
+	kind        string
+	table       string
+	snapshotID  string
+	hostIP      string
+	backend     string
+	exportUUIDs string
 }
 
 const (
@@ -95,11 +96,12 @@ func listInProgress(ctx context.Context, db *gorm.DB) ([]workItem, error) {
 	}
 	for _, rec := range snaps {
 		items = append(items, workItem{
-			kind:       kindSnapshot,
-			table:      constants.SnapshotTableName,
-			snapshotID: rec.SnapshotID,
-			hostIP:     rec.OriginNodeIP,
-			backend:    rec.Backend,
+			kind:        kindSnapshot,
+			table:       constants.SnapshotTableName,
+			snapshotID:  rec.SnapshotID,
+			hostIP:      rec.OriginNodeIP,
+			backend:     rec.Backend,
+			exportUUIDs: rec.ExportUUIDs,
 		})
 	}
 	var pauses []models.PauseSnapshotRecord
@@ -110,11 +112,12 @@ func listInProgress(ctx context.Context, db *gorm.DB) ([]workItem, error) {
 	}
 	for _, rec := range pauses {
 		items = append(items, workItem{
-			kind:       kindPause,
-			table:      constants.PauseSnapshotTableName,
-			snapshotID: rec.SnapshotID,
-			hostIP:     rec.NodeIP,
-			backend:    rec.Backend,
+			kind:        kindPause,
+			table:       constants.PauseSnapshotTableName,
+			snapshotID:  rec.SnapshotID,
+			hostIP:      rec.NodeIP,
+			backend:     rec.Backend,
+			exportUUIDs: rec.ExportUUIDs,
 		})
 	}
 	return items, nil
@@ -138,12 +141,27 @@ func reconcileItem(ctx context.Context, db *gorm.DB, item workItem) {
 	if !ok {
 		return
 	}
+	updates := map[string]any{
+		"remote_status": next,
+		"updated_at":    nowTimestamp(),
+	}
+	if next == constants.RemoteStatusReady {
+		// Async export (B15) rows are inprogress with empty export_uuids; the
+		// identities arrive here. A row must never become ready without them,
+		// since cross-node restore imports exactly these uuids. Rows that
+		// already carry uuids (legacy Cubelet) keep them.
+		if strings.TrimSpace(item.exportUUIDs) == "" {
+			raw := strings.TrimSpace(st.GetRemoteUuids())
+			if raw == "" {
+				log.G(ctx).Warnf("remote_status %s %s: cubelet ready without remote_uuids; keeping inprogress", item.kind, snapshotID)
+				return
+			}
+			updates["export_uuids"] = raw
+		}
+	}
 	res := db.WithContext(ctx).Table(item.table).
 		Where("snapshot_id = ? AND remote_status = ?", snapshotID, constants.RemoteStatusInProgress).
-		Updates(map[string]any{
-			"remote_status": next,
-			"updated_at":    nowTimestamp(),
-		})
+		Updates(updates)
 	if res.Error != nil {
 		log.G(ctx).Warnf("remote_status update %s %s failed: %v", item.kind, snapshotID, res.Error)
 		return

@@ -52,7 +52,7 @@ func evictRecord(t *testing.T, sandbox, checkpoint, node, digest string) []byte 
 func readyS3Binding() *pausesnap.Record {
 	return &pausesnap.Record{
 		SandboxID: "sb-1", SnapshotID: "snap-1", NodeID: "node-a", NodeIP: "10.0.0.1",
-		Status: pausesnap.StatusReady, Backend: "s3", RemoteStatus: "ready",
+		Status: pausesnap.StatusReady, Backend: "s3", RemoteStatus: "ready", ExportUUIDs: `{"rootfs":"r","metadata":"m"}`,
 	}
 }
 
@@ -215,9 +215,9 @@ func TestPausedEvictionViewReportsPressureAndEligibility(t *testing.T) {
 	now := time.Now()
 	pausedEvictionBindingsFn = func(context.Context) ([]*pausesnap.Record, error) {
 		return []*pausesnap.Record{
-			{SandboxID: "ok", SnapshotID: "s1", NodeIP: "10.0.0.1", Status: "READY", Backend: "s3", RemoteStatus: "ready", UpdatedAt: now},
+			{SandboxID: "ok", SnapshotID: "s1", NodeIP: "10.0.0.1", Status: "READY", Backend: "s3", RemoteStatus: "ready", ExportUUIDs: `{"rootfs":"r","metadata":"m"}`, UpdatedAt: now},
 			{SandboxID: "cow", SnapshotID: "s2", NodeIP: "10.0.0.1", Status: "READY", Backend: "xfs", UpdatedAt: now},
-			{SandboxID: "gone", SnapshotID: "s3", NodeIP: "10.0.0.1", Status: "READY", Backend: "s3", RemoteStatus: "ready", EvictedAt: &now},
+			{SandboxID: "gone", SnapshotID: "s3", NodeIP: "10.0.0.1", Status: "READY", Backend: "s3", RemoteStatus: "ready", ExportUUIDs: `{"rootfs":"r","metadata":"m"}`, EvictedAt: &now},
 		}, nil
 	}
 	v := BuildPausedEvictionView(context.Background())

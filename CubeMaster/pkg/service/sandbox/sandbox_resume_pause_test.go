@@ -49,6 +49,7 @@ func TestPauseResumePlacementInputPinsHostMount(t *testing.T) {
 		SnapshotID:   "snap-1",
 		Backend:      "s3",
 		RemoteStatus: "ready",
+		ExportUUIDs:  `{"rootfs":"r","metadata":"m"}`,
 		NodeID:       "node-a",
 		NodeIP:       "10.0.0.1",
 	}
@@ -111,6 +112,7 @@ func TestResumePlacementCallsDecideWhenS3Ready(t *testing.T) {
 		SnapshotID:   "snap-1",
 		Backend:      "s3",
 		RemoteStatus: "ready",
+		ExportUUIDs:  `{"rootfs":"r","metadata":"m"}`,
 		NodeID:       "node-a",
 		NodeIP:       "10.0.0.1",
 	}, "cubebox", nil)

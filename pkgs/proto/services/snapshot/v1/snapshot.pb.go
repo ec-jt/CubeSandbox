@@ -98,8 +98,11 @@ type StatusResponse struct {
 	RemoteReady bool   `protobuf:"varint,6,opt,name=remote_ready,json=remoteReady,proto3" json:"remote_ready,omitempty"`
 	// Rootfs snapshot cubecow deletable: "true" | "false" | "" (unknown / N/A).
 	RootfsDeletable string `protobuf:"bytes,7,opt,name=rootfs_deletable,json=rootfsDeletable,proto3" json:"rootfs_deletable,omitempty"`
-	unknownFields   protoimpl.UnknownFields
-	sizeCache       protoimpl.SizeCache
+	// remote_uuids JSON ({"rootfs","memory","metadata"}) read from the native
+	// export identity of every role. Set only when remote_ready is true.
+	RemoteUuids   string `protobuf:"bytes,8,opt,name=remote_uuids,json=remoteUuids,proto3" json:"remote_uuids,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *StatusResponse) Reset() {
@@ -177,6 +180,13 @@ func (x *StatusResponse) GetRemoteReady() bool {
 func (x *StatusResponse) GetRootfsDeletable() string {
 	if x != nil {
 		return x.RootfsDeletable
+	}
+	return ""
+}
+
+func (x *StatusResponse) GetRemoteUuids() string {
+	if x != nil {
+		return x.RemoteUuids
 	}
 	return ""
 }
@@ -348,7 +358,7 @@ const file_services_snapshot_v1_snapshot_proto_rawDesc = "" +
 	"request_id\x18\x01 \x01(\tR\trequestId\x12\x1f\n" +
 	"\vsnapshot_id\x18\x02 \x01(\tR\n" +
 	"snapshotId\x12\x18\n" +
-	"\abackend\x18\x03 \x01(\tR\abackend\"\xe8\x01\n" +
+	"\abackend\x18\x03 \x01(\tR\abackend\"\x8b\x02\n" +
 	"\x0eStatusResponse\x12\x1d\n" +
 	"\n" +
 	"request_id\x18\x01 \x01(\tR\trequestId\x12\x1f\n" +
@@ -358,7 +368,8 @@ const file_services_snapshot_v1_snapshot_proto_rawDesc = "" +
 	"\x05state\x18\x04 \x01(\tR\x05state\x12\x18\n" +
 	"\amessage\x18\x05 \x01(\tR\amessage\x12!\n" +
 	"\fremote_ready\x18\x06 \x01(\bR\vremoteReady\x12)\n" +
-	"\x10rootfs_deletable\x18\a \x01(\tR\x0frootfsDeletable\"H\n" +
+	"\x10rootfs_deletable\x18\a \x01(\tR\x0frootfsDeletable\x12!\n" +
+	"\fremote_uuids\x18\b \x01(\tR\vremoteUuids\"H\n" +
 	"\vStatusQuery\x12\x1f\n" +
 	"\vsnapshot_id\x18\x01 \x01(\tR\n" +
 	"snapshotId\x12\x18\n" +

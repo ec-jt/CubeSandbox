@@ -444,3 +444,22 @@ func TestDecideCrossNodeFailsWhenQueryHasNoMatchingPeer(t *testing.T) {
 		t.Fatalf("want no-compatible-node, got %v", err)
 	}
 }
+
+func TestCanCrossNodeWithExportsRequiresReadyAndUUIDs(t *testing.T) {
+	cases := []struct {
+		backend, status, uuids string
+		want                   bool
+	}{
+		{"s3", "ready", `{"rootfs":"r"}`, true},
+		{"s3", "ready", "", false},
+		{"s3", "inprogress", "", false},
+		{"s3", "inprogress", `{"rootfs":"r"}`, false},
+		{"s3", "failed", `{"rootfs":"r"}`, false},
+		{"xfs", "ready", `{"rootfs":"r"}`, false},
+	}
+	for _, c := range cases {
+		if got := CanCrossNodeWithExports(c.backend, c.status, c.uuids); got != c.want {
+			t.Fatalf("%+v: got %v", c, got)
+		}
+	}
+}

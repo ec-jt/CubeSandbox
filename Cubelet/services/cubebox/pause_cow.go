@@ -506,7 +506,7 @@ func (s *service) updateWithPauseCow(
 		return failPause(errorcode.ErrorCode_Unknown, fmt.Sprintf("failed to expose shim spec dir: %v", err))
 	}
 
-	remoteUUIDsJSON, err := publishSnapshotPackage(workCtx, backend, &storage.SnapshotCatalogEntry{
+	exportPending, err := publishSnapshotPackage(workCtx, backend, &storage.SnapshotCatalogEntry{
 		SnapshotID:      snapID,
 		InstanceType:    "cubebox",
 		SpecDir:         specDir,
@@ -549,14 +549,11 @@ func (s *service) updateWithPauseCow(
 	// Always attach whatever volume ref events were observed — Detach may have
 	// succeeded (node 1→0) even when later cleanup fails. Master still needs
 	// to apply those deltas on an explicit Pause failure.
-	if remoteUUIDsJSON != "" {
-		if extInfo == nil {
-			extInfo = map[string][]byte{}
-		}
-		extInfo[storage.ExtInfoRemoteUUIDs] = []byte(remoteUUIDsJSON)
-	}
-	rsp.ExtInfo = extInfo
-	rsp.RemoteUuids = remoteUUIDsJSON
+	//
+	// S3 export is asynchronous (B15): no remote_uuids here. The pending flag
+	// tells Master to record remote_status=inprogress with empty uuids; the
+	// remotestatus reconciler fills them in once every role is DONE.
+	rsp.ExtInfo = remoteExportExtInfo(extInfo, exportPending)
 	if err != nil {
 		// Snapshot is on disk; do not wipe it. Master records FAILED (no Resume).
 		markLocalPauseFailed(sb, err)

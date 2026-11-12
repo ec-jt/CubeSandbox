@@ -100,6 +100,13 @@ func CanCrossNode(backend, remoteStatus string) bool {
 	return strings.EqualFold(strings.TrimSpace(remoteStatus), constants.RemoteStatusReady)
 }
 
+// CanCrossNodeWithExports additionally requires the export identities a
+// target node imports. With async export (B15) a row can be inprogress with
+// empty export_uuids; it must never leave the origin until both hold.
+func CanCrossNodeWithExports(backend, remoteStatus, exportUUIDs string) bool {
+	return CanCrossNode(backend, remoteStatus) && strings.TrimSpace(exportUUIDs) != ""
+}
+
 // Decide runs the §3.1 tree. Origin is returned whenever it can still take
 // the job (including when cross-node is allowed). Cross-node Select runs only
 // when origin cannot, PinToOrigin is false, and CanCrossNode is true.

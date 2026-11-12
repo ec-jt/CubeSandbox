@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"runtime/debug"
 	"strings"
+	"time"
 
 	"github.com/tencentcloud/CubeSandbox/Cubelet/pkg/constants"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/pkg/log"
@@ -298,7 +299,7 @@ func (s *service) CommitSandbox(ctx context.Context, req *cubebox.CommitSandboxR
 	// guest after every snapshot; legacy templates without the annotation keep
 	// the previous best-effort behavior of returning an empty version.
 	rsp.EnvdVersion = envdVersionFromCubeBox(cb)
-	remoteUUIDs, err := publishSnapshotPackage(ctx, backend, &storage.SnapshotCatalogEntry{
+	exportPending, err := publishSnapshotPackage(ctx, backend, &storage.SnapshotCatalogEntry{
 		SnapshotID:        rsp.TemplateID,
 		InstanceType:      "cubebox",
 		SpecDir:           specDir,
@@ -325,7 +326,8 @@ func (s *service) CommitSandbox(ctx context.Context, req *cubebox.CommitSandboxR
 		rsp.Ret.RetMsg = err.Error()
 		return rsp, nil
 	}
-	rsp.RemoteUuids = remoteUUIDs
+	// S3 export runs asynchronously (B15); Master fills export_uuids later.
+	rsp.RemoteExportPending = exportPending
 	stepLog.Infof("CommitSandbox completed successfully: snapshotPath=%s", snapshotPath)
 	return rsp, nil
 }
@@ -623,7 +625,14 @@ var (
 	cleanupReleaseS3Metadata   = storage.ReleaseS3MetadataVolume
 	cleanupObjectsFor          = storage.CleanupObjectsFor
 	cleanupTemplateLocalDataFn = storage.CleanupTemplateLocalData
+	stopSnapshotExportFn       = storage.StopSnapshotExport
 )
+
+// cleanupExportStopTimeout bounds how long cleanup waits for the async export
+// worker to leave a native call on the package. Native export_snapshot and
+// get_volume_info calls are short; the long part of an export is waiting,
+// which the worker abandons as soon as it sees the fence.
+const cleanupExportStopTimeout = 30 * time.Second
 
 // cleanupTemplate removes a catalog package. honorLivePauseKeep is true for
 // the Master RPC: Resume still needs the pause catalog (XFS mmap, S3
@@ -700,6 +709,19 @@ func (s *service) cleanupTemplate(ctx context.Context, req *cubebox.CleanupTempl
 	// one stopped. Objects already gone count as cleaned, so a Resume that
 	// consumed the pause package still drops the dir here.
 	if cleanupIsCowBackend() {
+		// Fence the async S3 export (B15) before any object is deleted, and wait
+		// until the worker is out of its native call for this package. A wait
+		// that is cut short is retryable: nothing has been deleted yet.
+		if storage.IsS3Backend(backend) {
+			stopCtx, stopCancel := context.WithTimeout(ctx, cleanupExportStopTimeout)
+			err := stopSnapshotExportFn(stopCtx, rsp.TemplateID)
+			stopCancel()
+			if err != nil {
+				rsp.Ret.RetCode = errorcode.ErrorCode_Unknown
+				rsp.Ret.RetMsg = fmt.Sprintf("retryable: async export still active: %v", err)
+				return rsp, nil
+			}
+		}
 		if err := cleanupReleaseS3Metadata(ctx, backend, rsp.TemplateID); err != nil {
 			log.G(ctx).Warnf("CleanupTemplate %s: s3 metadata umount: %v", rsp.TemplateID, err)
 		}

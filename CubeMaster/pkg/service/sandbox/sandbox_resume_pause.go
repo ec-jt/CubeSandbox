@@ -124,16 +124,20 @@ func pauseSandbox(ctx context.Context, req *types.UpdateRequest, hostIP string) 
 
 	released := volrefcount.ReleasedVolumeIDs(cubeRsp.GetExtInfo())
 	exportUUIDs := ""
+	exportPending := false
 	if constants.IsS3Backend(req.Backend) {
 		exportUUIDs = strings.TrimSpace(cubeRsp.GetRemoteUuids())
 		if exportUUIDs == "" {
 			exportUUIDs = remoteUUIDsFromExtInfo(cubeRsp.GetExtInfo())
 		}
-		// Empty uuids means export failed or still pending on Cubelet.
-		// Pause itself succeeded — same-node Resume does not need uuids;
-		// Complete records remote_status=failed when uuids are empty.
+		// B15 Cubelets export asynchronously and say so with the pending flag:
+		// remote_status=inprogress with empty uuids until the reconciler sees
+		// every role DONE. Legacy Cubelets send uuids (inprogress) or nothing
+		// (export failed -> remote_status=failed). Either way Pause succeeded
+		// and same-node Resume does not need uuids.
+		exportPending = remoteExportPendingFromExtInfo(cubeRsp.GetExtInfo())
 	}
-	if err := pausesnap.Complete(ctx, req.SandboxID, snapID, nodeID, hostIP, req.InstanceType, released, exportUUIDs); err != nil {
+	if err := pausesnap.CompleteWithExport(ctx, req.SandboxID, snapID, nodeID, hostIP, req.InstanceType, released, exportUUIDs, exportPending); err != nil {
 		pausesnap.MarkFailed(ctx, req.SandboxID, snapID, err.Error())
 		rsp.Ret.RetCode = int(errorcode.ErrorCode_ReqCubeAPIFailed)
 		rsp.Ret.RetMsg = fmt.Sprintf("pause ok on cubelet but master meta failed: %v", err)
@@ -196,7 +200,9 @@ func recoverTimedOutPauseForResume(ctx context.Context, req *types.UpdateRequest
 	log.G(ctx).Warnf("resume: healing timed-out pause binding sandbox=%s snap=%s host=%s (cubelet PAUSED; no ext_info)",
 		req.SandboxID, rec.SnapshotID, probeIP)
 	// No ApplyFromExtInfo: timeout means Master never saw volume events.
-	if err := pausesnap.Complete(ctx, req.SandboxID, rec.SnapshotID, nodeID, probeIP, req.InstanceType, nil, rec.ExportUUIDs); err != nil {
+	// Keep an already-inprogress async export open (B15); otherwise legacy.
+	pending := strings.EqualFold(strings.TrimSpace(rec.RemoteStatus), constants.RemoteStatusInProgress)
+	if err := pausesnap.CompleteWithExport(ctx, req.SandboxID, rec.SnapshotID, nodeID, probeIP, req.InstanceType, nil, rec.ExportUUIDs, pending); err != nil {
 		return nil, fmt.Errorf("cannot resume: pause timeout heal complete failed: %w", err)
 	}
 	healed, err := pausesnap.GetBySandbox(ctx, req.SandboxID)
@@ -634,14 +640,15 @@ func resolvePauseHostIP(ctx context.Context, sandboxID string) (string, bool) {
 // cross-node source-quiesced gate.
 func resumePlacement(ctx context.Context, rec *pausesnap.Record, instanceType string, createReq *types.CreateCubeSandboxReq) (*restoreplace.Placement, error) {
 	in := pauseResumePlacementInput(rec, instanceType, createReq)
+	crossNodeOK := restoreplace.CanCrossNodeWithExports(in.Backend, in.RemoteStatus, rec.ExportUUIDs)
 	if rec.Evicted() {
-		if in.PinToOrigin || !restoreplace.CanCrossNode(in.Backend, in.RemoteStatus) {
+		if in.PinToOrigin || !crossNodeOK {
 			return nil, fmt.Errorf("evicted sandbox %s cannot be restored: checkpoint is not cross-node restorable", rec.SandboxID)
 		}
 		in.ExcludeOrigin = true
 		return decidePauseResumePlacementFn(ctx, in)
 	}
-	if in.PinToOrigin || !restoreplace.CanCrossNode(in.Backend, in.RemoteStatus) {
+	if in.PinToOrigin || !crossNodeOK {
 		return homeResumePlacement(rec), nil
 	}
 	return decidePauseResumePlacementFn(ctx, in)
@@ -694,7 +701,16 @@ func pauseResumePlacementInput(rec *pausesnap.Record, instanceType string, creat
 	return in
 }
 
-const extInfoRemoteUUIDs = "remote_uuids"
+const (
+	extInfoRemoteUUIDs         = "remote_uuids"
+	extInfoRemoteExportPending = "remote_export_pending"
+)
+
+// remoteExportPendingFromExtInfo reads the B15 Cubelet signal that the S3
+// export runs asynchronously. Absent on legacy Cubelets.
+func remoteExportPendingFromExtInfo(extInfo map[string][]byte) bool {
+	return strings.EqualFold(strings.TrimSpace(string(extInfo[extInfoRemoteExportPending])), "true")
+}
 
 func remoteUUIDsFromExtInfo(extInfo map[string][]byte) string {
 	if len(extInfo) == 0 {

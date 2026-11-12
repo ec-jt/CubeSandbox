@@ -375,16 +375,12 @@ func runSnapshotCreateJob(ctx context.Context, jobID, sandboxID, nodeID, nodeIP 
 		"rootfs_size_bytes_at_snapshot": commitRsp.GetRootfsSizeBytes(),
 	}
 	if constants.IsS3Backend(commitBackend) {
-		raw := strings.TrimSpace(commitRsp.GetRemoteUuids())
-		if raw != "" {
-			snapUpdates["export_uuids"] = raw
-			snapUpdates["remote_status"] = constants.RemoteStatusInProgress
-		} else {
-			// Commit succeeded for the customer; export failed or returned
-			// empty — same-node restore still works, cross-node does not.
-			snapUpdates["export_uuids"] = ""
-			snapUpdates["remote_status"] = constants.RemoteStatusFailed
-		}
+		// Legacy Cubelets return accepted uuids (inprogress) or nothing
+		// (export failed: same-node restore works, cross-node does not). B15
+		// Cubelets export asynchronously: remote_export_pending keeps the row
+		// inprogress with empty uuids until the reconciler fills them.
+		snapUpdates["export_uuids"], snapUpdates["remote_status"] = constants.CompletionRemoteState(
+			commitRsp.GetRemoteUuids(), commitRsp.GetRemoteExportPending())
 	}
 	if err := updateSnapshotFields(ctx, snapshotID, snapUpdates); err != nil {
 		return failSnapshotCreateJob(ctx, jobID, snapshotID, nodeIP, snapshotPath, commitRsp, err, commitBackend)

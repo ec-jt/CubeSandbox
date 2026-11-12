@@ -105,6 +105,13 @@ func (s *service) statusOne(ctx context.Context, requestID, snapshotID, rawBacke
 		rsp.Message = st.RemoteUUIDs.JSON()
 	}
 	rsp.RemoteReady = rsp.State == cow.RemoteStateReady
+	// Async export (B15): Master learns the export identities only from here.
+	// Publish them only when ready and complete, so a partial set can never
+	// be mistaken for a restorable package.
+	if rsp.RemoteReady && st.RemoteUUIDs != nil &&
+		strings.TrimSpace(st.RemoteUUIDs.Rootfs) != "" && strings.TrimSpace(st.RemoteUUIDs.Metadata) != "" {
+		rsp.RemoteUuids = st.RemoteUUIDs.JSON()
+	}
 	if st.RootfsDeletable != nil {
 		if *st.RootfsDeletable {
 			rsp.RootfsDeletable = "true"

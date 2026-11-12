@@ -5,7 +5,6 @@
 package cubebox
 
 import (
-	"context"
 	"fmt"
 	"strings"
 
@@ -13,25 +12,24 @@ import (
 	"github.com/tencentcloud/CubeSandbox/Cubelet/storage/cow"
 )
 
-// uploadRemoteUUIDsIfS3 runs cubecow_export_snapshot (via UploadSnapshot)
-// after Pause / CommitSandbox has already sealed package disks to
-// snapshots. Templates (AppSnapshot) do not export. XFS is a no-op.
-// Export acceptance is not remote readiness. The caller must propagate errors;
-// Master keeps accepted exports inprogress until status polling proves DONE.
-func uploadRemoteUUIDsIfS3(ctx context.Context, backend, snapshotID string) (string, error) {
+// scheduleRemoteExportIfS3 hands a sealed S3 package to the asynchronous
+// export worker (B15) after Pause / CommitSandbox sealed it locally. It never
+// waits for S3. Templates (AppSnapshot) do not export. XFS is a no-op and
+// reports no pending export. The returned flag is what the RPC response
+// carries so Master records remote_status=inprogress with empty export_uuids.
+func scheduleRemoteExportIfS3(backend, snapshotID string) (bool, error) {
 	normalized, err := cow.NormalizeBackend(backend)
 	if err != nil {
-		return "", err
+		return false, err
 	}
 	if normalized != cow.BackendS3 {
-		return "", nil
+		return false, nil
 	}
-	uuids, err := storage.UploadSnapshot(ctx, normalized, snapshotID)
-	if err != nil {
-		return "", err
-	}
-	return acceptedSnapshotUUIDs(uuids)
+	return scheduleSnapshotExportFn(normalized, snapshotID)
 }
+
+// scheduleSnapshotExportFn is swapped in tests.
+var scheduleSnapshotExportFn = storage.ScheduleSnapshotExport
 
 func acceptedSnapshotUUIDs(uuids *cow.RemoteUUIDs) (string, error) {
 	if uuids == nil || strings.TrimSpace(uuids.Rootfs) == "" || strings.TrimSpace(uuids.Memory) == "" || strings.TrimSpace(uuids.Metadata) == "" {

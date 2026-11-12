@@ -298,8 +298,9 @@ func (m *S3Cow) UploadStatus(ctx context.Context, snapshotID string) (*cow.Remot
 
 	switch {
 	case anyFailed:
-		st.State = cow.RemoteStateFailed
-		st.Message = strings.Join(messages, "; ")
+		// A native FAILED role (for example a flusher drain timeout) is only
+		// terminal once the async export worker gave up (B15).
+		st.State, st.Message = asyncExportFailedState(id, strings.Join(messages, "; "))
 	case allDone:
 		committed, err := m.commitCheckpoint(ctx, id)
 		if err != nil {
@@ -320,11 +321,68 @@ func (m *S3Cow) UploadStatus(ctx context.Context, snapshotID string) (*cow.Remot
 	case anyNone:
 		st.State = cow.RemoteStatePending
 		st.Message = "export_status NONE"
+		if state, msg, ok := asyncExportPendingState(id); ok {
+			st.State, st.Message = state, msg
+		}
 	default:
 		st.State = cow.RemoteStateRunning
 		st.Message = "export in progress"
 	}
 	return st, nil
+}
+
+// asyncExportFailedState maps a native FAILED role. While the async worker is
+// retrying, or a sealed package can still be (re)queued, report running so
+// Master keeps remote_status inprogress. Only a worker give-up is failed.
+func asyncExportFailedState(id, native string) (string, string) {
+	tracked, terminal, why := snapshotExportTracked(id)
+	switch {
+	case terminal:
+		return cow.RemoteStateFailed, strings.TrimSpace(native + "; " + why)
+	case tracked:
+		return cow.RemoteStateRunning, "export retrying: " + native
+	}
+	if requeueSealedExport(id) {
+		return cow.RemoteStateRunning, "export requeued: " + native
+	}
+	return cow.RemoteStateFailed, native
+}
+
+// asyncExportPendingState handles roles still at NONE: a terminal give-up is
+// failed; an untracked sealed package (for example right after a restart,
+// before the resume scan) is requeued.
+func asyncExportPendingState(id string) (string, string, bool) {
+	tracked, terminal, why := snapshotExportTracked(id)
+	switch {
+	case terminal:
+		return cow.RemoteStateFailed, why, true
+	case tracked:
+		return cow.RemoteStateRunning, "export queued", true
+	}
+	if requeueSealedExport(id) {
+		return cow.RemoteStateRunning, "export requeued", true
+	}
+	return "", "", false
+}
+
+// requeueSealedExport self-heals a sealed exportable package the worker is not
+// tracking. Never for a package under cleanup or after a terminal give-up.
+func requeueSealedExport(id string) bool {
+	if exportCleanupRequested(id) {
+		return false
+	}
+	if failed, _ := exportFailedMarker(id); failed {
+		return false
+	}
+	entry, err := GetLocalSnapshotFor(context.Background(), cow.BackendS3, id)
+	if err != nil || entry == nil || !exportableCatalogKind(entry.Kind) {
+		return false
+	}
+	if sealed, _ := snapshotPackageSealedForExport(id); !sealed {
+		return false
+	}
+	defaultExportWorker().enqueue(id)
+	return true
 }
 
 func (m *S3Cow) setUpload(id, state, message string, uuids *cow.RemoteUUIDs) {

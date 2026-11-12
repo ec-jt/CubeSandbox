@@ -42,8 +42,10 @@ func persistCapturedLineage(cb *cubeboxstore.CubeBox, snapshotID string, sync fu
 }
 
 // publishCapturedSnapshot stops on the first failure. It acknowledges local
-// sealing and remote export acceptance only, never remote export completion.
-func publishCapturedSnapshot(persist, seal func() error, upload func() (string, error)) (string, error) {
+// capture persistence and sealing only. Remote export is handed to the async
+// export worker afterwards and never gates the result (B15): scheduling is a
+// local, in-memory hand-off whose only failure mode is an invalid backend.
+func publishCapturedSnapshot(persist, seal func() error, schedule func() (bool, error)) (bool, error) {
 	for _, step := range []struct {
 		name string
 		run  func() error
@@ -51,14 +53,14 @@ func publishCapturedSnapshot(persist, seal func() error, upload func() (string, 
 		{"catalog persistence", persist}, {"package finalization", seal},
 	} {
 		if err := step.run(); err != nil {
-			return "", fmt.Errorf("%s: %w", step.name, err)
+			return false, fmt.Errorf("%s: %w", step.name, err)
 		}
 	}
-	raw, err := upload()
+	pending, err := schedule()
 	if err != nil {
-		return "", fmt.Errorf("remote export acceptance: %w", err)
+		return false, fmt.Errorf("schedule remote export: %w", err)
 	}
-	return raw, nil
+	return pending, nil
 }
 
 // isPreCaptureRuntimeRefusal reports whether the runtime rejected a capture
@@ -129,17 +131,31 @@ func (s *service) snapshotPackageRetentionError(snapshotID string) error {
 	return nil
 }
 
-func publishSnapshotPackage(ctx context.Context, backend string, entry *storage.SnapshotCatalogEntry, sandbox string, generation uint32) (string, error) {
+// publishSnapshotPackage returns whether an asynchronous S3 export is pending.
+func publishSnapshotPackage(ctx context.Context, backend string, entry *storage.SnapshotCatalogEntry, sandbox string, generation uint32) (bool, error) {
 	// This is pre-publication capture evidence, not a committed export receipt.
 	if err := storage.PrepareCheckpointDiskBinding(ctx, entry, sandbox, generation); err != nil {
-		return "", fmt.Errorf("prepare checkpoint disk binding: %w", err)
+		return false, fmt.Errorf("prepare checkpoint disk binding: %w", err)
 	}
 	if storage.IsS3Backend(backend) && entry.DiskBinding.NativeRootfsUUID == "" {
-		return "", fmt.Errorf("capture requires native rootfs snapshot identity")
+		return false, fmt.Errorf("capture requires native rootfs snapshot identity")
 	}
 	return publishCapturedSnapshot(
 		func() error { return storage.WriteSnapshotCatalogFor(backend, entry) },
 		func() error { return storage.FinalizeS3PackageSnapshots(ctx, backend, entry.SnapshotID) },
-		func() (string, error) { return uploadRemoteUUIDsIfS3(ctx, backend, entry.SnapshotID) },
+		func() (bool, error) { return scheduleRemoteExportIfS3(backend, entry.SnapshotID) },
 	)
+}
+
+// remoteExportExtInfo stamps the pending flag Master reads to record
+// remote_status=inprogress with empty export_uuids.
+func remoteExportExtInfo(ext map[string][]byte, pending bool) map[string][]byte {
+	if !pending {
+		return ext
+	}
+	if ext == nil {
+		ext = map[string][]byte{}
+	}
+	ext[storage.ExtInfoRemoteExportPending] = []byte("true")
+	return ext
 }

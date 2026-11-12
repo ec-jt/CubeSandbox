@@ -37,6 +37,9 @@ message StatusResponse {
   bool remote_ready = 6;
   // Rootfs snapshot cubecow deletable: "true" | "false" | "" (unknown / N/A).
   string rootfs_deletable = 7;
+  // remote_uuids JSON ({"rootfs","memory","metadata"}) read from the native
+  // export identity of every role. Set only when remote_ready is true.
+  string remote_uuids = 8;
 }
 
 message StatusQuery {

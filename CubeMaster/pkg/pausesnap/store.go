@@ -223,6 +223,16 @@ func Begin(ctx context.Context, sandboxID, nodeID, nodeIP, instanceType, backend
 // mean export failed — remote_status=failed so CanCrossNode stays false while
 // same-node Resume still works. CubeMaster does not query Cubelet here.
 func Complete(ctx context.Context, sandboxID, snapshotID, nodeID, nodeIP, instanceType string, pluginVolumeIDs []string, exportUUIDs string) error {
+	return CompleteWithExport(ctx, sandboxID, snapshotID, nodeID, nodeIP, instanceType, pluginVolumeIDs, exportUUIDs, false)
+}
+
+// CompleteWithExport is Complete plus the async-export signal (B15). With
+// exportPending and empty uuids, the S3 row goes to remote_status=inprogress
+// with empty export_uuids; the remotestatus reconciler fills the uuids and
+// flips it to ready once Cubelet reports every role DONE. Non-empty uuids keep
+// the legacy meaning (accepted, inprogress); empty uuids without the flag
+// keep meaning export failed. Cross-node restore stays refused until ready.
+func CompleteWithExport(ctx context.Context, sandboxID, snapshotID, nodeID, nodeIP, instanceType string, pluginVolumeIDs []string, exportUUIDs string, exportPending bool) error {
 	client := getDB()
 	if client == nil {
 		return ErrNotReady
@@ -252,13 +262,7 @@ func Complete(ctx context.Context, sandboxID, snapshotID, nodeID, nodeIP, instan
 		return err
 	}
 	if constants.IsS3Backend(existing.Backend) {
-		if raw := strings.TrimSpace(exportUUIDs); raw != "" {
-			updates["export_uuids"] = raw
-			updates["remote_status"] = constants.RemoteStatusInProgress
-		} else {
-			updates["export_uuids"] = ""
-			updates["remote_status"] = constants.RemoteStatusFailed
-		}
+		updates["export_uuids"], updates["remote_status"] = constants.CompletionRemoteState(exportUUIDs, exportPending)
 	}
 	res := client.WithContext(ctx).Table(constants.PauseSnapshotTableName).
 		Where("snapshot_id = ? AND sandbox_id = ?", snapshotID, sandboxID).
@@ -304,6 +308,47 @@ func MarkFailed(ctx context.Context, sandboxID, snapshotID, errMsg string) {
 	if res.Error != nil {
 		log.G(ctx).Warnf("pausesnap.MarkFailed sandbox=%s snap=%s: %v", sandboxID, snapshotID, res.Error)
 	}
+}
+
+// ReconcileFailedToReady flips a FAILED pause binding to READY after the
+// origin Cubelet confirmed (publication reconcile) that the package is sealed
+// and the sandbox is PAUSED. Guarded on status=FAILED so it never overrides a
+// concurrent transition. S3 rows go to remote_status=inprogress with empty
+// export_uuids (async export); the reconciler fills the uuids. Returns whether
+// a row changed.
+func ReconcileFailedToReady(ctx context.Context, sandboxID, snapshotID string, pluginVolumeIDs []string) (bool, error) {
+	client := getDB()
+	if client == nil {
+		return false, ErrNotReady
+	}
+	ctx = context.WithoutCancel(ctx)
+	var existing models.PauseSnapshotRecord
+	if err := client.WithContext(ctx).Table(constants.PauseSnapshotTableName).
+		Where("snapshot_id = ? AND sandbox_id = ?", snapshotID, sandboxID).
+		First(&existing).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return false, fmt.Errorf("%w: %s", ErrNotFound, snapshotID)
+		}
+		return false, err
+	}
+	updates := map[string]any{
+		"status":     statusReady,
+		"last_error": "",
+		"updated_at": gorm.Expr("CURRENT_TIMESTAMP"),
+	}
+	if raw, err := json.Marshal(uniqueNonEmpty(pluginVolumeIDs)); err == nil && len(pluginVolumeIDs) > 0 {
+		updates["plugin_volume_ids"] = string(raw)
+	}
+	if constants.IsS3Backend(existing.Backend) {
+		updates["export_uuids"], updates["remote_status"] = constants.CompletionRemoteState(existing.ExportUUIDs, true)
+	}
+	res := client.WithContext(ctx).Table(constants.PauseSnapshotTableName).
+		Where("snapshot_id = ? AND sandbox_id = ? AND status = ?", snapshotID, sandboxID, statusFailed).
+		Updates(updates)
+	if res.Error != nil {
+		return false, res.Error
+	}
+	return res.RowsAffected > 0, nil
 }
 
 // MarkDeleteFailed records that Delete tore down the sandbox but could not

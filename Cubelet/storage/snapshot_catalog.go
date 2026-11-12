@@ -88,6 +88,12 @@ type SnapshotCatalogEntry struct {
 // ExtInfoRemoteUUIDs is the Update/Pause ext_info key carrying remote_uuids JSON.
 const ExtInfoRemoteUUIDs = "remote_uuids"
 
+// ExtInfoRemoteExportPending is the Update/Pause ext_info key ("true") saying
+// the package is sealed locally and its S3 export runs asynchronously. Master
+// records remote_status=inprogress with empty export_uuids and fills the
+// uuids from Snapshot.Status once ready. Distinct from an export failure.
+const ExtInfoRemoteExportPending = "remote_export_pending"
+
 // Catalog entry kinds. See SnapshotCatalogEntry.Kind.
 const (
 	// CatalogKindRuntimeSnapshot is produced by CommitSandbox (taking a

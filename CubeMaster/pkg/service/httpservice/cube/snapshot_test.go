@@ -417,7 +417,7 @@ func TestBindSnapshotCreateReplicaPinsRawHostMountToOrigin(t *testing.T) {
 	getSnapshotRestoreSourceFn = func(context.Context, string) (*templatecenter.RestoreSource, error) {
 		return &templatecenter.RestoreSource{
 			SnapshotID: "snap-1", Backend: constants.SnapshotBackendS3,
-			RemoteStatus: constants.RemoteStatusReady, OriginNodeID: "node-a", OriginNodeIP: "10.0.0.1",
+			RemoteStatus: constants.RemoteStatusReady, ExportUUIDs: `{"rootfs":"r","metadata":"m"}`, OriginNodeID: "node-a", OriginNodeIP: "10.0.0.1",
 		}, nil
 	}
 	decideRestorePlacementFn = func(_ context.Context, in restoreplace.Input) (*restoreplace.Placement, error) {
@@ -447,7 +447,7 @@ func TestBindSnapshotCreateReplicaAllowsPluginVolumeCrossNode(t *testing.T) {
 	getSnapshotRestoreSourceFn = func(context.Context, string) (*templatecenter.RestoreSource, error) {
 		return &templatecenter.RestoreSource{
 			SnapshotID: "snap-1", Backend: constants.SnapshotBackendS3,
-			RemoteStatus: constants.RemoteStatusReady, OriginNodeID: "node-a", OriginNodeIP: "10.0.0.1",
+			RemoteStatus: constants.RemoteStatusReady, ExportUUIDs: `{"rootfs":"r","metadata":"m"}`, OriginNodeID: "node-a", OriginNodeIP: "10.0.0.1",
 		}, nil
 	}
 	decideRestorePlacementFn = func(_ context.Context, in restoreplace.Input) (*restoreplace.Placement, error) {
@@ -754,7 +754,7 @@ func TestFromSnapshotPlacementSourceIdentityFromSnapshotOrigin(t *testing.T) {
 	}
 	src := &templatecenter.RestoreSource{
 		SnapshotID: "snap-1", Backend: constants.SnapshotBackendS3,
-		RemoteStatus: constants.RemoteStatusReady, OriginSandboxID: " sb-origin ",
+		RemoteStatus: constants.RemoteStatusReady, ExportUUIDs: `{"rootfs":"r","metadata":"m"}`, OriginSandboxID: " sb-origin ",
 		OriginNodeID: "node-a", OriginNodeIP: "10.0.0.1",
 	}
 	req := &types.CreateCubeSandboxReq{InsId: "new-instance"}

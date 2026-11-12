@@ -129,6 +129,67 @@ func TestBeginCompletePersistsBackendAndRemoteStatus(t *testing.T) {
 	require.Error(t, err)
 }
 
+// B15: a Cubelet that exports asynchronously reports the pending flag with no
+// uuids. The row is inprogress with empty export_uuids, not failed.
+func TestCompleteWithExportPendingIsInProgress(t *testing.T) {
+	setupPauseDeleteTest(t)
+	ctx := context.Background()
+	snapID, err := Begin(ctx, "sb-async", "node-1", "10.0.0.9", "cubebox", "s3")
+	require.NoError(t, err)
+	require.NoError(t, CompleteWithExport(ctx, "sb-async", snapID, "node-1", "10.0.0.9", "cubebox", nil, "", true))
+	ready, err := GetBySnapshotID(ctx, snapID)
+	require.NoError(t, err)
+	require.Equal(t, statusReady, ready.Status)
+	require.Equal(t, constants.RemoteStatusInProgress, ready.RemoteStatus)
+	require.Empty(t, ready.ExportUUIDs)
+
+	// Old Cubelet (uuids, no flag) and an explicit failure keep legacy meaning.
+	snap2, err := Begin(ctx, "sb-old", "node-1", "10.0.0.9", "cubebox", "s3")
+	require.NoError(t, err)
+	require.NoError(t, CompleteWithExport(ctx, "sb-old", snap2, "node-1", "10.0.0.9", "cubebox", nil, `{"rootfs":"r"}`, false))
+	old, err := GetBySnapshotID(ctx, snap2)
+	require.NoError(t, err)
+	require.Equal(t, constants.RemoteStatusInProgress, old.RemoteStatus)
+	require.Equal(t, `{"rootfs":"r"}`, old.ExportUUIDs)
+
+	// XFS rows ignore the flag entirely.
+	snap3, err := Begin(ctx, "sb-xfs", "node-1", "10.0.0.9", "cubebox", "xfs")
+	require.NoError(t, err)
+	require.NoError(t, CompleteWithExport(ctx, "sb-xfs", snap3, "node-1", "10.0.0.9", "cubebox", nil, "", true))
+	xfs, err := GetBySnapshotID(ctx, snap3)
+	require.NoError(t, err)
+	require.Empty(t, xfs.RemoteStatus)
+}
+
+func TestReconcileFailedToReadyOnlyFromFailed(t *testing.T) {
+	db := setupPauseDeleteTest(t)
+	ctx := context.Background()
+	snapID, err := Begin(ctx, "sb-held", "node-1", "10.0.0.9", "cubebox", "s3")
+	require.NoError(t, err)
+	// CREATING is not reconcilable.
+	changed, err := ReconcileFailedToReady(ctx, "sb-held", snapID, nil)
+	require.NoError(t, err)
+	require.False(t, changed)
+	MarkFailed(ctx, "sb-held", snapID, "remote export acceptance: settle rootfs: context deadline exceeded")
+	changed, err = ReconcileFailedToReady(ctx, "sb-held", snapID, []string{"vol-a"})
+	require.NoError(t, err)
+	require.True(t, changed)
+	rec, err := GetBySnapshotID(ctx, snapID)
+	require.NoError(t, err)
+	require.Equal(t, statusReady, rec.Status)
+	require.Empty(t, rec.LastError)
+	require.Equal(t, constants.RemoteStatusInProgress, rec.RemoteStatus)
+	require.Empty(t, rec.ExportUUIDs)
+	require.Equal(t, []string{"vol-a"}, rec.PluginVolumeIDs)
+	// Idempotent: already READY changes nothing.
+	changed, err = ReconcileFailedToReady(ctx, "sb-held", snapID, nil)
+	require.NoError(t, err)
+	require.False(t, changed)
+	_, err = ReconcileFailedToReady(ctx, "sb-held", "snap-missing", nil)
+	require.ErrorIs(t, err, ErrNotFound)
+	_ = db
+}
+
 func TestTryDeletePausedNoBinding(t *testing.T) {
 	setupPauseDeleteTest(t)
 	destroys, cleans := mockCubeletOK(t)
