@@ -35,12 +35,32 @@
 #include "spdk/queue.h"
 #include "spdk/thread.h"
 #include "spdk/util.h"
+#include "spdk/string.h"
 
 #include "s3lvol/s3_flusher.h"
 #include "s3lvol/s3_wal.h"
 
+struct flush_req;
+
+/* Diagnostics only (B16): how often each recently failed chunk has failed, so
+ * the drain-timeout dump can say "attempt N". A small ring, not a map: only the
+ * chunks that are failing right now matter, and losing an old entry costs a
+ * log number, nothing else. */
+#define FLUSHER_TRACE_FAIL_SLOTS 32
+
+struct flusher_fail_slot {
+	uint64_t chunk_index;
+	uint32_t failures;
+	bool     used;
+};
+
 struct s3_flusher {
 	struct s3_overlay          *overlay;
+
+	/* Uploads in flight, for the drain-timeout dump. Log only. */
+	TAILQ_HEAD(, flush_req)     inflight_reqs;
+	struct flusher_fail_slot    fail_slots[FLUSHER_TRACE_FAIL_SLOTS];
+	uint32_t                    fail_next;
 
 	/* Optional: without a WAL there is nothing to truncate, which is the
 	 * mode the unit test uses. */
@@ -94,7 +114,57 @@ struct s3_flusher {
 struct flush_req {
 	struct s3_flusher              *flusher;
 	struct s3_overlay_flush_view    view;
+
+	/* Diagnostics only. */
+	uint64_t                        start_tsc;
+	uint32_t                        attempt;
+	TAILQ_ENTRY(flush_req)          link;
 };
+
+static struct flusher_fail_slot *
+flusher_fail_slot(struct s3_flusher *f, uint64_t chunk_index, bool create)
+{
+	uint32_t i;
+
+	for (i = 0; i < FLUSHER_TRACE_FAIL_SLOTS; i++) {
+		if (f->fail_slots[i].used && f->fail_slots[i].chunk_index == chunk_index) {
+			return &f->fail_slots[i];
+		}
+	}
+	if (!create) {
+		return NULL;
+	}
+	i = f->fail_next++ % FLUSHER_TRACE_FAIL_SLOTS;
+	f->fail_slots[i].used = true;
+	f->fail_slots[i].chunk_index = chunk_index;
+	f->fail_slots[i].failures = 0;
+	return &f->fail_slots[i];
+}
+
+static uint64_t
+flusher_age_ms(uint64_t start_tsc)
+{
+	uint64_t now = spdk_get_ticks();
+
+	return now > start_tsc ? (uint64_t)((now - start_tsc) * 1000 / spdk_get_ticks_hz()) : 0;
+}
+
+/* One line per upload still in flight when a drain gives up. Bounded by
+ * max_concurrent (8 by default), so at most a handful of lines per timeout. */
+static void
+flusher_dump_inflight(struct s3_flusher *f)
+{
+	struct flush_req *req;
+
+	TAILQ_FOREACH(req, &f->inflight_reqs, link) {
+		SPDK_WARNLOG("  in-flight upload: chunk=%" PRIu64 " age_ms=%" PRIu64
+			     " attempt=%u blocks=%u bytes<=%u covers_prefix=%d "
+			     "max_seq=%" PRIu64 "\n", req->view.chunk_index,
+			     flusher_age_ms(req->start_tsc), req->attempt,
+			     req->view.nblocks, req->view.end_offset,
+			     (int)req->view.covers_prefix, req->view.max_seq);
+	}
+}
 
 static void flusher_check_drain(struct s3_flusher *f);
 static void flusher_check_retire(struct s3_flusher *f);
@@ -185,14 +255,34 @@ flusher_upload_done(void *cb_arg, int status)
 
 	assert(f->in_flight > 0);
 	f->in_flight--;
+	TAILQ_REMOVE(&f->inflight_reqs, req, link);
 
 	if (status == 0) {
+		struct flusher_fail_slot *slot = flusher_fail_slot(f, chunk_index, false);
+
 		f->stats.chunks_flushed++;
 		f->stats.blocks_flushed += req->view.nblocks;
+		if (slot) {
+			if (slot->failures > 0) {
+				SPDK_NOTICELOG("Chunk %" PRIu64 " flushed on attempt %u "
+					       "after %u failure(s), %" PRIu64 " ms\n",
+					       chunk_index, req->attempt, slot->failures,
+					       flusher_age_ms(req->start_tsc));
+			}
+			slot->used = false;
+		}
 	} else {
+		struct flusher_fail_slot *slot = flusher_fail_slot(f, chunk_index, true);
+
+		slot->failures++;
 		f->stats.failures++;
-		SPDK_ERRLOG("Failed to flush chunk %" PRIu64 " to S3: %d "
-			    "(kept dirty, will retry)\n", chunk_index, status);
+		/* The transport/HTTP cause is on the "S3 <op> failed" line logged
+		 * by the client just before this one, with the same key. */
+		SPDK_ERRLOG("Failed to flush chunk %" PRIu64 " to S3: %d (%s) after "
+			    "%" PRIu64 " ms, attempt %u, %u failure(s) so far, %u "
+			    "block(s) (kept dirty, will retry)\n", chunk_index, status,
+			    spdk_strerror(-status), flusher_age_ms(req->start_tsc),
+			    req->attempt, slot->failures, req->view.nblocks);
 	}
 
 	/* Releases the claimed blocks on success, or re-dirties and re-queues
@@ -240,6 +330,13 @@ flusher_start_one(struct s3_flusher *f, uint64_t chunk_index)
 
 	f->in_flight++;
 	f->stats.rounds++;
+	req->start_tsc = spdk_get_ticks();
+	{
+		struct flusher_fail_slot *slot = flusher_fail_slot(f, chunk_index, false);
+
+		req->attempt = 1 + (slot ? slot->failures : 0);
+	}
+	TAILQ_INSERT_TAIL(&f->inflight_reqs, req, link);
 
 	f->upload_fn(f->upload_ctx, &req->view, flusher_upload_done, req);
 }
@@ -348,6 +445,7 @@ flusher_check_drain(struct s3_flusher *f)
 			     "and the flusher keeps retrying\n", f->in_flight,
 			     (int)s3_overlay_has_dirty(f->overlay),
 			     (int)f->super_sync_active);
+		flusher_dump_inflight(f);
 	} else {
 		return;
 	}
@@ -503,6 +601,7 @@ s3_flusher_create(struct s3_overlay *overlay, struct s3_wal *wal,
 
 	f->overlay    = overlay;
 	f->wal        = wal;
+	TAILQ_INIT(&f->inflight_reqs);
 	f->upload_fn  = upload_fn;
 	f->upload_ctx = upload_ctx;
 

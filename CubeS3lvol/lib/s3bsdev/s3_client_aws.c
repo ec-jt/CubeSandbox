@@ -197,6 +197,19 @@ struct s3_request {
 	 * every other op. Selects which arm of ->cb to invoke. */
 	bool                             is_get;
 
+	/* Diagnostics only (B16). Never consulted for any decision.
+	 *
+	 *   submit_ms   monotonic ms at submit, for the elapsed time logged
+	 *               on failure or when a request is slow.
+	 *   attempts    HTTP attempts CRT made, counted in the telemetry
+	 *               callback (CRT retries internally, up to 5 times).
+	 *   request_id  x-amz-request-id of the last attempt that got one.
+	 *   op          short operation name for log lines. */
+	uint64_t                         submit_ms;
+	uint32_t                         attempts;
+	char                             request_id[96];
+	const char                      *op;
+
 	/* SPDK thread that submitted the request, captured at submit time.
 	 *
 	 * CRT completes requests on its own IO threads, but callers touch
@@ -362,6 +375,200 @@ s3_stats_record_error(struct s3_client *client, int http_status)
 	} else if (http_status >= 500) {
 		S3_STAT_INC(client, errors_5xx);
 	}
+}
+
+/* ==========================================================================
+ * Request tracing (B16, log only)
+ *
+ * A flush upload that failed used to reach the log as "-5" and nothing else, and
+ * one that never completed left no trace at all. These lines say which request,
+ * which object key, how long it ran, how many HTTP attempts CRT made, what the
+ * server or the transport said, and the server's request id for the provider's
+ * support. Nothing here changes a status or a retry decision.
+ *
+ * Never logged: credentials, the Authorization header, or any query string. The
+ * key is the object key only; the bucket and endpoint are already in the client
+ * creation line.
+ *
+ * Volume: one line per failed attempt, one per failed request, and one per
+ * successful request slower than S3_TRACE_SLOW_MS, rate limited to one per
+ * S3_TRACE_SLOW_INTERVAL_MS with a suppressed count.
+ * ========================================================================== */
+
+#define S3_TRACE_SLOW_MS          5000
+#define S3_TRACE_SLOW_INTERVAL_MS 1000
+
+static struct aws_atomic_var g_trace_slow_last_ms = AWS_ATOMIC_INIT_INT(0);
+static struct aws_atomic_var g_trace_slow_suppressed = AWS_ATOMIC_INIT_INT(0);
+
+/* CLOCK_MONOTONIC, not the SPDK tick counter: this file must link without
+ * spdk_env (the offline client tests and tools use it from plain pthreads). */
+static uint64_t
+s3_trace_now_ms(void)
+{
+	struct timespec ts;
+
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return (uint64_t)ts.tv_sec * 1000 + (uint64_t)ts.tv_nsec / 1000000;
+}
+
+static uint64_t
+s3_trace_elapsed_ms(const struct s3_request *req)
+{
+	uint64_t now = s3_trace_now_ms();
+
+	if (req->submit_ms == 0 || now < req->submit_ms) {
+		return 0;
+	}
+	return now - req->submit_ms;
+}
+
+/* Copy a header value into buf; empty when absent. */
+static void
+s3_trace_header(const struct aws_http_headers *headers, const char *name,
+		char *buf, size_t len)
+{
+	struct aws_byte_cursor value;
+	size_t n;
+
+	buf[0] = '\0';
+	if (!headers || len == 0) {
+		return;
+	}
+	if (aws_http_headers_get(headers, aws_byte_cursor_from_c_str(name),
+				 &value) != AWS_OP_SUCCESS) {
+		aws_reset_error();
+		return;
+	}
+	n = value.len < len - 1 ? value.len : len - 1;
+	memcpy(buf, value.ptr, n);
+	buf[n] = '\0';
+}
+
+/* <Code> and <Message> out of an S3 XML error body, bounded. */
+static void
+s3_trace_xml_field(const struct aws_byte_buf *body, const char *tag,
+		   char *buf, size_t len)
+{
+	char open[32], close[32];
+	const char *b, *e, *start, *end;
+	size_t n;
+
+	buf[0] = '\0';
+	if (!body || !body->buffer || body->len == 0 || len == 0) {
+		return;
+	}
+	snprintf(open, sizeof(open), "<%s>", tag);
+	snprintf(close, sizeof(close), "</%s>", tag);
+	b = (const char *)body->buffer;
+	e = b + body->len;
+	start = memmem(b, (size_t)(e - b), open, strlen(open));
+	if (!start) {
+		return;
+	}
+	start += strlen(open);
+	end = memmem(start, (size_t)(e - start), close, strlen(close));
+	if (!end) {
+		return;
+	}
+	n = (size_t)(end - start);
+	if (n > len - 1) {
+		n = len - 1;
+	}
+	memcpy(buf, start, n);
+	buf[n] = '\0';
+}
+
+/* CRT telemetry: one call per HTTP attempt, on the meta request's event
+ * delivery path, always before the finish callback of the same request. */
+static void
+s3_trace_telemetry(struct aws_s3_meta_request *meta_request,
+		   struct aws_s3_request_metrics *metrics, void *user_data)
+{
+	struct s3_request *req = user_data;
+	const struct aws_string *rid = NULL;
+	int status = 0;
+	int err;
+
+	(void)meta_request;
+	req->attempts++;
+
+	if (aws_s3_request_metrics_get_request_id(metrics, &rid) == AWS_OP_SUCCESS &&
+	    rid != NULL) {
+		snprintf(req->request_id, sizeof(req->request_id), "%s",
+			 aws_string_c_str(rid));
+	} else {
+		aws_reset_error();
+	}
+	if (aws_s3_request_metrics_get_response_status_code(metrics, &status) !=
+	    AWS_OP_SUCCESS) {
+		aws_reset_error();
+		status = 0;
+	}
+	err = aws_s3_request_metrics_get_error_code(metrics);
+
+	if (err != AWS_ERROR_SUCCESS || status >= 300) {
+		SPDK_WARNLOG("S3 %s attempt %u failed: key=%s http=%d crt=%d (%s) "
+			     "request_id=%s elapsed_ms=%" PRIu64 "\n",
+			     req->op ? req->op : "?", req->attempts, req->key_buf,
+			     status, err, aws_error_str(err),
+			     req->request_id[0] ? req->request_id : "-",
+			     s3_trace_elapsed_ms(req));
+	}
+}
+
+/* One line per failed request, and per slow successful one (rate limited).
+ * Called at the top of every finish callback, before anything is released. */
+static void
+s3_trace_finish(struct s3_request *req,
+		const struct aws_s3_meta_request_result *result, uint64_t bytes)
+{
+	uint64_t elapsed = s3_trace_elapsed_ms(req);
+	char rid[96], code[64], msg[160];
+
+	if (result->error_code == AWS_ERROR_SUCCESS) {
+		size_t now, last;
+		size_t suppressed;
+
+		if (elapsed < S3_TRACE_SLOW_MS) {
+			return;
+		}
+		now = (size_t)s3_trace_now_ms();
+		last = aws_atomic_load_int(&g_trace_slow_last_ms);
+		if (now - last < S3_TRACE_SLOW_INTERVAL_MS ||
+		    !aws_atomic_compare_exchange_int(&g_trace_slow_last_ms, &last, now)) {
+			aws_atomic_fetch_add(&g_trace_slow_suppressed, 1);
+			return;
+		}
+		suppressed = aws_atomic_exchange_int(&g_trace_slow_suppressed, 0);
+		SPDK_NOTICELOG("S3 %s slow: key=%s bytes=%" PRIu64 " elapsed_ms=%" PRIu64
+			       " attempts=%u request_id=%s (%zu other slow request(s) "
+			       "not logged)\n", req->op ? req->op : "?", req->key_buf,
+			       bytes, elapsed, req->attempts,
+			       req->request_id[0] ? req->request_id : "-", suppressed);
+		return;
+	}
+
+	s3_trace_header(result->error_response_headers, "x-amz-request-id",
+			rid, sizeof(rid));
+	if (!rid[0]) {
+		s3_trace_header(result->error_response_headers, "x-request-id",
+				rid, sizeof(rid));
+	}
+	if (!rid[0] && req->request_id[0]) {
+		snprintf(rid, sizeof(rid), "%s", req->request_id);
+	}
+	s3_trace_xml_field(result->error_response_body, "Code", code, sizeof(code));
+	s3_trace_xml_field(result->error_response_body, "Message", msg, sizeof(msg));
+
+	SPDK_ERRLOG("S3 %s failed: key=%s http=%d s3_code=%s s3_message=\"%s\" "
+		    "crt=%d (%s) errno=%d bytes=%" PRIu64 " elapsed_ms=%" PRIu64
+		    " attempts=%u request_id=%s\n",
+		    req->op ? req->op : "?", req->key_buf, result->response_status,
+		    code[0] ? code : "-", msg, result->error_code,
+		    aws_error_str(result->error_code),
+		    crt_error_to_errno(result->error_code, result->response_status),
+		    bytes, elapsed, req->attempts, rid[0] ? rid : "-");
 }
 
 /* ==========================================================================
@@ -1347,6 +1554,8 @@ s3_get_finished(struct aws_s3_meta_request *meta_request,
 {
 	struct s3_request *req = user_data;
 
+	s3_trace_finish(req, result, req->bytes_read);
+
 	if (result->error_code != AWS_ERROR_SUCCESS) {
 		SPDK_ERRLOG("GetObject failed: key=%s, error=%d (%s), http=%d\n",
 			    req->key_buf, result->error_code,
@@ -1420,6 +1629,8 @@ s3_get_range_ex(struct s3_client *client, const char *key,
 	req->cb_arg  = cb_arg;
 	req->is_get  = true;
 	req->owner_thread = spdk_get_thread();
+	req->submit_ms = s3_trace_now_ms();
+	req->op = "GET";
 
 	rc = s3_request_set_key(req, key);
 	if (rc) {
@@ -1434,6 +1645,7 @@ s3_get_range_ex(struct s3_client *client, const char *key,
 		.body_callback  = s3_get_body_callback,
 		.headers_callback = s3_get_headers_callback,
 		.finish_callback = s3_get_finished,
+		.telemetry_callback = s3_trace_telemetry,
 	};
 
 	options.message = aws_http_message_new_request(client->app_ctx->allocator);
@@ -1494,6 +1706,8 @@ s3_put_finished(struct aws_s3_meta_request *meta_request,
 		void *user_data)
 {
 	struct s3_request *req = user_data;
+
+	s3_trace_finish(req, result, req->bytes_read);
 
 	if (result->error_code != AWS_ERROR_SUCCESS) {
 		req->status = crt_error_to_errno(result->error_code,
@@ -1605,6 +1819,8 @@ s3_put_common(struct s3_client *client, const char *key,
 	req->cb.op_cb = cb;
 	req->cb_arg   = cb_arg;
 	req->owner_thread = spdk_get_thread();
+	req->submit_ms = s3_trace_now_ms();
+	req->op = "PUT";
 	/* bytes_read doubles as "total payload size" for PUT — the finish
 	 * callback must not dereference the caller's iov. */
 	req->bytes_read = total_size;
@@ -1638,6 +1854,7 @@ s3_put_common(struct s3_client *client, const char *key,
 		.user_data       = req,
 		.signing_config  = &client->signing_config,
 		.finish_callback = s3_put_finished,
+		.telemetry_callback = s3_trace_telemetry,
 	};
 
 	options.message = aws_http_message_new_request(client->app_ctx->allocator);
@@ -1805,6 +2022,8 @@ s3_head_finished(struct aws_s3_meta_request *meta_request,
 {
 	struct s3_request *req = user_data;
 
+	s3_trace_finish(req, result, 0);
+
 	if (result->error_code != AWS_ERROR_SUCCESS) {
 		req->status = crt_error_to_errno(result->error_code,
 						result->response_status);
@@ -1868,6 +2087,8 @@ s3_head(struct s3_client *client, const char *key,
 	req->cb.op_cb  = cb;
 	req->cb_arg    = cb_arg;
 	req->owner_thread = spdk_get_thread();
+	req->submit_ms = s3_trace_now_ms();
+	req->op = "HEAD";
 
 	if (out_size) {
 		*out_size = 0;
@@ -1886,6 +2107,7 @@ s3_head(struct s3_client *client, const char *key,
 		.signing_config   = &head_signing,
 		.headers_callback = s3_head_headers_callback,
 		.finish_callback  = s3_head_finished,
+		.telemetry_callback = s3_trace_telemetry,
 	};
 
 	options.message = aws_http_message_new_request(client->app_ctx->allocator);
@@ -1936,6 +2158,8 @@ s3_delete_finished(struct aws_s3_meta_request *meta_request,
 		   void *user_data)
 {
 	struct s3_request *req = user_data;
+
+	s3_trace_finish(req, result, 0);
 
 	/* A conditional delete that was rejected (412/409) is a *successful*
 	 * request whose condition did not hold: the object is untouched, which
@@ -2026,6 +2250,7 @@ s3_delete_submit_one(struct s3_client *client, struct s3_request *req)
 		.user_data       = req,
 		.signing_config  = &delete_signing,
 		.finish_callback = s3_delete_finished,
+		.telemetry_callback = s3_trace_telemetry,
 	};
 
 	options.message = aws_http_message_new_request(client->app_ctx->allocator);
@@ -2095,6 +2320,8 @@ s3_delete_common(struct s3_client *client, const char *key, const char *etag,
 	req->cb.op_cb  = cb;
 	req->cb_arg    = cb_arg;
 	req->owner_thread = spdk_get_thread();
+	req->submit_ms = s3_trace_now_ms();
+	req->op = "DELETE";
 
 	if (etag) {
 		if (strlen(etag) >= sizeof(req->if_match_buf)) {
@@ -2436,6 +2663,8 @@ s3_copy_finished(struct aws_s3_meta_request *meta_request,
 {
 	struct s3_request *req = user_data;
 
+	s3_trace_finish(req, result, 0);
+
 	if (result->error_code != AWS_ERROR_SUCCESS) {
 		SPDK_ERRLOG("CopyObject failed: %s/%s -> %s, error=%d (%s), http=%d\n",
 			    req->src_bucket, req->src_key, req->key_buf,
@@ -2502,6 +2731,8 @@ s3_copy_object(struct s3_client *client,
 	req->cb.op_cb  = cb;
 	req->cb_arg    = cb_arg;
 	req->owner_thread = spdk_get_thread();
+	req->submit_ms = s3_trace_now_ms();
+	req->op = "COPY";
 	req->len = S3_COPY_XML_MAX;
 	req->buf = aws_mem_calloc(client->app_ctx->allocator, 1, S3_COPY_XML_MAX);
 	if (!req->buf) {
@@ -2530,6 +2761,7 @@ s3_copy_object(struct s3_client *client,
 		.signing_config  = &client->signing_config,
 		.body_callback   = s3_copy_body_callback,
 		.finish_callback = s3_copy_finished,
+		.telemetry_callback = s3_trace_telemetry,
 	};
 
 	options.message = aws_http_message_new_request(client->app_ctx->allocator);

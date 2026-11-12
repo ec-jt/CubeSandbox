@@ -490,6 +490,10 @@ func (w *s3ExportWorker) exportRole(ctx context.Context, m *S3Cow, id string, re
 		}
 		uuid, subErr := m.uploadOne(ref.Name)
 		w.leave()
+		if subErr == nil {
+			CubeLog.Infof("async s3 export %s: submitted %s %s as uuid=%s (attempt %d/%d, previous status %q)",
+				id, ref.Role, ref.Name, uuid, attempt+1, w.cfg.MaxAttempts, v.status)
+		}
 		if subErr != nil {
 			// Acceptance may be ambiguous (timeout after admission). Do not
 			// resubmit blind: the next iteration re-reads export_uuid/status
@@ -513,11 +517,24 @@ func (w *s3ExportWorker) exportRole(ctx context.Context, m *S3Cow, id string, re
 	return fmt.Errorf("export %s %s: %w", ref.Role, ref.Name, lastErr)
 }
 
+// exportOrphanWarnAfter is how long an accepted export may read INPROGRESS
+// before the settle loop logs it as probably orphaned (B16). Log only: the
+// decision logic below is unchanged.
+const exportOrphanWarnAfter = 5 * time.Minute
+
 // waitSettled polls until the exact accepted export is DONE. A changed or
 // missing identity and a FAILED status end the wait so the caller re-reads.
 func (w *s3ExportWorker) waitSettled(ctx context.Context, m *S3Cow, id string, ref CowObjectRef, uuid string) error {
 	wctx, cancel := context.WithTimeout(ctx, w.cfg.RoleSettleTimeout)
 	defer cancel()
+	// Diagnostics only (B16): log each status transition once, and warn once
+	// when INPROGRESS lasts long enough that the native export is probably
+	// gone (a failed drain leaves publication_pending=true, which reads as
+	// INPROGRESS forever).
+	start := time.Now()
+	lastStatus := "\x00"
+	warnedOrphan := false
+	CubeLog.Infof("async s3 export %s: settle %s %s uuid=%s started", id, ref.Role, ref.Name, uuid)
 	for {
 		if w.isCancelled(id) {
 			return errExportCancelled
@@ -527,6 +544,19 @@ func (w *s3ExportWorker) waitSettled(ctx context.Context, m *S3Cow, id string, r
 			return err
 		}
 		if err == nil {
+			if v.status != lastStatus {
+				CubeLog.Infof("async s3 export %s: %s %s uuid=%s native status %q -> %q after %s",
+					id, ref.Role, ref.Name, uuid, strings.Trim(lastStatus, "\x00"), v.status,
+					time.Since(start).Truncate(time.Millisecond))
+				lastStatus = v.status
+			}
+			if !warnedOrphan && v.status == cow.ExportStatusInProgress && time.Since(start) > exportOrphanWarnAfter {
+				warnedOrphan = true
+				CubeLog.Warnf("async s3 export %s: export appears orphaned: publication_pending without progress: "+
+					"%s snapshot %s uuid=%s INPROGRESS for %s with no completion; check rcow_get_exports "+
+					"(publication_pending, disposition) and the s3lvol journal for 'Export %s' failure lines",
+					id, ref.Role, ref.Name, uuid, time.Since(start).Truncate(time.Second), uuid)
+			}
 			if !v.exists {
 				return fmt.Errorf("%s %s disappeared while exporting", ref.Role, ref.Name)
 			}
@@ -541,6 +571,8 @@ func (w *s3ExportWorker) waitSettled(ctx context.Context, m *S3Cow, id string, r
 			}
 		}
 		if err := w.sleep(wctx, w.cfg.PollInterval); err != nil {
+			CubeLog.Warnf("async s3 export %s: settle %s %s uuid=%s gave up after %s, last native status %q",
+				id, ref.Role, ref.Name, uuid, time.Since(start).Truncate(time.Second), strings.Trim(lastStatus, "\x00"))
 			return fmt.Errorf("settle %s %s: %w", ref.Role, ref.Name, err)
 		}
 	}

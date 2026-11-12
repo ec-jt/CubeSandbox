@@ -1238,12 +1238,29 @@ struct export_ctx {
 	struct spdk_poller       *drain_retry_poller;
 	uint32_t                  drain_retries;
 
+	/* Diagnostics only (B16): when the export started and which step it was
+	 * in, so a failure line can say where it died and after how long. */
+	uint64_t                  start_tsc;
+	const char               *step;
+
 	s3lvol_export_cb          cb_fn;
 	void                     *cb_arg;
 };
 
 static void export_copy(struct export_ctx *ctx);
 static void export_ref(struct export_ctx *ctx);
+
+/* Diagnostics only: ms since lvol_export_start(), 0 before it ran. */
+static uint64_t
+export_elapsed_ms(const struct export_ctx *ctx)
+{
+	uint64_t now = spdk_get_ticks();
+
+	if (ctx->start_tsc == 0 || now < ctx->start_tsc) {
+		return 0;
+	}
+	return (uint64_t)((now - ctx->start_tsc) * 1000 / spdk_get_ticks_hz());
+}
 static void export_drain(struct export_ctx *ctx);
 static void export_drained(void *cb_arg, int status);
 
@@ -1270,10 +1287,26 @@ export_report(struct export_ctx *ctx, int status)
 	 * are not redundant: that one says which step, this one says which export it
 	 * took down. */
 	if (status != 0) {
+		struct s3lvol_export *left = s3lvol_export_find(ctx->lvs, ctx->info.export_uuid);
+		struct s3lvol_export_entry left_info;
+		const char *registry = "absent";
+
+		if (left) {
+			s3lvol_export_get(left, &left_info);
+			registry = left_info.publication_pending ?
+				   "publication_pending=yes (export_status reads INPROGRESS "
+				   "until rcow_reconcile_export or a release clears it)" :
+				   "publication_pending=no";
+		}
 		SPDK_ERRLOG("Export %s of snapshot '%s' failed: %s. Any durable reservation is retained; "
 			    "do not infer that remote dependencies are absent.\n",
 			    ctx->info.export_uuid, ctx->info.snapshot_name,
 			    spdk_strerror(-status));
+		SPDK_ERRLOG("Export %s failed at step '%s' after %" PRIu64 " ms (%" PRIu32
+			    " drain retr%s); registry entry left behind: %s\n",
+			    ctx->info.export_uuid, ctx->step ? ctx->step : "?",
+			    export_elapsed_ms(ctx), ctx->drain_retries,
+			    ctx->drain_retries == 1 ? "y" : "ies", registry);
 	} else {
 		SPDK_NOTICELOG("Export %s of snapshot '%s' completed\n",
 			       ctx->info.export_uuid, ctx->info.snapshot_name);
@@ -1323,6 +1356,7 @@ export_reserved(void *cb_arg, int status)
 		export_report(ctx, status);
 		return;
 	}
+	ctx->step = "admission";
 	if (ctx->release_safe) {
 		struct ea_doc doc = {0};
 		struct spdk_uuid id, nonce;
@@ -1378,6 +1412,7 @@ export_copy_done(void *cb_arg, struct s3_export_manifest *m, int status)
 		export_report(ctx, status);
 		return;
 	}
+	ctx->step = "publication_save";
 
 	ctx->info.size_bytes = m->size_bytes;
 	ctx->info.num_chunks = m->num_chunks;
@@ -1645,15 +1680,27 @@ export_ref(struct export_ctx *ctx)
 	char esnap_uuid[SPDK_UUID_STRING_LEN];
 	uint32_t chain_len = 0;
 	int rc;
-	if (ctx->release_safe) { export_copy(ctx); return; }
+	ctx->step = "ref";
+	if (ctx->release_safe) {
+		SPDK_NOTICELOG("Export %s: layout dense (release_safe requested)\n",
+			       ctx->info.export_uuid);
+		export_copy(ctx);
+		return;
+	}
 
 	rc = export_build_chain(ctx->lvs, ctx->snapshot->blob, chain,
 				SPDK_COUNTOF(chain), &chain_len,
 				esnap_uuid, sizeof(esnap_uuid));
 	if (rc != 0) {
+		SPDK_NOTICELOG("Export %s: layout dense (snapshot chain walk declined: "
+			       "%s)\n", ctx->info.export_uuid, spdk_strerror(-rc));
 		export_copy(ctx);
 		return;
 	}
+	SPDK_NOTICELOG("Export %s: layout ref, chain of %u layer(s)%s%s\n",
+		       ctx->info.export_uuid, chain_len,
+		       esnap_uuid[0] ? ", inheriting from export " : "",
+		       esnap_uuid[0] ? esnap_uuid : "");
 
 	/* The chain bottomed out in an export rather than in a blob, so the chunks
 	 * older than the import have to be named out of that export's manifest. It is
@@ -1692,6 +1739,8 @@ export_ref(struct export_ctx *ctx)
 
 	rc = s3_export_run_ref(&opts, export_copy_done, ctx);
 	if (rc == -ENOTSUP) {
+		SPDK_NOTICELOG("Export %s: ref engine declined (%s); layout dense\n",
+			       ctx->info.export_uuid, spdk_strerror(ENOTSUP));
 		export_copy(ctx);
 		return;
 	}
@@ -1756,6 +1805,7 @@ export_ref(struct export_ctx *ctx)
 static void
 export_drain(struct export_ctx *ctx)
 {
+	ctx->step = "drain";
 	s3lvol_lvstore_flush(ctx->lvs, export_drained, ctx);
 }
 
@@ -1791,6 +1841,18 @@ export_drained(void *cb_arg, int status)
 				       s3lvol_lvstore_get_name(ctx->lvs));
 		}
 		ctx->drain_retries++;
+		/* Every 60th retry (30 s) so a long wait is visible without one
+		 * line per 500 ms. */
+		if (ctx->drain_retries % 60 == 0) {
+			struct s3_bs_dev_stats st = {0};
+
+			s3_bs_dev_get_stats(s3lvol_lvstore_get_bs_dev(ctx->lvs), &st);
+			SPDK_NOTICELOG("Export %s still waiting for a drain of '%s': %" PRIu32
+				       " retries, %" PRIu64 " ms since the export started, "
+				       "%u upload(s) in flight\n", ctx->info.export_uuid,
+				       s3lvol_lvstore_get_name(ctx->lvs), ctx->drain_retries,
+				       export_elapsed_ms(ctx), st.flush_in_flight);
+		}
 		ctx->drain_retry_poller = SPDK_POLLER_REGISTER(export_drain_retry, ctx,
 							      EXPORT_DRAIN_RETRY_US);
 		if (ctx->drain_retry_poller) {
@@ -1803,6 +1865,14 @@ export_drained(void *cb_arg, int status)
 
 	if (status != 0) {
 		char waited[80] = "";
+		struct s3_bs_dev_stats st = {0};
+
+		s3_bs_dev_get_stats(s3lvol_lvstore_get_bs_dev(ctx->lvs), &st);
+		SPDK_ERRLOG("Export %s drain of '%s' ended %d after %" PRIu64 " ms: flusher "
+			    "in_flight=%u chunks_flushed=%" PRIu64 " flush_failures=%" PRIu64
+			    "\n", ctx->info.export_uuid, s3lvol_lvstore_get_name(ctx->lvs),
+			    status, export_elapsed_ms(ctx), st.flush_in_flight, st.chunks_flushed,
+			    st.flush_failures);
 
 		/* How long it waited, not just that it did: "busy" after five seconds
 		 * of retrying is a different problem from "busy" on the first ask. */
@@ -1841,6 +1911,8 @@ export_copy(struct export_ctx *ctx)
 	struct s3_export_opts opts = {0};
 	uint64_t cluster_size = spdk_bs_get_cluster_size(store->blobstore);
 	int rc;
+
+	ctx->step = "copy";
 
 	/* Export chunks are clusters. Not "the lvstore's S3 chunk size": the export
 	 * does not reference the source's objects, so its own slicing is free to be
@@ -2056,6 +2128,15 @@ lvol_export_start(struct s3lvol_lvstore *lvs, struct spdk_lvol *snapshot,
 	if (uuid_out && uuid_out_len > 0) {
 		snprintf(uuid_out, uuid_out_len, "%s", ctx->info.export_uuid);
 	}
+
+	ctx->start_tsc = spdk_get_ticks();
+	ctx->step = "reserve";
+	SPDK_NOTICELOG("Export %s of snapshot '%s' starting: release_safe=%d, %" PRIu64
+		       " cluster(s) allocated of %" PRIu64 ", chain depth %u\n",
+		       ctx->info.export_uuid, snapshot->name, (int)release_safe,
+		       spdk_blob_get_num_allocated_clusters(snapshot->blob),
+		       spdk_blob_get_num_clusters(snapshot->blob),
+		       s3lvol_lvol_chain_depth(lvs, snapshot));
 
 	/* A conservative REF reservation closes publish-before-registry crashes.
 	 * Only successful first publication as dense can drop the source pin. */
