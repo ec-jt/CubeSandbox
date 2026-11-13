@@ -6,7 +6,9 @@ package storage
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"os"
 	"strings"
 
 	"github.com/tencentcloud/CubeSandbox/Cubelet/pkg/constants"
@@ -219,6 +221,76 @@ func (s *SandboxImport) importOne(ctx context.Context, name, role, uuid string) 
 		return "", fmt.Errorf("resolve imported %s %s: %w", role, name, err)
 	}
 	return dev, nil
+}
+
+// ReleaseCrossNodeSandboxImports deletes the disks a cross-node restore
+// imported for sandboxID on this node: the rootfs and memory volumes, the
+// metadata volume and its mount, and the per-sandbox snapshot directory
+// (B18 rollback of a Create that failed before any runtime started).
+//
+// The caller must hold the sandbox lifecycle lock and have proven that no
+// runtime uses these disks.
+//
+// Safe for the source snapshot: import_lvol materializes a NEW local RW lvol
+// whose blobs read through to the export's chunk objects (REF layout) or a
+// copy of them. Deleting that lvol (cubecow delete_volume, which issues
+// rcow_deactive_bdev then rcow_delete_lvol) frees only the destination's own
+// clusters and drops this lvstore's import-registry entry once no reader is
+// left (s3lvol_imports_recheck; v4 admission metadata is kept until an
+// explicit detach). It never deletes, rewrites or releases the source
+// export's manifest or chunk objects in S3; only the snapshot delete flow on
+// the source node can do that. Only names minted for this sandbox are touched
+// (sandboxOwnsS3Object), and rootfs/memory are only deleted when their native
+// import origin proves they were imported, never a clone of a local package.
+func ReleaseCrossNodeSandboxImports(ctx context.Context, sandboxID string) error {
+	sandboxID = strings.TrimSpace(sandboxID)
+	if sandboxID == "" {
+		return nil
+	}
+	store, err := requireS3Cow()
+	if err != nil {
+		return err
+	}
+	if store == nil {
+		return fmt.Errorf("s3 cow store is not initialized")
+	}
+	var errs error
+	for _, name := range []string{SandboxRootfsName(sandboxID, 0), SandboxMemoryName(sandboxID)} {
+		if !sandboxOwnsS3Object(name, sandboxID) {
+			continue
+		}
+		info, lookupErr := store.GetVolumeInfo(ctx, name)
+		present, err := cowObjectPresent(info, lookupErr)
+		if err != nil {
+			errs = errors.Join(errs, fmt.Errorf("lookup %s: %w", name, err))
+			continue
+		}
+		if !present {
+			continue
+		}
+		if info.ImportOrigin == nil {
+			// Not proven to be an import of this attempt; leave it to the
+			// regular storage destroy, which knows what Create recorded.
+			continue
+		}
+		if err := store.DeactivateByKind(ctx, name, cowKindVolume); err != nil {
+			warnVolumeDeleteDeferred(ctx, name, cowKindVolume, err)
+		}
+		if err := store.DeleteByKind(ctx, name, cowKindVolume); err != nil {
+			errs = errors.Join(errs, fmt.Errorf("delete imported %s: %w", name, err))
+		}
+	}
+	// Derived-only release: the imported metadata volume is the sandbox's own
+	// disk; there is no package snapshot here to drop.
+	if err := ReleaseS3MetadataDerivedVolume(ctx, cow.BackendS3, sandboxID); err != nil {
+		errs = errors.Join(errs, fmt.Errorf("release imported metadata: %w", err))
+	}
+	if home := SnapshotHome(cow.BackendS3, SnapshotKindNormal, sandboxID); home != "" {
+		if err := os.RemoveAll(home); err != nil && !os.IsNotExist(err) {
+			errs = errors.Join(errs, fmt.Errorf("remove %s: %w", home, err))
+		}
+	}
+	return errs
 }
 
 func requireImportedOrigin(info *cubecow.Volume, name, uuid string) error {

@@ -69,6 +69,19 @@ func CheckCleanupEpoch(id string, evidence *LifecycleCleanup) error {
 	return nil
 }
 
+// StaleCleanupVerifier is installed by the cubebox service. It reports, under
+// the lifecycle lock, whether the persisted record for id provably never
+// started a runtime and owns only attempt-owned storage. Any doubt is false.
+var StaleCleanupVerifier func(ctx context.Context, id string) (bool, string)
+
+func staleCleanupProven(ctx context.Context, id string) (bool, string) {
+	v := StaleCleanupVerifier
+	if v == nil {
+		return false, ""
+	}
+	return v(ctx, id)
+}
+
 func RuntimeCleanupProven(ctx context.Context) bool {
 	e := LifecycleCleanupFrom(ctx)
 	return e != nil && (e.NeverStarted || e.RuntimeGone)

@@ -140,8 +140,16 @@ type CreateContext struct {
 
 	UserData *cubeboxstore.UserData
 
+	// CubeBoxCreated means the cubebox step owns the sandbox record: it may
+	// have replaced a paused row and persisted its own. It does not mean a
+	// runtime was started.
 	CubeBoxCreated bool
-	NetFile        *netfile.CubeboxNetfile
+	// RuntimeSpawnAttempted is set immediately before the first containerd
+	// container/task creation (the first step that can spawn a shim or VM).
+	// A failure while it is false has provably started no runtime in this
+	// attempt, so failover may remove the record and imported storage.
+	RuntimeSpawnAttempted bool
+	NetFile               *netfile.CubeboxNetfile
 
 	LocalRunTemplate *templatetypes.LocalRunTemplate
 
@@ -554,9 +562,7 @@ func (e *Engine) failover(ctx context.Context, opts ReqContext) {
 	if evidence == nil {
 		evidence = &LifecycleCleanup{}
 	}
-	evidence.NeverStarted = !opts.(*CreateContext).CubeBoxCreated
-	evidence.RuntimeMayExist = opts.(*CreateContext).CubeBoxCreated
-	evidence.PreserveStorage = opts.(*CreateContext).PreserveStorageOnFailure()
+	ApplyCreateFailureEvidence(evidence, opts.(*CreateContext))
 	sandboxID := opts.GetSandboxID()
 	namespace, err := namespaces.NamespaceRequired(ctx)
 	if err != nil {
@@ -653,9 +659,21 @@ func (e *Engine) CleanUp(ctx context.Context, opts *CleanContext) error {
 		}
 		defer unlock()
 		if err := CheckCleanupEpoch(opts.SandboxID, opts.CleanupEvidence); err != nil {
-			return err
-		}
-		if opts.CleanupEvidence != nil && opts.CleanupEvidence.Epoch != "" {
+			// B18: a job queued by an earlier process or attempt carries no
+			// usable evidence. Proceed only when the record itself proves
+			// that no runtime ever started; otherwise keep failing closed.
+			proven, reason := staleCleanupProven(ctx, opts.SandboxID)
+			if !proven {
+				return err
+			}
+			log.G(ctx).Warnf("sandbox %s: %v; proceeding because %s", opts.SandboxID, err, reason)
+			ctx = BeginSandboxLifecycle(ctx, opts.SandboxID)
+			evidence := LifecycleCleanupFrom(ctx)
+			evidence.NeverStarted = false
+			evidence.RuntimeMayExist = false
+			evidence.RuntimeGone = true
+			evidence.PreserveStorage = false
+		} else if opts.CleanupEvidence != nil && opts.CleanupEvidence.Epoch != "" {
 			// Use current process evidence so completed runtime cleanup survives
 			// a later storage failure and explicit delete retry.
 			ctx = ContinueSandboxLifecycle(ctx, opts.SandboxID)
@@ -672,4 +690,53 @@ func (e *Engine) CleanUp(ctx context.Context, opts *CleanContext) error {
 func (b *CreateContext) PreserveStorageOnFailure() bool {
 	_, snapshot := b.GetSnapshotTemplateID()
 	return (snapshot && !b.IsCreateSnapshot()) || b.IsPauseResume()
+}
+
+// IsCrossNodeRestore reports Master's verdict that this create restores onto
+// a node holding no replica of the package. Every disk such a create uses is
+// imported under the sandbox's own name by this attempt, so none is reused.
+func (b *CreateContext) IsCrossNodeRestore() bool {
+	if b == nil || b.ReqInfo == nil {
+		return false
+	}
+	return strings.EqualFold(strings.TrimSpace(b.ReqInfo.GetAnnotations()[constants.MasterAnnotationSnapshotCrossNode]), "true")
+}
+
+// RollbackReleasesStorage reports whether a failed attempt that provably
+// started no runtime may delete its storage. Restores normally retain storage
+// because they can reuse disks the attempt does not own (cold recreate,
+// same-node pause resume). A cross-node restore owns every disk it imported;
+// deleting them does not touch the source snapshot's exports in S3.
+func (b *CreateContext) RollbackReleasesStorage() bool {
+	if !b.PreserveStorageOnFailure() {
+		return true
+	}
+	return b.IsCrossNodeRestore() && !b.IsColdRecreate()
+}
+
+// ApplyCreateFailureEvidence records what a failed Create proved about its
+// runtime, for the failover destroy (B18):
+//   - cubebox step never ran: the record (if any) is not this attempt's.
+//   - record persisted, no container/task creation attempted: no runtime
+//     exists, so the record and attempt-owned storage may be removed.
+//   - runtime creation attempted: ownership is unknown; preserve as before.
+func ApplyCreateFailureEvidence(evidence *LifecycleCleanup, opts *CreateContext) {
+	if evidence == nil || opts == nil {
+		return
+	}
+	evidence.NeverStarted = !opts.CubeBoxCreated
+	evidence.RuntimeMayExist = opts.CubeBoxCreated
+	evidence.PreserveStorage = opts.PreserveStorageOnFailure()
+	if opts.RuntimeSpawnAttempted || !opts.RollbackReleasesStorage() {
+		// A runtime may exist, or the restore may reuse retained disks
+		// (same-node pause resume, cold recreate, local snapshot restore):
+		// keep the previous preserve-and-reconcile behaviour.
+		return
+	}
+	evidence.PreserveStorage = false
+	if opts.CubeBoxCreated {
+		// Record persisted but no container/task creation was attempted.
+		evidence.RuntimeMayExist = false
+		evidence.RuntimeGone = true
+	}
 }

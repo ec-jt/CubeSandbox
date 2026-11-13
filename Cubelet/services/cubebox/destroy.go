@@ -124,7 +124,8 @@ func (l *local) Destroy(ctx context.Context, opts *workflow.DestroyContext) (err
 	// is the next workflow step and must not delete those volumes yet.
 	runtimePIDs := l.collectSandboxRuntimePIDs(ctx, sb)
 	if len(runtimePIDs) == 0 {
-		if err := requireRuntimeCleanupEvidence(ctx, sandBoxID); err != nil {
+		// B18: see local.CleanUp; never-started records carry no pids.
+		if err := l.requireRuntimeCleanupEvidenceFor(ctx, sb); err != nil {
 			return err
 		}
 	}

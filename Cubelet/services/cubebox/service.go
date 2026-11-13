@@ -275,15 +275,11 @@ func (s *service) Create(ctx context.Context, req *cubebox.RunCubeSandboxRequest
 	}
 	// Reject an existing live runtime before importing, cloning or replacing
 	// storage. The later runtime-step check is too late for those effects.
-	if existing, err := s.cubeboxMgr.cubeboxManger.Get(ctx, sid); err == nil && existing != nil {
-		if existing.GetStatus() == nil || existing.GetStatus().Get().State() != cubebox.ContainerState_CONTAINER_PAUSED {
-			rsp.Ret.RetCode = errorcode.ErrorCode_PreConditionFailed
-			rsp.Ret.RetMsg = "sandbox already exists"
-			return rsp, nil
-		}
-	} else if err != nil && !errors.Is(err, utils.ErrorKeyNotFound) && !errors.Is(err, utils.ErrorBucketNotFound) {
+	// B18: a record a failed Create left behind that provably never started
+	// is rolled back here instead, so the node does not block the id forever.
+	if ok, msg := s.precheckExistingSandbox(ctx, sid); !ok {
 		rsp.Ret.RetCode = errorcode.ErrorCode_PreConditionFailed
-		rsp.Ret.RetMsg = err.Error()
+		rsp.Ret.RetMsg = msg
 		return rsp, nil
 	}
 	if err := workflow.CheckCreateRuntimeOwnership(sid); err != nil {
@@ -327,6 +323,18 @@ func (s *service) Create(ctx context.Context, req *cubebox.RunCubeSandboxRequest
 			return rsp, nil
 		}
 		ctx = retentionCtx
+	}
+	// B18: a cross-node restore that fails on this node, before any runtime
+	// started, must not leave the disks it imported (including the metadata
+	// disk imported just below, outside the workflow) behind. Runs before the
+	// lifecycle lock is released (defers run LIFO).
+	if isCrossNodeRestore(req.GetAnnotations()) {
+		lifecycleCtx := ctx
+		defer func() {
+			if !ret.IsSuccessCode(rsp.Ret.RetCode) {
+				s.releaseFailedCrossNodeRestore(lifecycleCtx, sid)
+			}
+		}()
 	}
 	if err := prepareCrossNodeRestore(ctx, req); err != nil {
 		rsp.Ret.RetMsg = err.Error()

@@ -228,3 +228,45 @@ func TestSandboxImportNativeFFIJSON(t *testing.T) {
 	require.Equal(t, "snap-a", info.ImportOrigin.Snapshot)
 	require.Error(t, requireImportedOrigin(&info, "target", "export-b"))
 }
+
+// B18: a failed cross-node Create releases exactly the disks it imported
+// under the sandbox's own names and its snapshot dir. Deleting an imported
+// lvol never touches the source export: no export, snapshot or package
+// object delete is issued, only delete_volume on sandbox-minted names.
+func TestReleaseCrossNodeSandboxImportsDeletesOnlyImports(t *testing.T) {
+	stubS3MetadataMounts(t)
+	engine := &fakeCowEngine{}
+	root := useTestCowStorageAt(t, engine)
+	imp := CrossNodeSandboxImport(crossNodeAnnotations())
+	require.NotNil(t, imp)
+	dir, err := imp.EnsureMetadata(context.Background())
+	require.NoError(t, err)
+	_, _, err = imp.Rootfs(context.Background(), 0)
+	require.NoError(t, err)
+	_, _, err = imp.Memory(context.Background())
+	require.NoError(t, err)
+	// A same-name clone without import origin must be left alone.
+	engine.volumeInfos["unrelated-package-snap"] = &cubecow.Volume{Name: "unrelated-package-snap"}
+
+	require.NoError(t, ReleaseCrossNodeSandboxImports(context.Background(), "sb-1"))
+	require.ElementsMatch(t, []string{"sb-sb-1-rootfs-gen0", "sb-sb-1-memory", S3MetadataVolumeName("sb-1")}, engine.deletedVolumes)
+	require.Empty(t, engine.deletedSnapshots, "no package or export snapshot may be deleted")
+	require.Contains(t, engine.deactivatedVolumes, "sb-sb-1-rootfs-gen0")
+	require.False(t, s3MetadataIsMounted(dir))
+	_, statErr := os.Stat(filepath.Join(root, "s3", "snapshots", "sb-1"))
+	require.True(t, os.IsNotExist(statErr), "per-sandbox snapshot dir removed")
+
+	// Idempotent: a second release finds nothing and succeeds.
+	require.NoError(t, ReleaseCrossNodeSandboxImports(context.Background(), "sb-1"))
+}
+
+func TestReleaseCrossNodeSandboxImportsSkipsNonImported(t *testing.T) {
+	stubS3MetadataMounts(t)
+	engine := &fakeCowEngine{volumeInfos: map[string]*cubecow.Volume{
+		// Same-node clone (no import origin): owned by regular storage destroy.
+		"sb-sb-2-rootfs-gen0": {Name: "sb-sb-2-rootfs-gen0"},
+	}}
+	useTestCowStorageAt(t, engine)
+	require.NoError(t, ReleaseCrossNodeSandboxImports(context.Background(), "sb-2"))
+	require.NotContains(t, engine.deletedVolumes, "sb-sb-2-rootfs-gen0")
+}

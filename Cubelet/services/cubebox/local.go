@@ -234,6 +234,8 @@ func init() {
 				return nil, fmt.Errorf("open paused eviction records: %w", err)
 			}
 
+			workflow.StaleCleanupVerifier = l.verifyStaleCleanup
+
 			CubeLog.Info("Start recovering state")
 
 			cbriManager.SetCubeRuntimeImplementation(l)
@@ -296,6 +298,8 @@ type local struct {
 	envdHTTPClient *http.Client
 	envdInitPort   int
 	destroyFn      func(context.Context, *workflow.DestroyContext) error
+	// probe overrides the containerd runtime-evidence queries (tests only).
+	probe runtimeProbe
 }
 
 const (
@@ -495,7 +499,9 @@ func (l *local) CleanUp(ctx context.Context, opts *workflow.CleanContext) error 
 
 	runtimePIDs := l.collectSandboxRuntimePIDs(ctx, info)
 	if len(runtimePIDs) == 0 {
-		if err := requireRuntimeCleanupEvidence(ctx, sandBoxID); err != nil {
+		// B18: a record left by a Create that never spawned a runtime has
+		// no pids; accept positive never-started proof as shutdown evidence.
+		if err := l.requireRuntimeCleanupEvidenceFor(ctx, info); err != nil {
 			return err
 		}
 	}

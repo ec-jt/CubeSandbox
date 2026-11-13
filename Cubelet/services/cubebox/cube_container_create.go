@@ -172,7 +172,10 @@ func (l *local) Create(ctx context.Context, opts *workflow.CreateContext) error 
 		}
 	}
 	opts.CubeBoxCreated = true
-	workflow.MarkRuntimeStarting(ctx)
+	// B18: runtime-start evidence is recorded in createContainers, right
+	// before the first containerd container/task creation. Failures before
+	// that point (spec generation, cbri hooks, storage reads) provably spawned
+	// no shim or VM, so failover may roll the record and its storage back.
 	if err := l.createContainers(ctx, opts); err != nil {
 		return err
 	}
@@ -411,6 +414,12 @@ func (l *local) createContainers(ctx context.Context, flowOpts *workflow.CreateC
 		})
 	}
 
+	// B18: the loop below is the first step that can spawn a shim or VM.
+	// Everything above only prepared specs and host files. Record the start
+	// attempt before any containerd side effect so failover never treats a
+	// possibly running runtime as never started.
+	flowOpts.RuntimeSpawnAttempted = true
+	workflow.MarkRuntimeStarting(ctx)
 	if err := func() (createErr error) {
 		sandBox.Lock()
 		defer func() {
