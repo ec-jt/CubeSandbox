@@ -742,20 +742,47 @@ rcow_log_size()
 #
 # Echoes the reasoning either way, so that the caller can log it.
 # --------------------------------------------------------------------------
-rcow_owner_is_stale()
+#
+# Two log formats name the holder: the legacy marker ("is already held by
+# node=... pid=...", s3_owner.c legacy path) and the strict v2 marker ("strict
+# acquire of '<key>' refused: held by node=... pid=..."). Both are read; the
+# decision below is the same for either.
+rcow_owner_holder()
 {
-	local since="${1:-0}" line node pid me
+	local since="${1:-0}" line node pid
 
 	line="$(tail -c "+$((since + 1))" "${RCOW_LOG}" 2>/dev/null |
-		grep -o 'is already held by node=[^ ]* pid=[0-9]*' | tail -1)"
+		grep -oE '(is already held by|refused: held by) node=[^ ]* pid=[0-9]*' |
+		tail -1)"
+	[ -n "${line}" ] || return 1
 
-	if [ -z "${line}" ]; then
+	node="${line#*node=}"; node="${node%% *}"
+	pid="${line##*pid=}"
+	printf '%s %s' "${node}" "${pid}"
+}
+
+# Strict v2 ownership (the default: S3LVOL_OWNER_MODE unset, empty or "strict")
+# has no force. Callers that would retry with force=true must clear the marker
+# out of band instead -- see rcow_owner_clear_stale().
+rcow_owner_mode_strict()
+{
+	case "${S3LVOL_OWNER_MODE:-}" in
+	''|strict) return 0 ;;
+	*)         return 1 ;;
+	esac
+}
+
+rcow_owner_is_stale()
+{
+	local since="${1:-0}" holder node pid me
+
+	if ! holder="$(rcow_owner_holder "${since}")"; then
 		printf 'the target log does not say who holds the marker'
 		return 1
 	fi
 
-	node="${line#*node=}"; node="${node%% *}"
-	pid="${line##*pid=}"
+	node="${holder%% *}"
+	pid="${holder##* }"
 	me="$(hostname)"
 
 	if [ "${node}" != "${me}" ]; then
@@ -773,6 +800,53 @@ rcow_owner_is_stale()
 
 	printf "it was left by this node's pid %s, which is not running" "${pid}"
 	return 0
+}
+
+# rcow_owner_clear_stale <log_mark> <lvs_name> <namespace>
+#
+# The strict-mode counterpart of retrying with force=true. Strict v2 refuses
+# force by design (s3_owner.h, "Crash-marker recovery"): the marker has to be
+# cleared out of band, after the old writer is known to be gone. This is that
+# step, and it is taken only when rcow_owner_is_stale() has already proved the
+# holder is this node's pid and that pid is not running a target.
+#
+# s3_owner_clear.py then refuses anything but a v2 held document naming
+# exactly that node and pid, and replaces it with a free tombstone through an
+# If-Match on the ETag it read, so a marker that changed in between is never
+# overwritten. The next attach takes the tombstone with its normal CAS.
+#
+# Echoes what it did; non-zero when the marker was left alone.
+rcow_owner_clear_stale()
+{
+	local since="$1" lvs="$2" ns="$3" holder node pid tool endpoint region
+	local -a flags=()
+
+	holder="$(rcow_owner_holder "${since}")" || {
+		printf 'the target log does not say who holds the marker'
+		return 1
+	}
+	node="${holder%% *}"
+	pid="${holder##* }"
+
+	tool="${RCOW_SCRIPTS_DIR:-$(dirname "${BASH_SOURCE[0]}")}/s3_owner_clear.py"
+	[ -f "${tool}" ] || tool="${RCOW_REPO_ROOT}/test/tools/s3_owner_clear.py"
+	if [ ! -f "${tool}" ]; then
+		printf 's3_owner_clear.py not found; the marker has to be cleared by hand'
+		return 1
+	fi
+
+	endpoint="$(rcow_cfg_get endpoint)"
+	region="$(rcow_cfg_get region)"
+	[ -n "${region}" ] || region="us-east-1"
+	rcow_s3_addr_flags flags
+	rcow_load_credentials || {
+		printf 'no S3 credentials in %s' "${RCOW_S3_CFG}"
+		return 1
+	}
+
+	python3 "${tool}" -e "${endpoint}" -b "${ns}" -r "${region}" \
+		--lvs "${lvs}" --expect-node "${node}" --expect-pid "${pid}" \
+		"${flags[@]+"${flags[@]}"}" 2>&1
 }
 
 # --------------------------------------------------------------------------

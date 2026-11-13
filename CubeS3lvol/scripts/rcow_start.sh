@@ -92,28 +92,95 @@ else
 fi
 
 # Set once the lvstore is up. Before that point a failure leaves a process
-# holding nothing, so it is cleaned up; after it, the process owns a replayed
-# journal and an open WAL, and killing it would only add a second recovery to
-# whatever is already being diagnosed.
+# holding nothing, so it is cleaned up by a plain signal. After it, the process
+# owns a replayed journal, an open WAL and the S3 owner marker, so a failed start
+# is undone with an unload first -- see release_lvstore().
 LVS_UP=0
 TGT_PID=""
+
+# A start that fails after the attach must not leave the target behind holding
+# the owner marker. The supervisor exits on the failure, systemd then stops the
+# unit, and its stop budget runs out on a target that is still attached -- the
+# SIGKILL that follows leaves a strict marker that refuses every later attach
+# (observed: B17, app2, 2026-11-13). rcow_unload_lvstore drains what was
+# acknowledged into S3, closes the log and releases the marker to a free
+# tombstone; only then is the target stopped. If the unload itself fails the
+# WAL still holds every acknowledged write and the marker names a pid that is
+# about to be dead, which the next start clears (rcow_owner_clear_stale).
+release_lvstore()
+{
+	local out
+
+	rcow_log "the lvstore was attached; unloading it so the owner marker is \
+released before the target is stopped"
+	if out="$(RCOW_RPC_TIMEOUT="${RCOW_FAIL_UNLOAD_TIMEOUT:-90}" \
+			rcow_rpc rcow_unload_lvstore \
+			"$(printf '{"lvs_name":"%s"}' "${RCOW_LVS_NAME}")" 2>&1)"; then
+		rcow_log "unloaded: acknowledged writes are in S3 and the marker is free"
+	else
+		rcow_warn "rcow_unload_lvstore did not complete: ${out}"
+		rcow_warn "the WAL keeps every acknowledged write; the next start \
+clears the marker this pid leaves behind"
+	fi
+	rcow_kill_target "${TGT_PID}" 30
+	rm -f "${RCOW_PIDFILE}" "${RCOW_RPC_SOCK}" "${RCOW_RPC_SOCK}.lock"
+}
 
 bail()
 {
 	rcow_err "$*"
 	rcow_log_tail 30
 
-	if [ -n "${TGT_PID}" ] && [ "${LVS_UP}" -eq 0 ] && kill -0 "${TGT_PID}" 2>/dev/null; then
-		rcow_log "no lvstore was attached yet, so the target is being stopped \
-again; nothing it held needs draining"
-		rcow_kill_target "${TGT_PID}" 15
-		rm -f "${RCOW_PIDFILE}"
-	elif [ -n "${TGT_PID}" ]; then
-		rcow_warn "the target (pid ${TGT_PID}) is left running with the \
-lvstore attached. Use rcow_stop.sh to shut it down cleanly once you have looked \
-at the log"
+	if [ -n "${TGT_PID}" ] && kill -0 "${TGT_PID}" 2>/dev/null; then
+		if [ "${LVS_UP}" -eq 0 ]; then
+			rcow_log "no lvstore was attached yet, so the target is being \
+stopped again; nothing it held needs draining"
+			rcow_kill_target "${TGT_PID}" 15
+			rm -f "${RCOW_PIDFILE}"
+		else
+			release_lvstore
+		fi
 	fi
 	exit 1
+}
+
+# retry_after_stale_owner <verb> <rpc> <params-without-force> <log_mark> <ns>
+#
+# After a refused attach/create: if the marker is provably this node's dead pid,
+# take it over -- with force=true in legacy mode, and in strict mode (which
+# rejects force by design) by clearing it to a free tombstone and retrying
+# without force. Not run in a subshell, so its results reach the caller:
+#   RETRY_OUT     the retried RPC's output (or why nothing was retried)
+#   OWNER_REASON  the staleness verdict
+# Returns 0 when the retry succeeded, 1 when the marker was not confirmed stale
+# (nothing was touched), 2 when a takeover was attempted and failed.
+retry_after_stale_owner()
+{
+	local verb="$1" rpc="$2" params="$3" mark="$4" ns="$5" out
+
+	RETRY_OUT=""
+	OWNER_REASON=""
+	[ "${AUTO_FORCE}" -eq 1 ] && [ "${FORCE}" -eq 0 ] || return 1
+	OWNER_REASON="$(rcow_owner_is_stale "${mark}")" || return 1
+
+	if rcow_owner_mode_strict; then
+		rcow_warn "the ${verb} was refused because a strict owner marker is \
+still in S3: ${OWNER_REASON}. Strict ownership has no force; clearing the marker \
+to a free tombstone (conditional on the holder named) and retrying"
+		if ! out="$(rcow_owner_clear_stale "${mark}" "${RCOW_LVS_NAME}" "${ns}")"; then
+			RETRY_OUT="the stale marker was not cleared: ${out}"
+			return 2
+		fi
+		rcow_log "${out}"
+		RETRY_OUT="$(rcow_rpc "${rpc}" "${params},\"force\":false}" 2>&1)" ||
+			return 2
+		return 0
+	fi
+
+	rcow_warn "the ${verb} was refused because an owner marker is still in S3: \
+${OWNER_REASON}. Retrying with force=true"
+	RETRY_OUT="$(rcow_rpc "${rpc}" "${params},\"force\":true}" 2>&1)" || return 2
+	return 0
 }
 
 # ==========================================================================
@@ -318,16 +385,14 @@ which replays the journal and the WAL"
 		# -EBUSY here is almost always the owner marker left behind by a
 		# process that died, which is the one case the marker cannot settle by
 		# itself. See rcow_owner_is_stale() for what "confirmed" means.
-		if [ "${AUTO_FORCE}" -eq 1 ] && [ "${FORCE}" -eq 0 ] &&
-		   OWNER_REASON="$(rcow_owner_is_stale "${LOG_MARK}")"; then
-			rcow_warn "the attach was refused because an owner marker is \
-still in S3: ${OWNER_REASON}. Retrying with force=true"
-			ATTACH_OUT="$(rcow_rpc rcow_attach_lvstore \
-				"${ATTACH_PARAMS},\"force\":true}" 2>&1)" || {
-				rcow_err "rcow_attach_lvstore failed even with force: \
-${ATTACH_OUT}"
-				bail "the lvstore could not be attached"
-			}
+		RETRY_RC=0
+		retry_after_stale_owner attach rcow_attach_lvstore \
+			"${ATTACH_PARAMS}" "${LOG_MARK}" "${LVS_NS}" || RETRY_RC=$?
+		if [ "${RETRY_RC}" -eq 0 ]; then
+			ATTACH_OUT="${RETRY_OUT}"
+		elif [ "${RETRY_RC}" -eq 2 ]; then
+			rcow_err "taking over the stale marker failed: ${RETRY_OUT}"
+			bail "the lvstore could not be attached"
 		else
 			rcow_err "rcow_attach_lvstore failed: ${ATTACH_OUT}"
 			[ -n "${OWNER_REASON:-}" ] &&
@@ -370,14 +435,12 @@ ${RCOW_BSTORE_FILE}"
 	LOG_MARK="$(rcow_log_size)"
 	if ! CREATE_OUT="$(rcow_rpc rcow_create_lvstore \
 			"${CREATE_PARAMS},\"force\":${FORCE_JSON}}" 2>&1)"; then
-		if [ "${AUTO_FORCE}" -eq 1 ] && [ "${FORCE}" -eq 0 ] &&
-		   OWNER_REASON="$(rcow_owner_is_stale "${LOG_MARK}")"; then
-			rcow_warn "the create was refused because an owner marker is \
-still in S3: ${OWNER_REASON}. Retrying with force=true"
-			rcow_rpc rcow_create_lvstore "${CREATE_PARAMS},\"force\":true}" \
-				>/dev/null || bail "rcow_create_lvstore failed even with force"
-		else
+		RETRY_RC=0
+		retry_after_stale_owner create rcow_create_lvstore \
+			"${CREATE_PARAMS}" "${LOG_MARK}" "${LVS_NS}" || RETRY_RC=$?
+		if [ "${RETRY_RC}" -ne 0 ]; then
 			rcow_err "rcow_create_lvstore failed: ${CREATE_OUT}"
+			[ -n "${RETRY_OUT}" ] && rcow_err "${RETRY_OUT}"
 			bail "the lvstore could not be created"
 		fi
 	fi
@@ -443,8 +506,20 @@ rcow_log "activate a volume:  rcow_rpc rcow_active_bdev '{\"device_name\":\"NAME
 rcow_log "find its device:    rcow_rpc rcow_get_bdev '{\"device_name\":\"NAME\"}'"
 
 if [ "${REPLAY_RC}" -ne 0 ]; then
-	rcow_err "the data plane is up but the previous layout was not fully \
+	# The lvstore is attached and serving; some previously active volumes did
+	# not come back as block devices in time. Failing the start here makes the
+	# supervisor exit and systemd stop the unit, so the whole node goes down
+	# (and, before release_lvstore, stayed down behind a stale marker: B17)
+	# over a few volumes. Those that did come back are usable and the missing
+	# ones can be re-activated by their owner, so by default this is a warning.
+	# RCOW_REPLAY_STRICT=1 restores the fatal behaviour, and bail then releases
+	# the marker on the way out.
+	if [ "${RCOW_REPLAY_STRICT:-0}" = "1" ]; then
+		bail "the data plane came up but the previous layout was not fully \
 restored; see the warnings above"
-	exit 1
+	fi
+	rcow_warn "the data plane is up but the previous layout was not fully \
+restored; see the warnings above. Continuing (RCOW_REPLAY_STRICT=1 makes this \
+fatal)"
 fi
 exit 0

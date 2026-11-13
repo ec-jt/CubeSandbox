@@ -292,6 +292,12 @@ log "scripts/s3_bucket.py (ensure-bucket, used by the one-click supervisor)"
 install -m 0755 "${REPO_ROOT}/test/tools/s3_bucket.py" \
 	"${PKG_DIR}/scripts/s3_bucket.py" || die "install failed"
 
+# rcow_start.sh clears a strict owner marker left by this node's dead pid with
+# this (conditional If-Match replace to a free tombstone). Same stdlib client.
+log "scripts/s3_owner_clear.py (stale strict marker clear, used by rcow_start.sh)"
+install -m 0755 "${REPO_ROOT}/test/tools/s3_owner_clear.py" \
+	"${PKG_DIR}/scripts/s3_owner_clear.py" || die "install failed"
+
 log "scripts/rpc.py + scripts/rpc_compat.py (this repo's 3.8-compatible launcher)"
 install -m 0755 "${REPO_ROOT}/scripts/rpc.py" "${PKG_DIR}/scripts/rpc.py" ||
 	die "install failed"
