@@ -191,8 +191,11 @@ def clear(client, lvs, expect_node, expect_pid):
     lvs_uuid = str(doc.get("lvs_uuid") or "00000000-0000-0000-0000-000000000000")
     new_body, nonce = encode_free(lvs_uuid)
 
+    # Sent unquoted: Ceph RGW (Hetzner Object Storage) answers 412 to a quoted
+    # ETag even when it is the current one, and matches the bare value -- the
+    # same form s3_put_if_match() sends. Measured on hel1 2026-11-13.
     status, _, resp = client.request("PUT", key, body=new_body,
-                                     extra={"If-Match": etag})
+                                     extra={"If-Match": etag.strip('"')})
     if status in (409, 412):
         return 1, ("the conditional replace of %s was rejected (HTTP %d): the "
                    "marker changed since it was read; nothing was written" % (key, status))
