@@ -635,6 +635,14 @@ func (w *s3ExportWorker) waitSettled(ctx context.Context, m *S3Cow, id string, r
 				return nil
 			case cow.ExportStatusIsFailed(v.status):
 				return fmt.Errorf("accepted export %s of %s ended %s", uuid, ref.Name, v.status)
+			case v.status == cow.ExportStatusNone:
+				// The native export no longer exists (abandoned, released, or a
+				// pre-publication failure that dropped its reservation). The
+				// cubecow index may still carry the old uuid. Hand back to
+				// exportRole, which resubmits on NONE.
+				CubeLog.Warnf("async s3 export %s: %s %s uuid=%s now reads NONE after %s; resubmitting",
+					id, ref.Role, ref.Name, uuid, time.Since(start).Truncate(time.Millisecond))
+				return errExportAbandoned
 			}
 		}
 		if err := w.sleep(wctx, w.cfg.PollInterval); err != nil {

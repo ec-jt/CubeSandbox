@@ -416,3 +416,25 @@ func TestExportWorkerOrphanWaitRespectsCancellation(t *testing.T) {
 	}
 	require.Empty(t, e.submits)
 }
+
+// B16 live finding: an export abandoned or dropped out-of-band reads NONE while
+// the cubecow index still carries the old uuid. The settle wait must treat NONE
+// as "gone, resubmit" instead of waiting out RoleSettleTimeout.
+func TestExportWorkerSettleResubmitsWhenNativeReadsNone(t *testing.T) {
+	w, e, entry := stuckRole(t)
+	w.cfg.OrphanAfter = time.Hour
+	w.cfg.RoleSettleTimeout = time.Hour
+	e.volumeInfos[entry.MemoryVol].ExportStatus = cow.ExportStatusNone
+	delete(e.stuck, entry.MemoryVol)
+	done := make(chan error, 1)
+	go func() { done <- w.runOne(context.Background(), entry.SnapshotID) }()
+	select {
+	case err := <-done:
+		require.NoError(t, err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("settle wait did not react to NONE")
+	}
+	require.Empty(t, e.abandoned)
+	require.Equal(t, []string{entry.MemoryVol, entry.MetadataVol}, e.submits)
+	require.Equal(t, cow.ExportStatusDone, e.volumeInfos[entry.MemoryVol].ExportStatus)
+}
