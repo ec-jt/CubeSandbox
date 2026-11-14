@@ -12,6 +12,7 @@ package cubecow
 #include "cubecow.h"
 #include <stdlib.h>
 extern int32_t cubecow_checkpoint_record(CubecowEngineHandle engine, const char* request, char** out_json);
+extern int32_t cubecow_import_status(CubecowEngineHandle engine, const char* lvol_name, char** out_json);
 
 static inline int32_t cubecow_create_snapshot_from_volume_go(
     CubecowEngineHandle engine,
@@ -469,6 +470,25 @@ func (e *Engine) CheckpointRecord(request string) (string, error) {
 	defer C.free(unsafe.Pointer(cRequest))
 	var result *C.char
 	if rc := C.cubecow_checkpoint_record(C.CubecowEngineHandle(ptr), cRequest, &result); rc != 0 {
+		return "", makeError(rc)
+	}
+	return takeCString(result), nil
+}
+
+// ImportStatus returns the native JSON of rcow_import_status for an imported
+// volume (B19 whole-chunk prefetch and decouple progress).
+func (e *Engine) ImportStatus(lvolName string) (string, error) {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+	ptr, err := e.openHandle()
+	if err != nil {
+		return "", err
+	}
+	defer e.mu.RUnlock()
+	cName := C.CString(lvolName)
+	defer C.free(unsafe.Pointer(cName))
+	var result *C.char
+	if rc := C.cubecow_import_status(C.CubecowEngineHandle(ptr), cName, &result); rc != 0 {
 		return "", makeError(rc)
 	}
 	return takeCString(result), nil

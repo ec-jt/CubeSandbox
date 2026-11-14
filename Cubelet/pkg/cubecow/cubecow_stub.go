@@ -96,6 +96,10 @@ func (e *Engine) ImportLvol(string, string) (string, error) {
 	return "", fmt.Errorf(nativeBuildHint)
 }
 
+func (e *Engine) ImportStatus(string) (string, error) {
+	return "", fmt.Errorf(nativeBuildHint)
+}
+
 func (e *Engine) GetMetrics() (map[string]uint64, error) {
 	return nil, fmt.Errorf(nativeBuildHint)
 }

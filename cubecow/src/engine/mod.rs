@@ -139,6 +139,15 @@ pub trait Engine: Send + Sync {
         ))
     }
 
+    /// B19: progress of an imported volume's whole-chunk prefetch and
+    /// decouple, as the native JSON object of `rcow_import_status`. `done`
+    /// is true once no read of the volume can reach the export.
+    fn import_status(&self, _lvol_name: &str) -> CubecowResult<String> {
+        Err(CubecowError::PreconditionFailed(
+            "import_status is not implemented by this backend".to_string(),
+        ))
+    }
+
     // -----------------------------------------------------------------------
     // Node operations
     // -----------------------------------------------------------------------

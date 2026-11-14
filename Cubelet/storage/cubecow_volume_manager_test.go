@@ -16,16 +16,16 @@ import (
 )
 
 type fakeCowEngine struct {
-	createVolumePath            string
-	createVolumeErr             error
-	createVolumes               []string
-	createVolumeSizes           map[string]uint64
+	createVolumePath  string
+	createVolumeErr   error
+	createVolumes     []string
+	createVolumeSizes map[string]uint64
 	// staleIndexNames models the S3 engine's persisted name index: the name is
 	// still indexed, so CreateVolume/CreateSnapshotFromVolume report
 	// AlreadyExists, but the attached lvstore does not hold the object.
 	staleIndexNames []string
 	// getVolumeInfoErr is returned for every lookup (non-not-found failure).
-	getVolumeInfoErr error
+	getVolumeInfoErr            error
 	createSnapshots             [][2]string
 	createSnapshotActivations   []bool
 	createSnapshotPath          string
@@ -41,6 +41,8 @@ type fakeCowEngine struct {
 	listSnapshots               map[string][]cubecow.Snapshot
 	listSnapshotsErr            error
 	deletedVolumes              []string
+	importStatusCalls           []string
+	importStatusFn              func(name string, call int) (string, error)
 	deletedSnapshots            []string
 	deleteVolumeErr             error
 	deleteSnapshotErr           error
@@ -58,6 +60,16 @@ type fakeCowEngine struct {
 
 // ImportLvol makes the fake a cowVolumeImporter: cross-node create imports
 // each disk under the sandbox's own name.
+// ImportStatus answers rcow_import_status. Without a scripted reply the
+// import is reported done, which is what every pre-B19 test expects.
+func (f *fakeCowEngine) ImportStatus(name string) (string, error) {
+	f.importStatusCalls = append(f.importStatusCalls, name)
+	if f.importStatusFn != nil {
+		return f.importStatusFn(name, len(f.importStatusCalls))
+	}
+	return `{"state":"done","done":true,"present_chunks":1,"local_chunks":1}`, nil
+}
+
 func (f *fakeCowEngine) ImportLvol(name, remoteUUID string) (string, error) {
 	f.importedLvols = append(f.importedLvols, [2]string{name, remoteUUID})
 	if f.importErr != nil {

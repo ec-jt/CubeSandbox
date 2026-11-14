@@ -613,6 +613,14 @@ impl Engine for S3Engine {
         Ok((old_size, new_size_bytes))
     }
 
+    fn import_status(&self, lvol_name: &str) -> CubecowResult<String> {
+        Self::validate_name(lvol_name, "volume")?;
+        extract_string_value(&self.rpc.call_raw(
+            "rcow_import_status",
+            &serde_json::json!({"lvol_name": lvol_name, "ensure": true}),
+        )?)
+    }
+
     fn checkpoint_record(&self, request: &str) -> CubecowResult<String> {
         if request.len() > 160 * 1024 {
             return Err(CubecowError::InvalidArg("checkpoint request too large".into()));
@@ -1188,6 +1196,9 @@ impl Engine for S3Engine {
                 "lvol_name": lvol_name,
                 "export_uuid": export_uuid,
                 "decouple": true,
+                // B19: fetch every present chunk whole and in parallel and
+                // materialise locally; callers wait on rcow_import_status.
+                "prefetch": true,
             }),
         ) {
             Ok(_) => {}
@@ -1868,6 +1879,48 @@ mod tests {
             }
             std::fs::remove_dir_all(dir).unwrap();
         }
+    }
+
+    #[test]
+    fn import_status_ffi_routes_native_reply() {
+        use std::io::{BufRead, BufReader, Write};
+        use std::os::unix::net::UnixListener;
+        let dir = std::env::temp_dir().join(format!("impstat-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&dir).unwrap();
+        let socket = dir.join("rpc.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            let request: serde_json::Value = serde_json::from_str(&line).unwrap();
+            assert_eq!(request["method"], "rcow_import_status");
+            assert_eq!(request["params"]["lvol_name"], "s3-meta-sb1");
+            assert_eq!(request["params"]["ensure"], true);
+            let body = serde_json::json!({"state":"running","present_chunks":17,"local_chunks":5,"done":false,"error":0});
+            writeln!(stream, "{}", serde_json::json!({"jsonrpc":"2.0","id":request["id"],"result":{"bool_value":true,"string_value":body.to_string()}})).unwrap();
+        });
+        let engine = S3Engine {
+            cfg: S3Config { state_dir: dir.clone(), ..Default::default() },
+            rpc: Arc::new(JsonRpcClient::new(socket, Duration::from_secs(2))),
+            name_index: RwLock::new(HashMap::new()),
+            metrics: Arc::new(MetricsCollector::new()),
+        };
+        let handle: Box<Box<dyn Engine>> = Box::new(Box::new(engine));
+        let ptr = Box::into_raw(handle) as *mut std::ffi::c_void;
+        let name = std::ffi::CString::new("s3-meta-sb1").unwrap();
+        let mut out = std::ptr::null_mut();
+        assert_eq!(crate::ffi::cubecow_import_status(ptr, name.as_ptr(), &mut out), 0);
+        let got: serde_json::Value = serde_json::from_str(
+            unsafe { std::ffi::CStr::from_ptr(out) }.to_str().unwrap()).unwrap();
+        assert_eq!(got["present_chunks"], 17);
+        assert_eq!(got["local_chunks"], 5);
+        assert_eq!(got["done"], false);
+        crate::ffi::cubecow_free_string(out);
+        crate::ffi::cubecow_shutdown(ptr);
+        server.join().unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

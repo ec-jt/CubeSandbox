@@ -344,6 +344,13 @@ int32_t cubecow_create_volume_from_snapshot(
 int32_t cubecow_get_metrics(CubecowEngineHandle engine, char** out_json);
 int32_t cubecow_checkpoint_record(CubecowEngineHandle engine, const char* request, char** out_json);
 
+/*
+ * B19: native JSON progress of an imported volume's whole-chunk prefetch and
+ * decouple (rcow_import_status). Caller frees *out_json with
+ * cubecow_free_string.
+ */
+int32_t cubecow_import_status(CubecowEngineHandle engine, const char* lvol_name, char** out_json);
+
 #ifdef __cplusplus
 } /* extern "C" */
 #endif

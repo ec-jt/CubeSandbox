@@ -1113,6 +1113,40 @@ pub extern "C" fn cubecow_checkpoint_record(
     }
 }
 
+/// B19: native JSON progress of an imported volume's prefetch/decouple
+/// (`rcow_import_status`). Caller frees `out_json` with `cubecow_free_string`.
+#[no_mangle]
+pub extern "C" fn cubecow_import_status(
+    engine: *mut std::ffi::c_void,
+    lvol_name: *const c_char,
+    out_json: *mut *mut c_char,
+) -> i32 {
+    let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+        // SAFETY: `engine` was created by `cubecow_init` and is valid.
+        let eng = unsafe { engine_ref(engine) }?;
+        // SAFETY: `lvol_name` is a valid C string provided by the caller.
+        let name = unsafe { c_str_to_str(lvol_name) }?;
+        match eng.import_status(name) {
+            Ok(body) => {
+                if !out_json.is_null() {
+                    // SAFETY: `out_json` is non-null and writable.
+                    unsafe { *out_json = rust_string_to_c(&body) };
+                }
+                Ok(COW_OK)
+            }
+            Err(e) => Err(handle_cow_error(&e)),
+        }
+    }));
+    match result {
+        Ok(Ok(code)) => code,
+        Ok(Err(code)) => code,
+        Err(_) => {
+            set_last_error("panic during cubecow_import_status");
+            COW_ERR_PANIC
+        }
+    }
+}
+
 /// Instantiate a writable volume from an `export_uuid` produced by a
 /// remote node's `cubecow_export_snapshot`.
 ///

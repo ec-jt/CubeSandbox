@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/pkg/cubecow"
@@ -44,6 +45,7 @@ func stubS3MetadataMounts(t *testing.T) {
 	mounted := map[string]string{}
 	origFormat := formatS3MetadataBaseDevice
 	origMount := mountS3MetadataDevice
+	origTimeoutMount := mountS3MetadataDeviceTimeout
 	origUmount := unmountS3MetadataPath
 	origFinalizeUmount := unmountS3FinalizePath
 	origIsMounted := s3MetadataIsMounted
@@ -54,6 +56,10 @@ func stubS3MetadataMounts(t *testing.T) {
 		return nil
 	}
 	mountS3MetadataDevice = func(devicePath, mountPath string) error {
+		mounted[mountPath] = devicePath
+		return nil
+	}
+	mountS3MetadataDeviceTimeout = func(devicePath, mountPath string, _ time.Duration) error {
 		mounted[mountPath] = devicePath
 		return nil
 	}
@@ -71,6 +77,7 @@ func stubS3MetadataMounts(t *testing.T) {
 	t.Cleanup(func() {
 		formatS3MetadataBaseDevice = origFormat
 		mountS3MetadataDevice = origMount
+		mountS3MetadataDeviceTimeout = origTimeoutMount
 		unmountS3MetadataPath = origUmount
 		unmountS3FinalizePath = origFinalizeUmount
 		s3MetadataIsMounted = origIsMounted

@@ -127,7 +127,7 @@ func (s *SandboxImport) EnsureMetadata(ctx context.Context) (string, error) {
 		return "", err
 	}
 	dir := s.MetadataDir()
-	if err := MountS3MetadataAt(ctx, cow.BackendS3, s.SandboxID, dir); err != nil {
+	if err := MountImportedS3MetadataAt(ctx, cow.BackendS3, s.SandboxID, dir); err != nil {
 		return "", fmt.Errorf("mount imported metadata for sandbox %s: %w", s.SandboxID, err)
 	}
 	return dir, nil
@@ -212,6 +212,18 @@ func (s *SandboxImport) importOne(ctx context.Context, name, role, uuid string) 
 	}
 	if err := requireImportedOrigin(info, name, uuid); err != nil {
 		return "", fmt.Errorf("refuse imported %s %s: %w", role, name, err)
+	}
+	// B19: the volume must not be used while its reads still go to the
+	// export. Wait for the whole-chunk prefetch and decouple to finish before
+	// activating it, so the metadata mount and the VM only ever read local
+	// data. A timeout or prefetch error fails the Create; the B18 rollback
+	// releases what was imported.
+	statuser, ok := store.engine.(cowImportStatuser)
+	if !ok {
+		return "", fmt.Errorf("cubecow engine cannot report import status of %s %s", role, name)
+	}
+	if err := waitImportPrefetch(ctx, statuser, name, role, importPrefetchTimeout); err != nil {
+		return "", fmt.Errorf("imported %s %s is not local: %w", role, name, err)
 	}
 	if _, err := store.engine.ActivateVolume(name); err != nil && !isCowSemantic(err, cubecow.SemAlreadyExists) {
 		return "", fmt.Errorf("activate imported %s %s: %w", role, name, err)

@@ -110,6 +110,16 @@ type Config struct {
 	// recompiling.
 	CmdTimeout tomlext.Duration `toml:"cmd_timeout"`
 
+	// ImportPrefetchTimeout bounds how long a cross-node restore waits for
+	// an imported volume's whole-chunk prefetch and decouple to complete
+	// before using it (B19). Default 300s.
+	ImportPrefetchTimeout tomlext.Duration `toml:"import_prefetch_timeout"`
+
+	// ImportedMetadataMountTimeout is the mount timeout for the metadata
+	// disk a cross-node restore imported, used instead of cmd_timeout
+	// (B19). Default 120s.
+	ImportedMetadataMountTimeout tomlext.Duration `toml:"imported_metadata_mount_timeout"`
+
 	// VolumePlugins lists external volume plugin configurations.
 	// Built-in plugins are registered in code and do not need entries here.
 	//
@@ -409,6 +419,9 @@ func init() {
 					tomlext.ToStdTime(localStorage.config.CmdTimeout))
 			}
 			cmdTimeout = tomlext.ToStdTime(localStorage.config.CmdTimeout)
+			if err := applyImportTimeouts(localStorage.config); err != nil {
+				return nil, err
+			}
 			if localStorage.config.StorageBackend != StorageBackendCow {
 				checkPoolType(localStorage.config)
 			}
