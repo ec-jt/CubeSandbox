@@ -37,6 +37,7 @@
 #include "spdk/util.h"
 
 #include "s3lvol/s3_export.h"
+#include "s3lvol/s3_hedge.h"
 #include "s3lvol/s3_chunk_map.h"
 
 SPDK_LOG_REGISTER_COMPONENT(s3lvol_export)
@@ -2118,8 +2119,13 @@ export_chunk_read(void *cb_arg, int bserrno)
 	slot->iov.iov_base = slot->buf;
 	slot->iov.iov_len = ctx->chunk_size;
 
-	rc = s3_put(ctx->client, slot->key, &slot->iov, 1, false,
-		    export_chunk_uploaded, slot);
+	/* Hedged: an export chunk key is written once per export uuid and never
+	 * with other bytes (a re-export is a new uuid), and slot->buf is only
+	 * released from export_chunk_uploaded(). The manifest PUT below is NOT
+	 * hedged: a manifest is rewritten in place when its generation is bumped,
+	 * and a delayed duplicate could roll it back. */
+	rc = s3_put_hedged(ctx->client, slot->key, &slot->iov, 1, NULL,
+			   export_chunk_uploaded, slot);
 	if (rc != 0) {
 		SPDK_ERRLOG("Failed to submit export chunk %" PRIu64 ": %s\n",
 			    slot->chunk_index, spdk_strerror(-rc));

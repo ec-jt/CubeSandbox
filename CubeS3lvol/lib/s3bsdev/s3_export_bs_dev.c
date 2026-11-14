@@ -79,6 +79,31 @@
  *
  *   Holes and the REF tail are unchanged: a chunk absent from the manifest, or a
  *   byte range past a REF chunk's valid_bytes, is zero-filled without any I/O.
+ *
+ *   === Tail latency: hedging and per-chunk retry ===
+ *
+ *   Every whole-chunk GET is hedged (s3_get_range_hedged): if it has not
+ *   completed after max(1 s, 3 x p50), a duplicate is sent and the first to
+ *   finish wins. A fetch that still fails -- a 5xx, a stall the deadline cut
+ *   off, a short body -- is retried by the slot itself, up to
+ *   S3LVOL_IMPORT_CHUNK_RETRIES times (default 5) with exponential backoff and
+ *   jitter (200 ms base, 5 s cap). Each retry is a fresh request, so CRT picks a
+ *   new connection. Only when the retries are spent do the slot's readers and
+ *   its prefetcher see the error, and nothing else in flight is disturbed by
+ *   one chunk's trouble. A 404 is not retried: it has its own meaning (the
+ *   source materialised the export) and its own recovery, the manifest refetch.
+ *
+ *   Before this, one chunk whose GET stalled five times in a row (crt=2073,
+ *   then the 60 s deadline) failed a 626-chunk import at chunk 157.
+ *
+ *   === Shared prefetch budget ===
+ *
+ *   Each prefetcher bounds what it *holds* with its window. A budget, when one
+ *   is attached, additionally bounds the GETs in flight across every prefetcher
+ *   attached to it, so the volumes of one sandbox can be prefetched at the same
+ *   time without multiplying the load on the endpoint. When a budgeted fetch
+ *   completes, every attached prefetcher is pumped, so a slot freed by one
+ *   volume can be taken by another.
  */
 
 #include "spdk/stdinc.h"
@@ -90,6 +115,7 @@
 
 #include "s3lvol/s3_chunk_map.h"
 #include "s3lvol/s3_export.h"
+#include "s3lvol/s3_hedge.h"
 
 /* Demand-miss partition of the slot table. See the file comment. */
 #define EXPORT_MISS_SLOTS 16
@@ -117,6 +143,10 @@ struct export_slot {
 	uint32_t                    pins;         /* prefetcher references */
 	uint64_t                    gen;          /* bumped on every reuse */
 	uint64_t                    lru;
+	/* Retry state of the fetch in progress (see the file comment). */
+	uint32_t                    retries;      /* retries done for this fetch */
+	struct spdk_poller         *retry_poller;
+	struct s3_hedge_counters    hedge;        /* this fetch, all attempts */
 	TAILQ_HEAD(, s3_export_chunk_io) waiters;
 	TAILQ_HEAD(, export_pf_wait)     pf_waiters;
 };
@@ -166,6 +196,10 @@ struct s3_export_dev {
 	uint64_t                   lru_clock;
 	uint32_t                   fetch_inflight;
 	bool                       destroy_pending;
+	uint32_t                   max_retries;
+	uint32_t                   retry_base_ms;
+	uint32_t                   retry_cap_ms;
+	unsigned int               rand_seed;
 	struct s3_export_bs_dev_stats stats;
 };
 
@@ -236,7 +270,18 @@ struct s3_export_chunk_io {
 struct export_pf_wait {
 	struct s3_export_prefetcher *p;
 	uint64_t                     chunk_index;
+	bool                         budgeted;  /* holds one unit of p's budget */
+	bool                         launcher;  /* this wait started the fetch */
 	TAILQ_ENTRY(export_pf_wait)  link;
+};
+
+/* What a finished fetch tells the prefetchers waiting on it. */
+struct export_fetch_result {
+	int      status;
+	uint64_t bytes;
+	uint32_t retries;
+	uint64_t hedges_issued;
+	uint64_t hedges_won;
 };
 
 /* ==========================================================================
@@ -346,7 +391,9 @@ export_io_put(struct s3_export_io *io)
 }
 
 static void export_chunk_read_done(void *cb_arg, uint64_t bytes_read, int status);
-static void export_pf_slot_done(struct export_pf_wait *w, int status);
+static void export_pf_slot_done(struct export_pf_wait *w,
+				const struct export_fetch_result *res);
+static int export_slot_send(struct s3_export_dev *dev, struct export_slot *s);
 static void export_destroy_now(struct s3_export_dev *dev);
 
 /* ==========================================================================
@@ -411,6 +458,8 @@ export_slot_alloc(struct s3_export_dev *dev, bool prefetch_part, uint32_t window
 	victim->prefetch_part = prefetch_part;
 	victim->pins = 0;
 	victim->gen++;
+	victim->retries = 0;
+	memset(&victim->hedge, 0, sizeof(victim->hedge));
 	TAILQ_INIT(&victim->waiters);
 	TAILQ_INIT(&victim->pf_waiters);
 	return victim;
@@ -463,6 +512,59 @@ export_cio_deliver(struct s3_export_chunk_io *cio)
 	}
 }
 
+/* Backoff before retry number \p n (1-based): base x 2^(n-1), capped, with the
+ * upper half jittered so that chunks which failed together do not retry in
+ * lockstep. */
+static uint64_t
+export_retry_delay_ms(struct s3_export_dev *dev, uint32_t n)
+{
+	uint64_t d = dev->retry_base_ms;
+	uint32_t i;
+
+	for (i = 1; i < n && d < dev->retry_cap_ms; i++) {
+		d *= 2;
+	}
+	if (d > dev->retry_cap_ms) {
+		d = dev->retry_cap_ms;
+	}
+	if (d < 2) {
+		return d;
+	}
+	return d / 2 + (uint64_t)rand_r(&dev->rand_seed) % (d / 2 + 1);
+}
+
+static void export_slot_fetch_done(void *cb_arg, uint64_t bytes_read, int status);
+
+static int
+export_slot_retry_fire(void *arg)
+{
+	struct export_slot *s = arg;
+	struct s3_export_dev *dev = s->dev;
+	int rc;
+
+	spdk_poller_unregister(&s->retry_poller);
+	if (dev->destroy_pending) {
+		/* Whoever waited on this is gone or going; do not send more. */
+		export_slot_fetch_done(s, 0, -ECANCELED);
+		return SPDK_POLLER_BUSY;
+	}
+	rc = export_slot_send(dev, s);
+	if (rc != 0) {
+		/* Could not even submit: counts as this retry failing. */
+		export_slot_fetch_done(s, 0, rc);
+	}
+	return SPDK_POLLER_BUSY;
+}
+
+/* A failed fetch that may be tried again: anything but a 404 (its own meaning,
+ * see export_chunk_read_done) and a teardown cancel. */
+static bool
+export_slot_should_retry(struct s3_export_dev *dev, struct export_slot *s, int status)
+{
+	return status != 0 && status != -ENOENT && status != -ECANCELED &&
+	       !dev->destroy_pending && s->retries < dev->max_retries;
+}
+
 static void
 export_slot_fetch_done(void *cb_arg, uint64_t bytes_read, int status)
 {
@@ -470,11 +572,9 @@ export_slot_fetch_done(void *cb_arg, uint64_t bytes_read, int status)
 	struct s3_export_dev *dev = s->dev;
 	struct s3_export_chunk_io *cio, *ctmp;
 	struct export_pf_wait *w, *wtmp;
+	struct export_fetch_result res;
 	TAILQ_HEAD(, s3_export_chunk_io) waiters;
 	TAILQ_HEAD(, export_pf_wait) pf_waiters;
-
-	assert(dev->fetch_inflight > 0);
-	dev->fetch_inflight--;
 
 	if (status == 0 && bytes_read != s->object_len) {
 		/* Same rule as a ranged read: a short answer is an error, never zeroes. */
@@ -483,6 +583,35 @@ export_slot_fetch_done(void *cb_arg, uint64_t bytes_read, int status)
 			    "zeroes.\n", s->key, s->object_len, bytes_read);
 		status = -EIO;
 	}
+
+	if (export_slot_should_retry(dev, s, status)) {
+		uint64_t delay = export_retry_delay_ms(dev, s->retries + 1);
+
+		s->retries++;
+		dev->stats.fetch_retries++;
+		SPDK_WARNLOG("Export chunk '%s' fetch failed (%s); retry %u of %u in "
+			     "%" PRIu64 " ms\n", s->key, spdk_strerror(-status),
+			     s->retries, dev->max_retries, delay);
+		/* Still in flight as far as everyone is concerned: the readers and
+		 * the prefetcher keep waiting, and destroy keeps waiting for it. */
+		s->retry_poller = SPDK_POLLER_REGISTER(export_slot_retry_fire, s,
+						       delay * 1000);
+		if (s->retry_poller) {
+			return;
+		}
+		SPDK_ERRLOG("Export chunk '%s': no poller for the retry\n", s->key);
+	}
+
+	assert(dev->fetch_inflight > 0);
+	dev->fetch_inflight--;
+	dev->stats.hedges_issued += s->hedge.issued;
+	dev->stats.hedges_won += s->hedge.won;
+	res.status = status;
+	res.bytes = status == 0 ? s->object_len : 0;
+	res.retries = s->retries;
+	res.hedges_issued = s->hedge.issued;
+	res.hedges_won = s->hedge.won;
+
 	if (status == 0) {
 		s->state = EXPORT_SLOT_FILLED;
 		s->lru = ++dev->lru_clock;
@@ -524,12 +653,30 @@ export_slot_fetch_done(void *cb_arg, uint64_t bytes_read, int status)
 	}
 	TAILQ_FOREACH_SAFE(w, &pf_waiters, link, wtmp) {
 		TAILQ_REMOVE(&pf_waiters, w, link);
-		export_pf_slot_done(w, status);
+		export_pf_slot_done(w, &res);
 	}
 
 	if (dev->destroy_pending && dev->fetch_inflight == 0) {
 		export_destroy_now(dev);
 	}
+}
+
+/* One GET attempt of a slot's object: the first one, or a retry. Hedged: the
+ * key names an immutable object, so a duplicate is always equally good. */
+static int
+export_slot_send(struct s3_export_dev *dev, struct export_slot *s)
+{
+	int rc;
+
+	dev->stats.whole_gets++;
+	dev->stats.get_bytes += s->object_len;
+	rc = s3_get_range_hedged(dev->client, s->key, 0, s->object_len, s->buf,
+				 &s->hedge, export_slot_fetch_done, s);
+	if (rc != 0) {
+		dev->stats.whole_gets--;
+		dev->stats.get_bytes -= s->object_len;
+	}
+	return rc;
 }
 
 /* Start the whole-object GET for a slot already set up with its key. */
@@ -545,18 +692,15 @@ export_slot_start_fetch(struct s3_export_dev *dev, struct export_slot *s)
 		}
 	}
 	s->state = EXPORT_SLOT_FETCHING;
+	s->retries = 0;
+	memset(&s->hedge, 0, sizeof(s->hedge));
 	dev->fetch_inflight++;
 	if (dev->fetch_inflight > dev->stats.peak_fetch_inflight) {
 		dev->stats.peak_fetch_inflight = dev->fetch_inflight;
 	}
-	dev->stats.whole_gets++;
-	dev->stats.get_bytes += s->object_len;
-	rc = s3_get_range(dev->client, s->key, 0, s->object_len, s->buf,
-			  export_slot_fetch_done, s);
+	rc = export_slot_send(dev, s);
 	if (rc != 0) {
 		dev->fetch_inflight--;
-		dev->stats.whole_gets--;
-		dev->stats.get_bytes -= s->object_len;
 		s->state = EXPORT_SLOT_FREE;
 		return rc;
 	}
@@ -1099,11 +1243,15 @@ export_destroy(struct spdk_bs_dev *bs_dev)
 		       "%" PRIu64 " bytes served, %" PRIu64 " served as zeroes, "
 		       "%" PRIu64 " manifest refetch(es), %" PRIu64 " whole-chunk "
 		       "GET(s) (%" PRIu64 " prefetched, %" PRIu64 " on demand), "
-		       "%" PRIu64 " slot hit(s), %" PRIu64 " joined in flight\n",
+		       "%" PRIu64 " slot hit(s), %" PRIu64 " joined in flight, "
+		       "%" PRIu64 " retried, %" PRIu64 " hedge(s) sent / %" PRIu64
+		       " won\n",
 		       dev->m->uuid_str, dev->reads, dev->bytes_read, dev->zero_fills,
 		       dev->refetches, dev->stats.whole_gets,
 		       dev->stats.prefetch_fetches, dev->stats.miss_fetches,
-		       dev->stats.slot_hits, dev->stats.slot_joins);
+		       dev->stats.slot_hits, dev->stats.slot_joins,
+		       dev->stats.fetch_retries, dev->stats.hedges_issued,
+		       dev->stats.hedges_won);
 
 	/* No wait for a refetch, deliberately.
 	 *
@@ -1520,6 +1668,25 @@ export_retry_msg(void *arg)
  * Construction
  * ========================================================================== */
 
+static uint32_t
+export_env_u32(const char *name, uint32_t dflt, uint32_t max)
+{
+	const char *v = getenv(name);
+	char *end = NULL;
+	unsigned long n;
+
+	if (!v || !*v) {
+		return dflt;
+	}
+	errno = 0;
+	n = strtoul(v, &end, 10);
+	if (errno || !end || *end != '\0' || n > max) {
+		SPDK_WARNLOG("ignoring %s='%s'; using %u\n", name, v, dflt);
+		return dflt;
+	}
+	return (uint32_t)n;
+}
+
 int
 s3_export_bs_dev_create(struct s3_client *client, struct s3_export_manifest *m,
 			struct spdk_bs_dev **out)
@@ -1550,6 +1717,17 @@ s3_export_bs_dev_create(struct s3_client *client, struct s3_export_manifest *m,
 	 * started it would send a message to an exited thread, which aborts. */
 	dev->home_thread = spdk_get_thread();
 	TAILQ_INIT(&dev->refetch_waiters);
+
+	dev->max_retries = export_env_u32("S3LVOL_IMPORT_CHUNK_RETRIES",
+					  S3_EXPORT_CHUNK_RETRIES_DEFAULT, 100);
+	dev->retry_base_ms = export_env_u32("S3LVOL_IMPORT_RETRY_BASE_MS",
+					    S3_EXPORT_RETRY_BASE_MS, 600000);
+	dev->retry_cap_ms = export_env_u32("S3LVOL_IMPORT_RETRY_CAP_MS",
+					   S3_EXPORT_RETRY_CAP_MS, 600000);
+	if (dev->retry_cap_ms < dev->retry_base_ms) {
+		dev->retry_cap_ms = dev->retry_base_ms;
+	}
+	dev->rand_seed = (unsigned int)(uintptr_t)dev ^ (unsigned int)time(NULL);
 
 	s3_export_manifest_ref(m);
 
@@ -1646,8 +1824,22 @@ s3_export_bs_dev_get_stats(struct spdk_bs_dev *bs_dev,
  * on home_thread.
  * ========================================================================== */
 
+struct s3_export_prefetch_budget {
+	uint32_t                                  cap;
+	uint32_t                                  inflight;
+	uint32_t                                  peak;
+	uint32_t                                  attached;
+	TAILQ_HEAD(, s3_export_prefetcher)        prefetchers;
+};
+
 struct s3_export_prefetcher {
 	struct s3_export_dev      *dev;
+	struct s3_export_prefetch_budget *budget;
+	TAILQ_ENTRY(s3_export_prefetcher) budget_link;
+	uint64_t                   bytes;
+	uint64_t                   retries;
+	uint64_t                   hedges_issued;
+	uint64_t                   hedges_won;
 	uint64_t                  *chunks;
 	uint64_t                   n;
 	uint64_t                   next;       /* next index into chunks to launch */
@@ -1683,6 +1875,9 @@ pf_fetched(struct s3_export_prefetcher *p, uint64_t chunk_index, int status)
 	p->inflight--;
 	if (status == 0) {
 		p->fetched++;
+	} else if (status == -ECANCELED && p->stopped) {
+		/* A retry abandoned because the device is going away under a
+		 * stopped prefetcher: nobody is waiting for the answer. */
 	} else if (status == -ENOENT) {
 		/* The object went away: the source materialised the export. Not a
 		 * prefetch failure -- the demand read that needs this chunk takes the
@@ -1696,15 +1891,54 @@ pf_fetched(struct s3_export_prefetcher *p, uint64_t chunk_index, int status)
 	}
 }
 
+/* A unit of the shared budget came back: give every attached prefetcher a
+ * chance to use it, not only the one whose chunk finished. */
 static void
-export_pf_slot_done(struct export_pf_wait *w, int status)
+pf_budget_pump_all(struct s3_export_prefetch_budget *b)
+{
+	struct s3_export_prefetcher *q, *tmp;
+
+	TAILQ_FOREACH_SAFE(q, &b->prefetchers, budget_link, tmp) {
+		if (q->status == 0) {
+			s3_export_prefetcher_pump_internal(q);
+		}
+		if (b->inflight >= b->cap) {
+			break;
+		}
+	}
+}
+
+static void
+export_pf_slot_done(struct export_pf_wait *w, const struct export_fetch_result *res)
 {
 	struct s3_export_prefetcher *p = w->p;
+	struct s3_export_prefetch_budget *b = w->budgeted ? p->budget : NULL;
 	uint64_t chunk_index = w->chunk_index;
+	bool launcher = w->launcher;
 
 	free(w);
-	pf_fetched(p, chunk_index, status);
-	if (p->status == 0) {
+	if (b) {
+		assert(b->inflight > 0);
+		b->inflight--;
+	}
+	/* Fetch telemetry goes to the prefetcher that launched the fetch only; a
+	 * prefetcher that joined it would count the same bytes twice. */
+	if (launcher) {
+		p->bytes += res->bytes;
+		p->retries += res->retries;
+		p->hedges_issued += res->hedges_issued;
+		p->hedges_won += res->hedges_won;
+	}
+	pf_fetched(p, chunk_index, res->status);
+	if (b) {
+		/* Round robin: p has had its turn, so the freed unit is offered to
+		 * the other volumes first. Pumping p itself first would let the
+		 * volume that started first hold the whole budget until its list
+		 * ran out, which is the serialisation this budget replaces. */
+		TAILQ_REMOVE(&b->prefetchers, p, budget_link);
+		TAILQ_INSERT_TAIL(&b->prefetchers, p, budget_link);
+		pf_budget_pump_all(b);
+	} else if (p->status == 0) {
 		s3_export_prefetcher_pump_internal(p);
 	}
 }
@@ -1797,6 +2031,11 @@ pf_launch_one(struct s3_export_prefetcher *p, uint64_t i)
 		return 0;
 	}
 
+	if (p->budget && p->budget->inflight >= p->budget->cap) {
+		/* The volumes sharing this budget already have as many GETs out as
+		 * were asked for. Retried when any of them completes. */
+		return -EAGAIN;
+	}
 	s = export_slot_alloc(dev, true, p->window);
 	if (!s) {
 		/* The window is at most S3_EXPORT_PREFETCH_MAX, and every pinned slot is
@@ -1809,6 +2048,7 @@ pf_launch_one(struct s3_export_prefetcher *p, uint64_t i)
 	}
 	w->p = p;
 	w->chunk_index = chunk_index;
+	w->launcher = true;
 	export_slot_setup(s, chunk_index, key, object_len);
 	s->pins = 1;
 	TAILQ_INSERT_TAIL(&s->pf_waiters, w, link);
@@ -1816,8 +2056,20 @@ pf_launch_one(struct s3_export_prefetcher *p, uint64_t i)
 	p->pin_gen[i] = s->gen;
 	p->inflight++;
 	dev->stats.prefetch_fetches++;
+	if (p->budget) {
+		/* Taken before the submit: a completion that ran inline would
+		 * otherwise give back a unit that was never taken. */
+		w->budgeted = true;
+		p->budget->inflight++;
+		if (p->budget->inflight > p->budget->peak) {
+			p->budget->peak = p->budget->inflight;
+		}
+	}
 	rc = export_slot_start_fetch(dev, s);
 	if (rc != 0) {
+		if (w->budgeted) {
+			p->budget->inflight--;
+		}
 		TAILQ_REMOVE(&s->pf_waiters, w, link);
 		free(w);
 		s->pins = 0;
@@ -1958,6 +2210,10 @@ s3_export_prefetcher_get_progress(const struct s3_export_prefetcher *p,
 	out->inflight = p->inflight;
 	out->held = pf_held(p);
 	out->status = p->status;
+	out->bytes = p->bytes;
+	out->retries = p->retries;
+	out->hedges_issued = p->hedges_issued;
+	out->hedges_won = p->hedges_won;
 }
 
 void
@@ -1984,6 +2240,7 @@ s3_export_prefetcher_destroy(struct s3_export_prefetcher *p)
 	}
 	/* The caller waited for idle: no slot still has a waiter naming p. */
 	assert(p->inflight == 0);
+	s3_export_prefetcher_set_budget(p, NULL);
 	for (i = p->released; i < p->next; i++) {
 		pf_unpin(p, i);
 	}
@@ -1991,4 +2248,71 @@ s3_export_prefetcher_destroy(struct s3_export_prefetcher *p)
 	free(p->pin_slot);
 	free(p->pin_gen);
 	free(p);
+}
+
+/* ==========================================================================
+ * Shared prefetch budget
+ * ========================================================================== */
+
+struct s3_export_prefetch_budget *
+s3_export_prefetch_budget_create(uint32_t cap)
+{
+	struct s3_export_prefetch_budget *b = calloc(1, sizeof(*b));
+
+	if (!b) {
+		return NULL;
+	}
+	b->cap = cap ? cap : S3_EXPORT_PREFETCH_DEFAULT;
+	TAILQ_INIT(&b->prefetchers);
+	return b;
+}
+
+void
+s3_export_prefetch_budget_destroy(struct s3_export_prefetch_budget *b)
+{
+	if (!b) {
+		return;
+	}
+	assert(b->attached == 0);
+	free(b);
+}
+
+uint32_t
+s3_export_prefetch_budget_inflight(const struct s3_export_prefetch_budget *b)
+{
+	return b ? b->inflight : 0;
+}
+
+uint32_t
+s3_export_prefetch_budget_peak(const struct s3_export_prefetch_budget *b)
+{
+	return b ? b->peak : 0;
+}
+
+uint32_t
+s3_export_prefetch_budget_attached(const struct s3_export_prefetch_budget *b)
+{
+	return b ? b->attached : 0;
+}
+
+void
+s3_export_prefetcher_set_budget(struct s3_export_prefetcher *p,
+				struct s3_export_prefetch_budget *b)
+{
+	if (!p || p->budget == b) {
+		return;
+	}
+	if (p->budget) {
+		/* Only when idle (destroy) or before the first launch: a budgeted
+		 * wait in flight keeps pointing at p->budget. */
+		assert(p->inflight == 0);
+		TAILQ_REMOVE(&p->budget->prefetchers, p, budget_link);
+		p->budget->attached--;
+		p->budget = NULL;
+	}
+	if (b) {
+		p->budget = b;
+		TAILQ_INSERT_TAIL(&b->prefetchers, p, budget_link);
+		b->attached++;
+	}
 }

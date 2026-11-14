@@ -75,6 +75,7 @@
 #include "s3lvol/s3_recovery.h"
 #include "s3lvol/s3_chunk_map.h"
 #include "s3lvol/s3_client.h"
+#include "s3lvol/s3_hedge.h"
 #include "s3lvol/s3_flusher.h"
 #include "s3lvol/s3_overlay.h"
 #include "s3lvol/s3_types.h"
@@ -3174,7 +3175,15 @@ s3_flush_put(struct s3_flush_ctx *fc)
 	iov.iov_base = fc->chunk_buf;
 	iov.iov_len = fc->put_len;
 
-	rc = s3_put(ctx->client, key, &iov, 1, false, s3_flush_put_done, fc);
+	/* Hedged: the key is a fresh uuid, written once, so a duplicate PUT can only
+	 * write the same bytes to the same key, and fc->chunk_buf stays allocated
+	 * until s3_flush_finish(), which only runs from the callback. One stalled
+	 * upload no longer holds a whole flush round for the request deadline.
+	 * A loser that was already fully sent can still land after the winner; if
+	 * the chunk is discarded meanwhile (the unmap check below deletes the new
+	 * key) that leaves one orphan object, the same outcome as a crash between
+	 * PUT and delete, and GC's to reclaim. */
+	rc = s3_put_hedged(ctx->client, key, &iov, 1, NULL, s3_flush_put_done, fc);
 	if (rc != 0) {
 		s3_flush_finish(fc, rc);
 	}

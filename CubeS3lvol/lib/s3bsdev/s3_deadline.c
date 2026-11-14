@@ -337,3 +337,164 @@ s3_deadline_shutdown(void)
 	pthread_mutex_unlock(&g_lock);
 	pthread_join(t, NULL);
 }
+
+/* ==========================================================================
+ * Gate: the fence a hedged request needs (see include/s3lvol/s3_hedge.h)
+ *
+ * Lives here rather than in s3_hedge.c for the same reason the deadline does:
+ * it is shared with s3_client_aws.c, touches the meta request only through the
+ * opaque ops, and needs nothing but pthreads, so the ownership rules can be
+ * tested offline.
+ *
+ * The lock is per gate and is held across a body copy (at most one CRT part,
+ * 8 MiB by default). Nobody else ever waits on it except s3_gate_abandon(),
+ * which is exactly the wait it exists for.
+ * ========================================================================== */
+
+
+struct s3_gate {
+	pthread_mutex_t               lock;
+	bool                          abandoned;
+	bool                          finished;
+	void                         *target;
+	const struct s3_deadline_ops *ops;
+};
+
+struct s3_gate *
+s3_gate_new(void)
+{
+	struct s3_gate *g = calloc(1, sizeof(*g));
+
+	if (g) {
+		pthread_mutex_init(&g->lock, NULL);
+	}
+	return g;
+}
+
+void
+s3_gate_free(struct s3_gate *g)
+{
+	if (!g) {
+		return;
+	}
+	pthread_mutex_destroy(&g->lock);
+	free(g);
+}
+
+void
+s3_gate_attach(struct s3_gate *g, void *target, const struct s3_deadline_ops *ops)
+{
+	bool cancel_now = false;
+
+	if (!g || !target || !ops) {
+		return;
+	}
+	pthread_mutex_lock(&g->lock);
+	if (!g->finished) {
+		/* finish() has not run, so the submitter's reference to the meta
+		 * request is still alive and taking another one is safe. */
+		ops->acquire(target);
+		g->target = target;
+		g->ops = ops;
+		if (g->abandoned) {
+			/* Abandoned between submit and attach: nobody has cancelled
+			 * it yet, because there was nothing to cancel. */
+			ops->acquire(target);
+			cancel_now = true;
+		}
+	}
+	pthread_mutex_unlock(&g->lock);
+
+	if (cancel_now) {
+		ops->cancel(target);
+		ops->release(target);
+	}
+}
+
+void
+s3_gate_finish(struct s3_gate *g)
+{
+	void *target = NULL;
+	const struct s3_deadline_ops *ops = NULL;
+
+	if (!g) {
+		return;
+	}
+	pthread_mutex_lock(&g->lock);
+	g->finished = true;
+	target = g->target;
+	ops = g->ops;
+	g->target = NULL;
+	g->ops = NULL;
+	pthread_mutex_unlock(&g->lock);
+
+	if (target) {
+		ops->release(target);
+	}
+}
+
+bool
+s3_gate_write_begin(struct s3_gate *g)
+{
+	if (!g) {
+		return true;
+	}
+	pthread_mutex_lock(&g->lock);
+	if (g->abandoned) {
+		pthread_mutex_unlock(&g->lock);
+		return false;
+	}
+	return true;
+}
+
+void
+s3_gate_write_end(struct s3_gate *g)
+{
+	if (g) {
+		pthread_mutex_unlock(&g->lock);
+	}
+}
+
+void
+s3_gate_abandon(struct s3_gate *g)
+{
+	void *target = NULL;
+	const struct s3_deadline_ops *ops = NULL;
+
+	if (!g) {
+		return;
+	}
+	/* Taking the lock is the fence: a body copy in progress holds it, so this
+	 * returns only after that copy is over, and every later one sees the flag. */
+	pthread_mutex_lock(&g->lock);
+	if (!g->abandoned) {
+		g->abandoned = true;
+		if (g->target) {
+			/* Own reference for the cancel: finish() may drop the attached
+			 * one as soon as the lock is released. */
+			target = g->target;
+			ops = g->ops;
+			ops->acquire(target);
+		}
+	}
+	pthread_mutex_unlock(&g->lock);
+
+	if (target) {
+		ops->cancel(target);
+		ops->release(target);
+	}
+}
+
+bool
+s3_gate_is_abandoned(struct s3_gate *g)
+{
+	bool a;
+
+	if (!g) {
+		return false;
+	}
+	pthread_mutex_lock(&g->lock);
+	a = g->abandoned;
+	pthread_mutex_unlock(&g->lock);
+	return a;
+}

@@ -1292,11 +1292,26 @@ struct s3lvol_import_status_info {
 	uint64_t                 clusters_done;
 	bool                     done;            /* no read of it goes to the export */
 	int                      error;           /* negative errno, 0 if none */
+	/* Prefetch telemetry (B20). live_*: the prefetch running now; pf_*: the
+	 * last one that finished, kept until the record is dropped. */
+	bool                     live;
+	uint64_t                 live_bytes;
+	uint64_t                 live_elapsed_ms;
+	uint64_t                 live_retries;
+	uint64_t                 live_hedges_issued;
+	uint64_t                 live_hedges_won;
+	uint64_t                 pf_bytes;
+	uint64_t                 pf_elapsed_ms;
+	uint64_t                 pf_retries;
+	uint64_t                 pf_hedges_issued;
+	uint64_t                 pf_hedges_won;
 };
 
 const char *s3lvol_import_state_name(enum s3lvol_import_state state);
 
-/* S3LVOL_IMPORT_PREFETCH_PARALLEL, else S3_EXPORT_PREFETCH_DEFAULT; capped. */
+/* S3LVOL_IMPORT_PREFETCH_PARALLEL, else S3_EXPORT_PREFETCH_DEFAULT (64); capped.
+ * Both the per-volume window and the per-lvstore cap shared by every
+ * prefetching volume of one lvstore. */
 uint32_t s3lvol_import_prefetch_window_default(void);
 
 /**

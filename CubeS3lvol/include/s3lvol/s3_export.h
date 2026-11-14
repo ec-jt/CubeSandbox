@@ -858,8 +858,16 @@ s3_export_bs_dev_refetch_already_current(int swap_rc)
 
 /* Default and upper bound of the prefetch window: how many whole chunks may be
  * fetched-or-in-flight and held at once. Memory is window x chunk_size. */
-#define S3_EXPORT_PREFETCH_DEFAULT 32
+#define S3_EXPORT_PREFETCH_DEFAULT 64
 #define S3_EXPORT_PREFETCH_MAX     128
+
+/* Per-chunk retry of a failed whole-chunk fetch: S3LVOL_IMPORT_CHUNK_RETRIES
+ * (default below), exponential backoff with jitter between
+ * S3_EXPORT_RETRY_BASE_MS and S3_EXPORT_RETRY_CAP_MS. Each retry is a fresh
+ * request, so CRT picks a new connection. */
+#define S3_EXPORT_CHUNK_RETRIES_DEFAULT 5
+#define S3_EXPORT_RETRY_BASE_MS         200
+#define S3_EXPORT_RETRY_CAP_MS          5000
 
 struct s3_export_bs_dev_stats {
 	uint64_t whole_gets;          /* GETs issued, every one a whole object */
@@ -870,9 +878,12 @@ struct s3_export_bs_dev_stats {
 	uint64_t slot_hits;           /* reads served from an already-filled slot */
 	uint64_t slot_joins;          /* reads that waited on a fetch in flight */
 	uint64_t evictions;
-	uint64_t fetch_errors;
-	uint32_t fetch_inflight;      /* right now */
+	uint64_t fetch_errors;        /* fetches that failed after every retry */
+	uint32_t fetch_inflight;      /* right now, including those waiting to retry */
 	uint32_t peak_fetch_inflight; /* highest seen */
+	uint64_t fetch_retries;       /* retries of failed fetches */
+	uint64_t hedges_issued;       /* hedged duplicate GETs sent */
+	uint64_t hedges_won;          /* of which completed first */
 };
 
 /** True when \p bs_dev was built by s3_export_bs_dev_create(). */
@@ -883,6 +894,28 @@ int s3_export_bs_dev_get_stats(struct spdk_bs_dev *bs_dev,
 			       struct s3_export_bs_dev_stats *out);
 
 struct s3_export_prefetcher;
+
+/* A cap on the whole-chunk GETs in flight, shared by every prefetcher attached
+ * to it -- one per lvstore, so several volumes of one sandbox can prefetch at
+ * the same time without together exceeding what was asked for. A chunk counts
+ * from the moment its fetch is launched until it is in memory or has failed
+ * for good (retries included). All prefetchers attached to one budget must run
+ * on the same SPDK thread. */
+struct s3_export_prefetch_budget;
+
+/** \p cap of 0 selects S3_EXPORT_PREFETCH_DEFAULT. */
+struct s3_export_prefetch_budget *s3_export_prefetch_budget_create(uint32_t cap);
+
+/** Only once no prefetcher is attached. */
+void s3_export_prefetch_budget_destroy(struct s3_export_prefetch_budget *b);
+
+uint32_t s3_export_prefetch_budget_inflight(const struct s3_export_prefetch_budget *b);
+uint32_t s3_export_prefetch_budget_peak(const struct s3_export_prefetch_budget *b);
+uint32_t s3_export_prefetch_budget_attached(const struct s3_export_prefetch_budget *b);
+
+/** Before the first pump. NULL detaches (no shared cap, only the window). */
+void s3_export_prefetcher_set_budget(struct s3_export_prefetcher *p,
+				     struct s3_export_prefetch_budget *b);
 
 /** Called once per chunk when its fetch completes (or fails), on home thread,
  * always from a completion -- never from inside create/pump/release -- so the
@@ -898,6 +931,10 @@ struct s3_export_prefetch_progress {
 	uint32_t inflight;   /* GETs in flight for this prefetcher */
 	uint32_t held;       /* launched and not yet released: <= window */
 	int      status;     /* first hard error, 0 if none */
+	uint64_t bytes;      /* bytes of the whole objects fetched */
+	uint64_t retries;    /* fetch retries of chunks this prefetcher waits on */
+	uint64_t hedges_issued;
+	uint64_t hedges_won;
 };
 
 /**

@@ -74,7 +74,7 @@ APPS = s3_client_test s3_spawner_test s3_thread_bounce_test s3_bs_dev_test \
        s3_journal_test s3_wal_test s3_wal_geometry_test s3_cache_test s3_flush_test s3_export_test \
        s3_statefile_test s3_local_dev_test s3_checkpoint_test s3_export_swap_test s3_export_prefetch_test \
        s3_copy_xml_test s3_pending_persist_test s3_recovery_test \
-       s3_put_etag_test s3_put_etag_request_test s3_b16_ctl_test
+       s3_put_etag_test s3_put_etag_request_test s3_b16_ctl_test s3_hedge_test
 
 # (a) minimal library set for the stubbed path
 STUB_SRCS      = spdk_thread_stub.c
@@ -336,6 +336,17 @@ s3_export_prefetch_test: s3_export_prefetch_test.c $(S3BSDEV_DIR)/libs3bsdev.a
 	    $(BLOB_DPDK_ARGS) \
 	    $(SYS_LIBS) $(TEST_SYS_LIBS) -o $@
 
+# B20 hedged requests, per-chunk retry and the shared prefetch budget. Same
+# link as the prefetch test: an in-memory client (which also replaces the gated
+# entry points) and a real spdk_thread for the hedge timer and retry pollers.
+s3_hedge_test: s3_hedge_test.c $(S3BSDEV_DIR)/libs3bsdev.a
+	$(CC) $(COMMON_CFLAGS) s3_hedge_test.c \
+	    $(S3BSDEV_DIR)/libs3bsdev.a \
+	    $(AWS_LIBS) \
+	    -Wl,--start-group $(BLOB_SPDK_LIBS) -Wl,--end-group \
+	    $(BLOB_DPDK_ARGS) \
+	    $(SYS_LIBS) $(TEST_SYS_LIBS) -o $@
+
 # Recovery descriptor validation: no S3, no DPDK init. Same link as the
 # checkpoint test -- it stubs the four s3_client entry points, and the objects
 # it pulls in (s3_recovery.o, s3_checkpoint.o, s3_chunk_map.o) reference bdev /
@@ -353,7 +364,7 @@ check: s3_spawner_test s3_thread_bounce_test s3_journal_test s3_wal_test s3_wal_
        s3_flush_test s3_export_test s3_statefile_test s3_local_dev_test \
        s3_checkpoint_test s3_export_swap_test s3_export_prefetch_test s3_copy_xml_test \
        s3_pending_persist_test s3_recovery_test s3_put_etag_test s3_put_etag_request_test \
-       s3_b16_ctl_test
+       s3_b16_ctl_test s3_hedge_test
 	./s3_spawner_test
 	./s3_thread_bounce_test
 	./s3_journal_test
@@ -367,6 +378,7 @@ check: s3_spawner_test s3_thread_bounce_test s3_journal_test s3_wal_test s3_wal_
 	./s3_checkpoint_test
 	./s3_export_swap_test
 	./s3_export_prefetch_test
+	./s3_hedge_test
 	./s3_copy_xml_test
 	./s3_put_etag_test
 	./s3_put_etag_request_test

@@ -87,4 +87,33 @@ uint64_t s3_deadline_fired_total(void);
  */
 void s3_deadline_shutdown(void);
 
+/* ==========================================================================
+ * Gate: the fence of a hedged request (see s3_hedge.h for why)
+ * ========================================================================== */
+
+struct s3_gate;
+
+struct s3_gate *s3_gate_new(void);
+
+/** Only once the gated request's callback has run, or its submit failed. */
+void s3_gate_free(struct s3_gate *g);
+
+/** Client side: the meta request exists. Takes a reference on it unless the
+ * request already finished; cancels at once if already abandoned. */
+void s3_gate_attach(struct s3_gate *g, void *target, const struct s3_deadline_ops *ops);
+
+/** Client side: the request finished. Drops the reference attach took. */
+void s3_gate_finish(struct s3_gate *g);
+
+/** Client side, around each body copy. false: abandoned, write nothing (the
+ * lock is not held). true: the lock is held until s3_gate_write_end(). */
+bool s3_gate_write_begin(struct s3_gate *g);
+void s3_gate_write_end(struct s3_gate *g);
+
+/** No byte is written by the request after this returns; it is asked to
+ * cancel. Idempotent. */
+void s3_gate_abandon(struct s3_gate *g);
+
+bool s3_gate_is_abandoned(struct s3_gate *g);
+
 #endif /* S3LVOL_DEADLINE_H */

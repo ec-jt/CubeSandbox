@@ -27,6 +27,7 @@
 
 #include "s3lvol/s3_client.h"
 #include "s3lvol/s3_deadline.h"
+#include "s3lvol/s3_hedge.h"
 #include "s3lvol/s3_spawner.h"
 #include "s3_copy_xml.h"
 #include "s3_put_etag.h"
@@ -217,6 +218,12 @@ struct s3_request {
 	 * rules that make the cancel safe against the finish callback. */
 	struct s3_deadline              *deadline;
 	uint64_t                         deadline_ms;
+
+	/* Hedging: lets the owner abandon this request -- fence every later
+	 * body write and cancel it -- when a duplicate has already won. NULL for
+	 * ungated requests. Owned by the caller, which frees it only from this
+	 * request's callback; see s3_hedge.h. */
+	struct s3_gate                  *gate;
 
 	/* SPDK thread that submitted the request, captured at submit time.
 	 *
@@ -1406,6 +1413,17 @@ s3_client_get_or_create(const struct s3_target *target, struct s3_client **out)
 	 * 1 KiB/s over a 10 s window is deliberately far below anything healthy:
 	 * the intent is to catch "stopped", not "slow". Short requests cannot be
 	 * killed by it either, since it only fires after the window has elapsed.
+	 *
+	 * Left unchanged by the hedging work, on purpose. The failures it reported
+	 * against Hetzner (crt=2073 "failure to meet throughput minimum", each
+	 * after ~11 s) were attempts that moved less than 1 KiB/s for 10 s: they
+	 * were stalled, not slow, and relaxing the floor would only have made each
+	 * stall last longer before CRT retried. A slow-but-moving 1 MiB chunk at
+	 * even 10 KiB/s clears this floor ten times over. What stops such a stall
+	 * from failing an import now is the hedge (s3_hedge.c), which sends a
+	 * duplicate after ~1-3 s instead of waiting for this monitor, and the
+	 * per-chunk retry in the prefetcher. The monitor stays as the half-open
+	 * connection guard it was added to be.
 	 */
 	struct aws_http_connection_monitoring_options monitoring = {
 		.minimum_throughput_bytes_per_second = 1024,
@@ -1611,7 +1629,16 @@ s3_get_body_callback(struct aws_s3_meta_request *meta_request,
 	}
 
 	copy_offset = chunk_offset - req->offset;
+
+	/* Hedged GET: once the owner has abandoned this request (another attempt
+	 * already delivered and the buffer may be in use again) not one more byte
+	 * may land in it. The gate's lock is held across the copy, which is what
+	 * makes s3_gate_abandon() a fence rather than a hint. */
+	if (!s3_gate_write_begin(req->gate)) {
+		return aws_raise_error(AWS_ERROR_S3_CANCELED);
+	}
 	memcpy((uint8_t *)req->buf + copy_offset, src, src_len);
+	s3_gate_write_end(req->gate);
 
 	/* Counted, not watermarked.
 	 *
@@ -1699,6 +1726,20 @@ s3_get_finished(struct aws_s3_meta_request *meta_request,
 	struct s3_request *req = user_data;
 	bool timed_out = s3_req_deadline_finish(req, result);
 
+	/* Before the meta request is released: the gate may hold a reference. */
+	s3_gate_finish(req->gate);
+	if (result->error_code != AWS_ERROR_SUCCESS && s3_gate_is_abandoned(req->gate)) {
+		/* The loser of a hedge, cancelled on purpose. Not a failure worth
+		 * an error line: the other attempt has already delivered. */
+		req->status = -ECANCELED;
+		req->bytes_read = 0;
+		S3_STAT_INC(req->client, get_ops);
+		S3_STAT_DEC(req->client, inflight);
+		aws_s3_meta_request_release(meta_request);
+		s3_request_complete(req);
+		return;
+	}
+
 	s3_trace_finish(req, result, req->bytes_read);
 
 	if (result->error_code != AWS_ERROR_SUCCESS) {
@@ -1728,12 +1769,18 @@ s3_get_finished(struct aws_s3_meta_request *meta_request,
 	s3_request_complete(req);
 }
 
+static int s3_get_range_common(struct s3_client *client, const char *key,
+			       uint64_t offset, uint64_t len, void *buf,
+			       char *etag_out, size_t etag_len, struct s3_gate *gate,
+			       s3_get_cb cb, void *cb_arg);
+
 int
 s3_get_range(struct s3_client *client, const char *key,
 	     uint64_t offset, uint64_t len, void *buf,
 	     s3_get_cb cb, void *cb_arg)
 {
-	return s3_get_range_ex(client, key, offset, len, buf, NULL, 0, cb, cb_arg);
+	return s3_get_range_common(client, key, offset, len, buf, NULL, 0, NULL,
+				   cb, cb_arg);
 }
 
 int
@@ -1741,6 +1788,25 @@ s3_get_range_ex(struct s3_client *client, const char *key,
 		uint64_t offset, uint64_t len, void *buf,
 		char *etag_out, size_t etag_len,
 		s3_get_cb cb, void *cb_arg)
+{
+	return s3_get_range_common(client, key, offset, len, buf, etag_out,
+				   etag_len, NULL, cb, cb_arg);
+}
+
+int
+s3_get_range_gated(struct s3_client *client, const char *key,
+		   uint64_t offset, uint64_t len, void *buf,
+		   struct s3_gate *gate, s3_get_cb cb, void *cb_arg)
+{
+	return s3_get_range_common(client, key, offset, len, buf, NULL, 0, gate,
+				   cb, cb_arg);
+}
+
+static int
+s3_get_range_common(struct s3_client *client, const char *key,
+		    uint64_t offset, uint64_t len, void *buf,
+		    char *etag_out, size_t etag_len, struct s3_gate *gate,
+		    s3_get_cb cb, void *cb_arg)
 {
 	struct s3_request *req;
 	char range_hdr[128];
@@ -1775,6 +1841,7 @@ s3_get_range_ex(struct s3_client *client, const char *key,
 	req->etag_cap = etag_len;
 	req->cb.get_cb = cb;
 	req->cb_arg  = cb_arg;
+	req->gate    = gate;
 	req->is_get  = true;
 	req->owner_thread = spdk_get_thread();
 	req->submit_ms = s3_trace_now_ms();
@@ -1838,8 +1905,11 @@ s3_get_range_ex(struct s3_client *client, const char *key,
 
 	if (meta_req) {
 		/* req may already be freed (the finish callback can run before
-		 * this returns); dl stays valid until armed. */
+		 * this returns); dl stays valid until armed. The gate stays
+		 * valid too: its owner frees it from the callback, which is
+		 * bounced to this thread and so cannot run before we return. */
 		s3_deadline_arm(dl, meta_req, &g_meta_deadline_ops);
+		s3_gate_attach(gate, meta_req, &g_meta_deadline_ops);
 	} else {
 		s3_deadline_abandon(dl);
 		req->deadline = NULL;
@@ -1869,6 +1939,20 @@ s3_put_finished(struct aws_s3_meta_request *meta_request,
 {
 	struct s3_request *req = user_data;
 	bool timed_out = s3_req_deadline_finish(req, result);
+
+	s3_gate_finish(req->gate);
+	if (result->error_code != AWS_ERROR_SUCCESS && s3_gate_is_abandoned(req->gate)) {
+		req->status = -ECANCELED;
+		S3_STAT_INC(req->client, put_ops);
+		S3_STAT_DEC(req->client, inflight);
+		aws_s3_meta_request_release(meta_request);
+		if (req->buf) {
+			aws_mem_release(req->allocator, req->buf);
+			req->buf = NULL;
+		}
+		s3_request_complete(req);
+		return;
+	}
 
 	s3_trace_finish(req, result, req->bytes_read);
 
@@ -1940,7 +2024,8 @@ s3_put_finished(struct aws_s3_meta_request *meta_request,
 static int
 s3_put_common(struct s3_client *client, const char *key,
 	      struct iovec *iov, int iovcnt, bool if_none_match,
-	      const char *if_match_etag, s3_op_cb cb, void *cb_arg)
+	      const char *if_match_etag, struct s3_gate *gate,
+	      s3_op_cb cb, void *cb_arg)
 {
 	struct s3_request *req;
 	size_t total_size = 0;
@@ -1984,6 +2069,7 @@ s3_put_common(struct s3_client *client, const char *key,
 	}
 	req->cb.op_cb = cb;
 	req->cb_arg   = cb_arg;
+	req->gate     = gate;
 	req->owner_thread = spdk_get_thread();
 	req->submit_ms = s3_trace_now_ms();
 	req->op = "PUT";
@@ -2110,8 +2196,11 @@ s3_put_common(struct s3_client *client, const char *key,
 
 	if (meta_req) {
 		/* req may already be freed (the finish callback can run before
-		 * this returns); dl stays valid until armed. */
+		 * this returns); dl stays valid until armed. The gate stays
+		 * valid too: its owner frees it from the callback, which is
+		 * bounced to this thread and so cannot run before we return. */
 		s3_deadline_arm(dl, meta_req, &g_meta_deadline_ops);
+		s3_gate_attach(gate, meta_req, &g_meta_deadline_ops);
 	} else {
 		s3_deadline_abandon(dl);
 		req->deadline = NULL;
@@ -2138,6 +2227,18 @@ s3_put(struct s3_client *client, const char *key,
        s3_op_cb cb, void *cb_arg)
 {
 	return s3_put_common(client, key, iov, iovcnt, if_none_match, NULL,
+			     NULL, cb, cb_arg);
+}
+
+int
+s3_put_gated(struct s3_client *client, const char *key,
+	     struct iovec *iov, int iovcnt, struct s3_gate *gate,
+	     s3_op_cb cb, void *cb_arg)
+{
+	/* Unconditional only: a conditional write must never be duplicated (a
+	 * second If-None-Match or If-Match attempt answers a different question
+	 * than the first). */
+	return s3_put_common(client, key, iov, iovcnt, false, NULL, gate,
 			     cb, cb_arg);
 }
 
@@ -2152,7 +2253,7 @@ s3_put_if_match(struct s3_client *client, const char *key,
 		return -EINVAL;
 	}
 	return s3_put_common(client, key, iov, iovcnt, false, etag,
-			     cb, cb_arg);
+			     NULL, cb, cb_arg);
 }
 
 /* ==========================================================================

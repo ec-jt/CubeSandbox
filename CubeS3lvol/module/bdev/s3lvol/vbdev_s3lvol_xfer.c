@@ -3588,6 +3588,9 @@ struct s3lvol_decouple {
 	bool                       pf_draining;
 	void                     (*pf_drained_fn)(struct s3lvol_decouple *d);
 	struct import_status      *st;
+	struct lvs_pf_budget      *budget;          /* shared with this lvstore */
+	uint64_t                   pf_start_ms;
+	uint64_t                   pf_chunks;       /* chunks in the prefetch list */
 
 	/* Told when a cancellation has taken effect, so whoever asked for it can go
 	 * on. Separate from cb_fn: that one belongs to whoever asked for the
@@ -3626,6 +3629,12 @@ struct import_status {
 	uint64_t                   clusters_total;
 	uint64_t                   clusters_done;
 	int                        error;
+	/* Prefetch telemetry of the last run, kept after it ends. */
+	uint64_t                   pf_bytes;
+	uint64_t                   pf_elapsed_ms;
+	uint64_t                   pf_retries;
+	uint64_t                   pf_hedges_issued;
+	uint64_t                   pf_hedges_won;
 	TAILQ_ENTRY(import_status) link;
 };
 
@@ -3671,6 +3680,11 @@ import_status_begin(struct s3lvol_lvstore *lvs, const char *lvol_name,
 	st->clusters_total = 0;
 	st->clusters_done = 0;
 	st->error = 0;
+	st->pf_bytes = 0;
+	st->pf_elapsed_ms = 0;
+	st->pf_retries = 0;
+	st->pf_hedges_issued = 0;
+	st->pf_hedges_won = 0;
 	return st;
 }
 
@@ -3731,6 +3745,73 @@ s3lvol_import_prefetch_window_default(void)
 		return S3_EXPORT_PREFETCH_DEFAULT;
 	}
 	return n > S3_EXPORT_PREFETCH_MAX ? S3_EXPORT_PREFETCH_MAX : (uint32_t)n;
+}
+
+/* ==========================================================================
+ * Per-lvstore prefetch budget
+ *
+ * Prefetch-mode decouples of different volumes on one lvstore run at the same
+ * time (see decouple_find_blocker()). What keeps that from multiplying the
+ * load on the endpoint is this: one s3_export_prefetch_budget per lvstore,
+ * capped at S3LVOL_IMPORT_PREFETCH_PARALLEL (default 64) whole-chunk GETs in
+ * flight across all of them. Created by the first prefetching decouple of the
+ * lvstore and freed with the last.
+ * ========================================================================== */
+
+struct lvs_pf_budget {
+	struct s3lvol_lvstore            *lvs;
+	struct s3_export_prefetch_budget *b;
+	uint32_t                          refs;
+	TAILQ_ENTRY(lvs_pf_budget)        link;
+};
+
+static TAILQ_HEAD(, lvs_pf_budget) g_lvs_pf_budgets =
+	TAILQ_HEAD_INITIALIZER(g_lvs_pf_budgets);
+
+static struct lvs_pf_budget *
+lvs_pf_budget_get(struct s3lvol_lvstore *lvs)
+{
+	struct lvs_pf_budget *e;
+
+	TAILQ_FOREACH(e, &g_lvs_pf_budgets, link) {
+		if (e->lvs == lvs) {
+			e->refs++;
+			return e;
+		}
+	}
+	e = calloc(1, sizeof(*e));
+	if (!e) {
+		return NULL;
+	}
+	e->b = s3_export_prefetch_budget_create(s3lvol_import_prefetch_window_default());
+	if (!e->b) {
+		free(e);
+		return NULL;
+	}
+	e->lvs = lvs;
+	e->refs = 1;
+	TAILQ_INSERT_TAIL(&g_lvs_pf_budgets, e, link);
+	return e;
+}
+
+static void
+lvs_pf_budget_put(struct lvs_pf_budget *e)
+{
+	if (!e || --e->refs > 0) {
+		return;
+	}
+	TAILQ_REMOVE(&g_lvs_pf_budgets, e, link);
+	s3_export_prefetch_budget_destroy(e->b);
+	free(e);
+}
+
+static uint64_t
+decouple_now_ms(void)
+{
+	struct timespec ts;
+
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return (uint64_t)ts.tv_sec * 1000 + (uint64_t)ts.tv_nsec / 1000000;
 }
 
 struct decouple_rewrite_entry {
@@ -4147,6 +4228,38 @@ struct decouple_pf_msg {
 	struct s3lvol_decouple *d;
 };
 
+/* One line per volume when its prefetcher is done, and the same numbers kept in
+ * its import status for rcow_import_status. Rates against wall time since the
+ * prefetch started, which for concurrent volumes includes the share of the
+ * lvstore budget the others had. */
+static void
+decouple_pf_report(struct s3lvol_decouple *d)
+{
+	struct s3_export_prefetch_progress pg;
+	uint64_t elapsed = decouple_now_ms() - d->pf_start_ms;
+	uint64_t kib_s;
+
+	s3_export_prefetcher_get_progress(d->pf, &pg);
+	kib_s = elapsed ? pg.bytes * 1000 / 1024 / elapsed : 0;
+	SPDK_NOTICELOG("lvol '%s': prefetch of export %s %s: %" PRIu64 " of %" PRIu64
+		       " chunk(s), %" PRIu64 " byte(s) in %" PRIu64 " ms (%" PRIu64
+		       ".%02" PRIu64 " MiB/s), %" PRIu64 " hedge(s) sent / %" PRIu64
+		       " won, %" PRIu64 " retr%s%s%s\n", d->lvol_name, d->uuid_str,
+		       pg.status == 0 ? "done" : "stopped", pg.fetched, pg.total,
+		       pg.bytes, elapsed, kib_s / 1024, (kib_s % 1024) * 100 / 1024,
+		       pg.hedges_issued, pg.hedges_won, pg.retries,
+		       pg.retries == 1 ? "y" : "ies",
+		       pg.status == 0 ? "" : ", error ",
+		       pg.status == 0 ? "" : spdk_strerror(-pg.status));
+	if (d->st) {
+		d->st->pf_bytes = pg.bytes;
+		d->st->pf_elapsed_ms = elapsed;
+		d->st->pf_retries = pg.retries;
+		d->st->pf_hedges_issued = pg.hedges_issued;
+		d->st->pf_hedges_won = pg.hedges_won;
+	}
+}
+
 static void
 decouple_pf_drained_msg(void *arg)
 {
@@ -4156,8 +4269,11 @@ decouple_pf_drained_msg(void *arg)
 	if (!d->pf_draining || !s3_export_prefetcher_idle(d->pf)) {
 		return;
 	}
+	decouple_pf_report(d);
 	s3_export_prefetcher_destroy(d->pf);
 	d->pf = NULL;
+	lvs_pf_budget_put(d->budget);
+	d->budget = NULL;
 	d->pf_draining = false;
 	d->pf_drained_fn = NULL;
 	next(d);
@@ -4241,9 +4357,20 @@ decouple_pf_start(struct s3lvol_decouple *d)
 		d->pf = NULL;
 		return;
 	}
+	/* Shared with every other prefetching decouple of this lvstore. Without
+	 * it (out of memory) the window alone still bounds this volume. */
+	d->budget = lvs_pf_budget_get(d->lvs);
+	if (d->budget) {
+		s3_export_prefetcher_set_budget(d->pf, d->budget->b);
+	}
+	d->pf_start_ms = decouple_now_ms();
+	d->pf_chunks = n;
 	SPDK_NOTICELOG("lvol '%s': prefetching %" PRIu64 " whole chunk(s) of export "
-		       "%s, %u in parallel\n", d->lvol_name, n, d->uuid_str,
-		       d->window ? d->window : S3_EXPORT_PREFETCH_DEFAULT);
+		       "%s, window %u, lvstore budget %u (%u volume(s) sharing it)\n",
+		       d->lvol_name, n, d->uuid_str,
+		       d->window ? d->window : S3_EXPORT_PREFETCH_DEFAULT,
+		       d->budget ? s3lvol_import_prefetch_window_default() : 0,
+		       d->budget ? s3_export_prefetch_budget_attached(d->budget->b) : 0);
 	s3_export_prefetcher_pump(d->pf);
 }
 
@@ -4567,13 +4694,44 @@ decouple_find(const struct spdk_lvol *lvol)
  * this adds is that the waiting is now visible in rcow_get_decouple, bounded by
  * the queue rather than by a retry counter, and in the order the requests came in.
  */
+/*
+ * === Except: prefetch-mode decouples of different volumes (B20) ===
+ *
+ * The lvstore rule exists because the expensive part of materialising a cluster
+ * used to be its S3 read, done while holding the lvstore's one blobstore
+ * channel, so a second decouple only queued up behind it. In prefetch mode that
+ * read is no longer under the channel: the prefetcher fetches whole chunks into
+ * memory ahead of the materialise loop, in parallel and outside blobstore, and
+ * the materialise itself is a local copy plus a WAL write. Two prefetching
+ * decouples on one lvstore therefore overlap exactly where it pays -- the S3
+ * transfers -- and only take turns on the short local part. Serialising them
+ * made a sandbox's rootfs wait for its whole memory volume to download first
+ * (2026-11-14: rootfs queued behind a 626-chunk memory volume).
+ *
+ * So a prefetch-mode decouple does not wait for another prefetch-mode decouple
+ * of a different volume on the same lvstore. The combined S3 load is still
+ * bounded: they share one per-lvstore budget (S3LVOL_IMPORT_PREFETCH_PARALLEL
+ * GETs in flight, see lvs_pf_budget). Still serialised, because there the
+ * reasons above hold unchanged:
+ *   - the same export, anywhere (duplicate fetching of the same objects);
+ *   - anything that is not prefetch mode on the same lvstore, in particular the
+ *     CopyObject ingest path, whose s3_bs_dev ingest state is one per lvstore;
+ *   - the same volume (refused outright by s3lvol_lvol_decouple_ex()).
+ * Correctness never depended on the serialisation: spdk_blob_materialize_cluster()
+ * re-offers a cluster that lost the channel, and decouple_cluster_done() checks
+ * every cluster is really allocated before counting it.
+ */
 static struct s3lvol_decouple *
-decouple_find_blocker(const struct s3lvol_lvstore *lvs, const char *uuid_str)
+decouple_find_blocker(const struct s3lvol_lvstore *lvs, const char *uuid_str,
+		      bool prefetch)
 {
 	struct s3lvol_decouple *d;
 
 	TAILQ_FOREACH(d, &g_decouples, link) {
-		if (strcmp(d->uuid_str, uuid_str) == 0 || d->lvs == lvs) {
+		if (strcmp(d->uuid_str, uuid_str) == 0) {
+			return d;
+		}
+		if (d->lvs == lvs && !(prefetch && d->prefetch)) {
 			return d;
 		}
 	}
@@ -4817,12 +4975,13 @@ decouple_start_next_queued(void)
 {
 	struct decouple_queued *q, *tmp;
 
+again:
 	TAILQ_FOREACH_SAFE(q, &g_decouple_queue, link, tmp) {
 		spdk_lvol_op_complete cb_fn;
 		void *cb_arg;
 		int rc;
 
-		if (decouple_find_blocker(q->lvs, q->uuid_str) != NULL) {
+		if (decouple_find_blocker(q->lvs, q->uuid_str, q->prefetch) != NULL) {
 			continue;
 		}
 
@@ -4830,7 +4989,19 @@ decouple_start_next_queued(void)
 		rc = decouple_start(q->lvs, q->lvol, q->uuid_str, q->prefetch,
 				    q->window, q->cb_fn, q->cb_arg);
 		if (rc == 0) {
+			bool was_prefetch = q->prefetch;
+
 			free(q);
+			/* A prefetch-mode start does not block other prefetch-mode
+			 * volumes of its lvstore, so look again: every one the
+			 * blocker check still lets through starts now. From the head
+			 * rather than from tmp, which a start is allowed to have
+			 * changed. Finite: every pass that gets here removed one
+			 * entry. Anything else started blocks its lvstore, and one
+			 * is enough. */
+			if (was_prefetch) {
+				goto again;
+			}
 			return;
 		}
 		if (rc == -EBUSY) {
@@ -5063,7 +5234,7 @@ s3lvol_lvol_decouple_ex(struct s3lvol_lvstore *lvs, struct spdk_lvol *lvol,
 		}
 	}
 
-	running = decouple_find_blocker(lvs, esnap_uuid);
+	running = decouple_find_blocker(lvs, esnap_uuid, prefetch);
 	if (!running) {
 		return decouple_start(lvs, lvol, esnap_uuid, prefetch, window,
 				      cb_fn, cb_arg);
@@ -5163,6 +5334,12 @@ s3lvol_import_status_get(struct s3lvol_lvstore *lvs, struct spdk_lvol *lvol,
 		s3_export_prefetcher_get_progress(d->pf, &pg);
 		out->chunks_fetched = pg.fetched;
 		out->fetch_inflight = pg.inflight;
+		out->live = true;
+		out->live_bytes = pg.bytes;
+		out->live_elapsed_ms = decouple_now_ms() - d->pf_start_ms;
+		out->live_retries = pg.retries;
+		out->live_hedges_issued = pg.hedges_issued;
+		out->live_hedges_won = pg.hedges_won;
 	}
 
 	if (!spdk_blob_is_esnap_clone(lvol->blob)) {
@@ -5221,6 +5398,11 @@ s3lvol_import_status_get(struct s3lvol_lvstore *lvs, struct spdk_lvol *lvol,
 		out->clusters_total = st->clusters_total;
 		out->clusters_done = d ? d->done : st->clusters_done;
 		out->error = st->error;
+		out->pf_bytes = st->pf_bytes;
+		out->pf_elapsed_ms = st->pf_elapsed_ms;
+		out->pf_retries = st->pf_retries;
+		out->pf_hedges_issued = st->pf_hedges_issued;
+		out->pf_hedges_won = st->pf_hedges_won;
 		/* A failed or cancelled run leaves the volume an esnap clone. A new
 		 * start clears it, so only report done when the blob says so. */
 		out->done = false;
@@ -5497,7 +5679,7 @@ int s3lvol_import_detach_ack(struct s3lvol_lvstore *lvs, const char *uuid,
 	int rc;
 	if (!imp || imp->m->version != S3_EXPORT_ADMISSION_VERSION) return -ENOTSUP;
 	if (!s3lvol_lvstore_xfer_allowed(lvs) || s3lvol_export_work_busy(lvs) ||
-	    s3lvol_export_registry_busy(lvs) || decouple_find_blocker(lvs, uuid)) return -EBUSY;
+	    s3lvol_export_registry_busy(lvs) || decouple_find_blocker(lvs, uuid, false)) return -EBUSY;
 	rc = export_reader_check(lvs, uuid);
 	if (rc) return rc;
 	d = calloc(1, sizeof(*d));

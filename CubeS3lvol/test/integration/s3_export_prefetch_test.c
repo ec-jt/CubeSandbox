@@ -40,6 +40,7 @@
 #include "s3lvol/s3_export.h"
 #include "s3lvol/s3_chunk_map.h"
 #include "s3lvol/s3_client.h"
+#include "s3lvol/s3_hedge.h"
 
 #define CHUNK_SIZE  (1024 * 1024)
 #define NUM_CHUNKS  16
@@ -376,6 +377,14 @@ main(void)
 	spdk_log_set_print_level(SPDK_LOG_ERROR);
 	spdk_log_open(NULL);
 	printf("=== s3lvol export whole-chunk + prefetch test (B19) ===\n");
+
+	/* This suite counts GETs exactly and checks that one failed fetch fails
+	 * the prefetch at once, so the B20 additions are switched off here:
+	 * hedged duplicates and per-chunk retries have their own suite
+	 * (s3_hedge_test). */
+	setenv("S3LVOL_S3_HEDGE", "0", 1);
+	setenv("S3LVOL_IMPORT_CHUNK_RETRIES", "0", 1);
+	s3_hedge_config_load();
 
 	printf("\n[1] SPDK env, a thread, and a REF export with holes and a short tail\n");
 	opts.opts_size = sizeof(opts);

@@ -52,6 +52,7 @@
 #include "spdk_internal/lvolstore.h"
 
 #include "s3lvol/s3_export.h"
+#include "s3lvol/s3_hedge.h"
 #include "s3lvol/s3_spawner.h"
 #include "s3lvol/s3_types.h"
 
@@ -2774,6 +2775,28 @@ rpc_rcow_import_status(struct spdk_jsonrpc_request *request,
 	spdk_json_write_named_int32(w, "error", info.error);
 	spdk_json_write_named_string(w, "error_msg",
 				     info.error ? spdk_strerror(-info.error) : "");
+	/* B20, additive: prefetch throughput, hedges and retries of the running
+	 * prefetch if there is one, else of the last one that finished. Callers
+	 * that do not know these fields ignore them. */
+	{
+		struct s3_hedge_stats hs;
+
+		spdk_json_write_named_uint64(w, "prefetch_bytes",
+					     info.live ? info.live_bytes : info.pf_bytes);
+		spdk_json_write_named_uint64(w, "prefetch_elapsed_ms",
+					     info.live ? info.live_elapsed_ms : info.pf_elapsed_ms);
+		spdk_json_write_named_uint64(w, "prefetch_retries",
+					     info.live ? info.live_retries : info.pf_retries);
+		spdk_json_write_named_uint64(w, "prefetch_hedges_issued",
+					     info.live ? info.live_hedges_issued :
+					     info.pf_hedges_issued);
+		spdk_json_write_named_uint64(w, "prefetch_hedges_won",
+					     info.live ? info.live_hedges_won : info.pf_hedges_won);
+		s3_hedge_get_stats(&hs);
+		spdk_json_write_named_bool(w, "s3_hedge_enabled", hs.enabled);
+		spdk_json_write_named_uint64(w, "s3_hedge_get_delay_ms", hs.get_delay_ms);
+		spdk_json_write_named_uint64(w, "s3_hedges_inflight", hs.inflight);
+	}
 	spdk_json_write_object_end(w);
 	rpc_json_buf_respond(request, w, &buf);
 out:
