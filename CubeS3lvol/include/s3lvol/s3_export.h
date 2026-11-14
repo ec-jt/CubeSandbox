@@ -847,4 +847,93 @@ s3_export_bs_dev_refetch_already_current(int swap_rc)
 	return swap_rc == -EALREADY;
 }
 
+/* ==========================================================================
+ * Whole-chunk fetching and prefetch (B19)
+ *
+ * The export device never serves guest I/O with sub-chunk GETs: every present
+ * chunk is fetched as one whole object (valid_bytes for REF, chunk_size for
+ * dense) and all readers of it are served from that one buffer. See the file
+ * comment of s3_export_bs_dev.c.
+ * ========================================================================== */
+
+/* Default and upper bound of the prefetch window: how many whole chunks may be
+ * fetched-or-in-flight and held at once. Memory is window x chunk_size. */
+#define S3_EXPORT_PREFETCH_DEFAULT 32
+#define S3_EXPORT_PREFETCH_MAX     128
+
+struct s3_export_bs_dev_stats {
+	uint64_t whole_gets;          /* GETs issued, every one a whole object */
+	uint64_t get_bytes;           /* bytes those GETs asked for */
+	uint64_t miss_fetches;        /* of which started by a guest read */
+	uint64_t prefetch_fetches;    /* of which started by the prefetcher */
+	uint64_t transient_fetches;   /* miss fetches that had no slot to keep */
+	uint64_t slot_hits;           /* reads served from an already-filled slot */
+	uint64_t slot_joins;          /* reads that waited on a fetch in flight */
+	uint64_t evictions;
+	uint64_t fetch_errors;
+	uint32_t fetch_inflight;      /* right now */
+	uint32_t peak_fetch_inflight; /* highest seen */
+};
+
+/** True when \p bs_dev was built by s3_export_bs_dev_create(). */
+bool s3_export_bs_dev_is_export(const struct spdk_bs_dev *bs_dev);
+
+/** Counters of the whole-chunk path. Call on the device's home thread. */
+int s3_export_bs_dev_get_stats(struct spdk_bs_dev *bs_dev,
+			       struct s3_export_bs_dev_stats *out);
+
+struct s3_export_prefetcher;
+
+/** Called once per chunk when its fetch completes (or fails), on home thread,
+ * always from a completion -- never from inside create/pump/release -- so the
+ * callback may stop the prefetcher but must not destroy it inline. */
+typedef void (*s3_export_prefetch_cb)(void *cb_arg, uint64_t chunk_index, int status);
+
+struct s3_export_prefetch_progress {
+	uint64_t total;      /* chunks in the list */
+	uint64_t launched;   /* taken from the list */
+	uint64_t fetched;    /* whole objects in memory */
+	uint64_t skipped;    /* 404: left to the demand path's manifest refetch */
+	uint64_t released;   /* handed back by the consumer */
+	uint32_t inflight;   /* GETs in flight for this prefetcher */
+	uint32_t held;       /* launched and not yet released: <= window */
+	int      status;     /* first hard error, 0 if none */
+};
+
+/**
+ * Fetch the given chunks of an export, whole and in order, at most \p window
+ * held at a time (0 selects S3_EXPORT_PREFETCH_DEFAULT; capped at
+ * S3_EXPORT_PREFETCH_MAX). A fetched chunk stays in the device's slot table,
+ * pinned, until s3_export_prefetcher_release_below() passes it, so a read of it
+ * in the meantime is local.
+ *
+ * Must be called on the device's home thread, which is the thread that created
+ * it. Nothing is fetched until s3_export_prefetcher_pump().
+ *
+ * \return 0, -EINVAL, -EXDEV (wrong thread) or -ENOMEM.
+ */
+int s3_export_prefetcher_create(struct spdk_bs_dev *bs_dev, const uint64_t *chunks,
+				uint64_t n, uint32_t window, s3_export_prefetch_cb cb,
+				void *cb_arg, struct s3_export_prefetcher **out);
+
+/** Launch fetches up to the window. */
+void s3_export_prefetcher_pump(struct s3_export_prefetcher *p);
+
+/** The consumer is done with every chunk index below \p chunk_bound: unpin them
+ * and refill the window. */
+void s3_export_prefetcher_release_below(struct s3_export_prefetcher *p,
+					uint64_t chunk_bound);
+
+void s3_export_prefetcher_get_progress(const struct s3_export_prefetcher *p,
+				       struct s3_export_prefetch_progress *out);
+
+/** Launch nothing more. GETs already in flight still complete. */
+void s3_export_prefetcher_stop(struct s3_export_prefetcher *p);
+
+/** No GET of this prefetcher is in flight; destroy() is allowed. */
+bool s3_export_prefetcher_idle(const struct s3_export_prefetcher *p);
+
+/** Unpin whatever is still held and free. Only when idle. */
+void s3_export_prefetcher_destroy(struct s3_export_prefetcher *p);
+
 #endif /* S3LVOL_EXPORT_H */

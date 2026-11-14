@@ -2411,6 +2411,11 @@ struct rpc_import_lvol {
 	 * source, so a source-side snapshot delete is deferred. Reading through is
 	 * the explicit opt-out from eager materialisation. */
 	bool  decouple;
+
+	/* B19: fetch every present chunk whole and in parallel and materialise
+	 * locally; wait on rcow_import_status. On by default with decouple. */
+	bool     prefetch;
+	uint32_t prefetch_parallel;   /* 0: S3LVOL_IMPORT_PREFETCH_PARALLEL or 32 */
 };
 
 static void
@@ -2428,6 +2433,8 @@ static const struct spdk_json_object_decoder rpc_import_lvol_decoders[] = {
 	{"src_namespace", offsetof(struct rpc_import_lvol, src_namespace), spdk_json_decode_string, true},
 	{"lvs_name",      offsetof(struct rpc_import_lvol, lvs_name),      spdk_json_decode_string, true},
 	{"decouple",      offsetof(struct rpc_import_lvol, decouple),      spdk_json_decode_bool,   true},
+	{"prefetch",      offsetof(struct rpc_import_lvol, prefetch),      spdk_json_decode_bool,   true},
+	{"prefetch_parallel", offsetof(struct rpc_import_lvol, prefetch_parallel), spdk_json_decode_uint32, true},
 };
 
 /* The lvstore a call means when it did not say. Sends the error response itself
@@ -2524,7 +2531,7 @@ rpc_rcow_import_lvol(struct spdk_jsonrpc_request *request,
 	/* decouple defaults to true; the decoder writes the field only when the
 	 * call says so, so an absent flag keeps the default while an explicit false
 	 * overrides it. */
-	struct rpc_import_lvol req = { .decouple = true };
+	struct rpc_import_lvol req = { .decouple = true, .prefetch = true };
 	struct rpc_import_ctx *ctx;
 	struct s3lvol_import_opts opts = {0};
 	struct s3lvol_lvstore *lvs;
@@ -2554,10 +2561,17 @@ rpc_rcow_import_lvol(struct spdk_jsonrpc_request *request,
 	opts.export_uuid   = req.export_uuid;
 	opts.src_namespace = req.src_namespace;
 	opts.decouple      = req.decouple;
+	opts.prefetch      = req.decouple && req.prefetch;
+	opts.prefetch_window = req.prefetch_parallel ? req.prefetch_parallel :
+			       s3lvol_import_prefetch_window_default();
+	if (opts.prefetch_window > S3_EXPORT_PREFETCH_MAX) {
+		opts.prefetch_window = S3_EXPORT_PREFETCH_MAX;
+	}
 
 	SPDK_NOTICELOG("rcow_import_lvol '%s' from export %s requested "
-		       "(decouple=%s)\n", req.lvol_name, req.export_uuid,
-		       req.decouple ? "true" : "false");
+		       "(decouple=%s prefetch=%s parallel=%u)\n", req.lvol_name,
+		       req.export_uuid, req.decouple ? "true" : "false",
+		       opts.prefetch ? "true" : "false", opts.prefetch_window);
 
 	rc = s3lvol_lvol_import(lvs, &opts, rpc_import_lvol_cb, ctx);
 	if (rc != 0) {
@@ -2666,6 +2680,108 @@ cleanup:
 }
 SPDK_RPC_REGISTER("rcow_decouple_lvol", rpc_rcow_decouple_lvol,
 		  SPDK_RPC_RUNTIME)
+
+/* rcow_import_status {lvol_name | device_name, lvs_name?, ensure?, prefetch_parallel?}
+ *
+ * B19. Whether an imported volume can be used without reading the export:
+ * done is true once every present chunk is materialised in the volume's own
+ * clusters (it is no longer an esnap clone). A caller polls this before
+ * mounting or booting from the volume, and treats error != 0 or state
+ * "failed"/"cancelled" as a failed import.
+ *
+ * device_name is accepted as an alias of lvol_name. ensure (default true)
+ * starts a prefetch decouple for an esnap clone that nothing is decoupling --
+ * the case after a target restart, or a leftover volume reused by a retry. */
+struct rpc_import_status {
+	char     *lvs_name;
+	char     *lvol_name;
+	char     *device_name;
+	bool      ensure;
+	uint32_t  prefetch_parallel;
+};
+
+static void
+rpc_rcow_import_status(struct spdk_jsonrpc_request *request,
+		       const struct spdk_json_val *params)
+{
+	struct rpc_import_status req = { .ensure = true };
+	const struct spdk_json_object_decoder decoders[] = {
+		{"lvs_name", offsetof(struct rpc_import_status, lvs_name), spdk_json_decode_string, true},
+		{"lvol_name", offsetof(struct rpc_import_status, lvol_name), spdk_json_decode_string, true},
+		{"device_name", offsetof(struct rpc_import_status, device_name), spdk_json_decode_string, true},
+		{"ensure", offsetof(struct rpc_import_status, ensure), spdk_json_decode_bool, true},
+		{"prefetch_parallel", offsetof(struct rpc_import_status, prefetch_parallel), spdk_json_decode_uint32, true},
+	};
+	struct s3lvol_import_status_info info;
+	struct s3lvol_lvstore *lvs;
+	struct spdk_lvol *lvol;
+	struct rpc_json_buf buf;
+	struct spdk_json_write_ctx *w;
+	const char *name;
+	uint32_t window;
+	int rc;
+
+	if (!params || spdk_json_decode_object(params, decoders,
+					       SPDK_COUNTOF(decoders), &req)) {
+		rpc_lvol_respond_err(request, -EINVAL, "Invalid parameters");
+		goto out;
+	}
+	name = req.lvol_name ? req.lvol_name : req.device_name;
+	if (!name) {
+		rpc_lvol_respond_err(request, -EINVAL, "lvol_name is required");
+		goto out;
+	}
+	if (req.lvs_name) {
+		lvs = rpc_lvstore_for(request, req.lvs_name);
+		if (!lvs) {
+			goto out;
+		}
+		lvol = s3lvol_lvol_find(lvs, name);
+	} else {
+		lvol = s3lvol_lvol_find_any(name);
+		lvs = lvol ? s3lvol_lvstore_of_lvol(lvol) : NULL;
+	}
+	if (!lvol || !lvs) {
+		rpc_lvol_respond_err(request, -ENOENT, NULL);
+		goto out;
+	}
+	window = req.prefetch_parallel ? req.prefetch_parallel :
+		 s3lvol_import_prefetch_window_default();
+	rc = s3lvol_import_status_get(lvs, lvol, req.ensure, window, &info);
+	if (rc != 0) {
+		rpc_lvol_respond_err(request, rc, NULL);
+		goto out;
+	}
+
+	w = rpc_json_buf_begin(&buf);
+	if (!w) {
+		rpc_lvol_respond_err(request, -ENOMEM, NULL);
+		goto out;
+	}
+	spdk_json_write_object_begin(w);
+	spdk_json_write_named_string(w, "lvol_name", info.lvol_name);
+	spdk_json_write_named_string(w, "export_uuid", info.export_uuid);
+	spdk_json_write_named_string(w, "state", s3lvol_import_state_name(info.state));
+	spdk_json_write_named_bool(w, "prefetch", info.prefetch);
+	spdk_json_write_named_uint32(w, "prefetch_parallel", info.window);
+	spdk_json_write_named_uint64(w, "present_chunks", info.present_chunks);
+	spdk_json_write_named_uint64(w, "local_chunks", info.local_chunks);
+	spdk_json_write_named_uint64(w, "chunks_fetched", info.chunks_fetched);
+	spdk_json_write_named_uint32(w, "fetch_inflight", info.fetch_inflight);
+	spdk_json_write_named_uint64(w, "clusters_total", info.clusters_total);
+	spdk_json_write_named_uint64(w, "clusters_done", info.clusters_done);
+	spdk_json_write_named_bool(w, "done", info.done);
+	spdk_json_write_named_int32(w, "error", info.error);
+	spdk_json_write_named_string(w, "error_msg",
+				     info.error ? spdk_strerror(-info.error) : "");
+	spdk_json_write_object_end(w);
+	rpc_json_buf_respond(request, w, &buf);
+out:
+	free(req.lvs_name);
+	free(req.lvol_name);
+	free(req.device_name);
+}
+SPDK_RPC_REGISTER("rcow_import_status", rpc_rcow_import_status, SPDK_RPC_RUNTIME)
 
 /* The decouples running right now, with how far each has got.
  *

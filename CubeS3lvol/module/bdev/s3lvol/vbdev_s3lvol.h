@@ -1153,6 +1153,18 @@ struct s3lvol_import_opts {
 	 * always sets it is asking for independence from the export, and a local
 	 * clone already has that. */
 	bool        decouple;
+
+	/* B19: with decouple, fetch every present chunk of the export whole and in
+	 * parallel ahead of the materialise loop, and materialise through the
+	 * local WAL rather than CopyObject. Progress and completion are reported
+	 * by s3lvol_import_status_get() / rcow_import_status. Ignored without
+	 * decouple. */
+	bool        prefetch;
+
+	/* Parallel whole-chunk GETs; 0 selects the default (env
+	 * S3LVOL_IMPORT_PREFETCH_PARALLEL, else S3_EXPORT_PREFETCH_DEFAULT).
+	 * Memory is bounded by window x chunk_size. */
+	uint32_t    prefetch_window;
 };
 
 /**
@@ -1249,6 +1261,54 @@ int s3lvol_lvol_import(struct s3lvol_lvstore *lvs,
  */
 int s3lvol_lvol_decouple(struct s3lvol_lvstore *lvs, struct spdk_lvol *lvol,
 		       spdk_lvol_op_complete cb_fn, void *cb_arg);
+
+/* As s3lvol_lvol_decouple(), optionally in B19 prefetch mode (see
+ * s3lvol_import_opts.prefetch). Prefetch mode also records an import status. */
+int s3lvol_lvol_decouple_ex(struct s3lvol_lvstore *lvs, struct spdk_lvol *lvol,
+			    bool prefetch, uint32_t window,
+			    spdk_lvol_op_complete cb_fn, void *cb_arg);
+
+enum s3lvol_import_state {
+	S3LVOL_IMPORT_NONE = 0,
+	S3LVOL_IMPORT_QUEUED,
+	S3LVOL_IMPORT_RUNNING,
+	S3LVOL_IMPORT_DONE,
+	S3LVOL_IMPORT_FAILED,
+	S3LVOL_IMPORT_CANCELLED,
+	S3LVOL_IMPORT_IDLE,     /* esnap clone, nothing decoupling it */
+};
+
+struct s3lvol_import_status_info {
+	char                     lvol_name[SPDK_LVOL_NAME_MAX];
+	char                     export_uuid[SPDK_UUID_STRING_LEN];
+	enum s3lvol_import_state state;
+	bool                     prefetch;
+	uint32_t                 window;
+	uint64_t                 present_chunks;  /* chunks the export holds */
+	uint64_t                 local_chunks;    /* of which materialised locally */
+	uint64_t                 chunks_fetched;  /* whole GETs completed by prefetch */
+	uint32_t                 fetch_inflight;
+	uint64_t                 clusters_total;
+	uint64_t                 clusters_done;
+	bool                     done;            /* no read of it goes to the export */
+	int                      error;           /* negative errno, 0 if none */
+};
+
+const char *s3lvol_import_state_name(enum s3lvol_import_state state);
+
+/* S3LVOL_IMPORT_PREFETCH_PARALLEL, else S3_EXPORT_PREFETCH_DEFAULT; capped. */
+uint32_t s3lvol_import_prefetch_window_default(void);
+
+/**
+ * Where an imported volume stands. done is true exactly when the volume is no
+ * longer an esnap clone, i.e. every present chunk is materialised in its own
+ * clusters and no read can reach the export. With \p start_if_idle, an esnap
+ * clone that nothing is decoupling (a restart dropped the record) gets a
+ * prefetch decouple started.
+ */
+int s3lvol_import_status_get(struct s3lvol_lvstore *lvs, struct spdk_lvol *lvol,
+			     bool start_if_idle, uint32_t window,
+			     struct s3lvol_import_status_info *out);
 
 /* Drop a volume from the decouple queue because it is being deleted.
  *

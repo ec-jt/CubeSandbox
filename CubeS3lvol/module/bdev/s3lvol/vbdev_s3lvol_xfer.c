@@ -130,6 +130,9 @@ static void import_build_target(const struct s3lvol_import *imp,
 static int imports_save(struct s3lvol_lvstore *lvs, spdk_lvs_op_complete cb_fn,
 			 void *cb_arg);
 static void import_on_swap(void *arg, struct s3_export_manifest *m);
+static void import_status_drop(struct s3lvol_lvstore *lvs, const char *lvol_name);
+static void import_status_fail(struct s3lvol_lvstore *lvs, const char *lvol_name,
+			       const char *export_uuid, int error);
 
 /* ==========================================================================
  * Registry
@@ -480,6 +483,7 @@ s3lvol_xfer_lvstore_fini(struct s3lvol_lvstore *lvs)
 			import_remove(imp);
 		}
 	}
+	import_status_drop(lvs, NULL);
 }
 
 /* ==========================================================================
@@ -2898,6 +2902,8 @@ struct import_ctx {
 	struct s3_export_manifest *m;
 	struct s3lvol_import      *imp;
 	bool                       decouple;
+	bool                       prefetch;
+	uint32_t                   prefetch_window;
 	struct spdk_lvol          *created_lvol;
 
 	s3lvol_lvol_op_cb          cb_fn;
@@ -2987,13 +2993,18 @@ import_origin_synced(void *cb_arg, int lvolerrno)
 			TAILQ_REMOVE(&g_admission_work, &ctx->work, link);
 			ctx->work_active = false;
 		}
-		int drc = s3lvol_lvol_decouple(ctx->lvs, lvol, NULL, NULL);
+		int drc = s3lvol_lvol_decouple_ex(ctx->lvs, lvol, ctx->prefetch,
+						  ctx->prefetch_window, NULL, NULL);
 
 		if (drc != 0) {
 			SPDK_WARNLOG("Imported '%s' but could not start decoupling it from "
 				     "%s: %s. The volume works; it still reads through to "
 				     "the export.\n", lvol->name, ctx->uuid_str,
 				     spdk_strerror(-drc));
+			if (ctx->prefetch) {
+				/* The caller will wait on the status; tell it now. */
+				import_status_fail(ctx->lvs, lvol->name, ctx->uuid_str, drc);
+			}
 		}
 	}
 
@@ -3423,6 +3434,8 @@ s3lvol_lvol_import_admitted(struct s3lvol_lvstore *lvs, const struct s3lvol_impo
 	ctx->cb_fn  = cb_fn;
 	ctx->cb_arg = cb_arg;
 	ctx->decouple = opts->decouple;
+	ctx->prefetch = opts->decouple && opts->prefetch;
+	ctx->prefetch_window = opts->prefetch_window;
 	snprintf(ctx->lvol_name, sizeof(ctx->lvol_name), "%s", opts->lvol_name);
 	snprintf(ctx->uuid_str, sizeof(ctx->uuid_str), "%s", opts->export_uuid);
 
@@ -3564,6 +3577,18 @@ struct s3lvol_decouple {
 	bool                       cancelled;
 	bool                       ingest;
 
+	/* B19 prefetch mode. The esnap parent's present chunks are fetched whole,
+	 * `window` at a time, ahead of the materialise loop, and the GET path is
+	 * used instead of CopyObject ingest so every materialised cluster lands in
+	 * the local WAL and cache rather than only in S3. See import_status_*. */
+	bool                       prefetch;
+	uint32_t                   window;
+	struct s3_export_prefetcher *pf;
+	uint64_t                   released_bound;  /* chunks below are local */
+	bool                       pf_draining;
+	void                     (*pf_drained_fn)(struct s3lvol_decouple *d);
+	struct import_status      *st;
+
 	/* Told when a cancellation has taken effect, so whoever asked for it can go
 	 * on. Separate from cb_fn: that one belongs to whoever asked for the
 	 * decouple, and still has to hear -ECANCELED. */
@@ -3577,6 +3602,136 @@ struct s3lvol_decouple {
 };
 
 static TAILQ_HEAD(, s3lvol_decouple) g_decouples = TAILQ_HEAD_INITIALIZER(g_decouples);
+
+/* ==========================================================================
+ * Import status (B19)
+ *
+ * What a caller that imported a volume waits on before using it. One record
+ * per (lvstore, lvol), created when an import asks for a decouple and kept
+ * after it finishes so "done" and "failed" stay observable until the volume is
+ * deleted or the lvstore unloaded. Not persisted: after a restart a volume
+ * with no record is answered from the blob itself (see
+ * s3lvol_import_status_get()).
+ * ========================================================================== */
+
+struct import_status {
+	struct s3lvol_lvstore     *lvs;
+	char                       lvol_name[SPDK_LVOL_NAME_MAX];
+	char                       export_uuid[SPDK_UUID_STRING_LEN];
+	enum s3lvol_import_state   state;
+	bool                       prefetch;
+	uint32_t                   window;
+	uint64_t                   present_chunks;
+	uint64_t                   local_chunks;
+	uint64_t                   clusters_total;
+	uint64_t                   clusters_done;
+	int                        error;
+	TAILQ_ENTRY(import_status) link;
+};
+
+static TAILQ_HEAD(, import_status) g_import_status =
+	TAILQ_HEAD_INITIALIZER(g_import_status);
+
+static struct import_status *
+import_status_find(const struct s3lvol_lvstore *lvs, const char *lvol_name)
+{
+	struct import_status *st;
+
+	TAILQ_FOREACH(st, &g_import_status, link) {
+		if (st->lvs == lvs && strcmp(st->lvol_name, lvol_name) == 0) {
+			return st;
+		}
+	}
+	return NULL;
+}
+
+/* Find or create, and reset to a fresh queued state. */
+static struct import_status *
+import_status_begin(struct s3lvol_lvstore *lvs, const char *lvol_name,
+		    const char *export_uuid, bool prefetch, uint32_t window)
+{
+	struct import_status *st = import_status_find(lvs, lvol_name);
+
+	if (!st) {
+		st = calloc(1, sizeof(*st));
+		if (!st) {
+			return NULL;
+		}
+		st->lvs = lvs;
+		snprintf(st->lvol_name, sizeof(st->lvol_name), "%s", lvol_name);
+		TAILQ_INSERT_TAIL(&g_import_status, st, link);
+	}
+	snprintf(st->export_uuid, sizeof(st->export_uuid), "%s",
+		 export_uuid ? export_uuid : "");
+	st->state = S3LVOL_IMPORT_QUEUED;
+	st->prefetch = prefetch;
+	st->window = window;
+	st->present_chunks = 0;
+	st->local_chunks = 0;
+	st->clusters_total = 0;
+	st->clusters_done = 0;
+	st->error = 0;
+	return st;
+}
+
+static void
+import_status_fail(struct s3lvol_lvstore *lvs, const char *lvol_name,
+		   const char *export_uuid, int error)
+{
+	struct import_status *st = import_status_begin(lvs, lvol_name, export_uuid,
+				   false, 0);
+
+	if (st) {
+		st->state = S3LVOL_IMPORT_FAILED;
+		st->error = error ? error : -EIO;
+	}
+}
+
+static void
+import_status_drop(struct s3lvol_lvstore *lvs, const char *lvol_name)
+{
+	struct import_status *st, *tmp;
+
+	TAILQ_FOREACH_SAFE(st, &g_import_status, link, tmp) {
+		if (st->lvs == lvs && (!lvol_name || strcmp(st->lvol_name, lvol_name) == 0)) {
+			TAILQ_REMOVE(&g_import_status, st, link);
+			free(st);
+		}
+	}
+}
+
+const char *
+s3lvol_import_state_name(enum s3lvol_import_state state)
+{
+	switch (state) {
+	case S3LVOL_IMPORT_NONE:      return "none";
+	case S3LVOL_IMPORT_QUEUED:    return "queued";
+	case S3LVOL_IMPORT_RUNNING:   return "running";
+	case S3LVOL_IMPORT_DONE:      return "done";
+	case S3LVOL_IMPORT_FAILED:    return "failed";
+	case S3LVOL_IMPORT_CANCELLED: return "cancelled";
+	case S3LVOL_IMPORT_IDLE:      return "idle";
+	}
+	return "unknown";
+}
+
+uint32_t
+s3lvol_import_prefetch_window_default(void)
+{
+	const char *v = getenv("S3LVOL_IMPORT_PREFETCH_PARALLEL");
+	char *end = NULL;
+	unsigned long n;
+
+	if (!v || v[0] == '\0') {
+		return S3_EXPORT_PREFETCH_DEFAULT;
+	}
+	n = strtoul(v, &end, 10);
+	if (!end || *end != '\0' || n == 0) {
+		SPDK_WARNLOG("ignoring S3LVOL_IMPORT_PREFETCH_PARALLEL='%s'\n", v);
+		return S3_EXPORT_PREFETCH_DEFAULT;
+	}
+	return n > S3_EXPORT_PREFETCH_MAX ? S3_EXPORT_PREFETCH_MAX : (uint32_t)n;
+}
 
 struct decouple_rewrite_entry {
 	char                    uuid_str[SPDK_UUID_STRING_LEN];
@@ -3951,6 +4106,147 @@ decouple_prefetch(struct s3lvol_decouple *d)
 static void decouple_start_next_queued(void);
 static void decouple_finish_complete(struct s3lvol_decouple *d);
 
+/* Present chunks of [first, last] chunk index, for local_chunks accounting. */
+static uint64_t
+decouple_present_in(const struct s3lvol_decouple *d, uint64_t first, uint64_t end)
+{
+	uint64_t i, n = 0;
+
+	for (i = first; i < end && i < d->m->num_chunks; i++) {
+		if (s3_export_manifest_is_present(d->m, i)) {
+			n++;
+		}
+	}
+	return n;
+}
+
+/* Clusters [0, d->cluster) are materialised: every chunk entirely below the
+ * first chunk of cluster d->cluster has been copied into the lvol. */
+static void
+decouple_advance_local(struct s3lvol_decouple *d)
+{
+	uint64_t bound = (d->cluster * d->cluster_size) / d->chunk_size;
+
+	if (d->cluster >= d->num_clusters) {
+		bound = d->m->num_chunks;
+	}
+	if (bound <= d->released_bound) {
+		return;
+	}
+	if (d->st) {
+		d->st->local_chunks += decouple_present_in(d, d->released_bound, bound);
+		d->st->clusters_done = d->done;
+	}
+	d->released_bound = bound;
+	if (d->pf) {
+		s3_export_prefetcher_release_below(d->pf, bound);
+	}
+}
+
+struct decouple_pf_msg {
+	struct s3lvol_decouple *d;
+};
+
+static void
+decouple_pf_drained_msg(void *arg)
+{
+	struct s3lvol_decouple *d = arg;
+	void (*next)(struct s3lvol_decouple *d) = d->pf_drained_fn;
+
+	if (!d->pf_draining || !s3_export_prefetcher_idle(d->pf)) {
+		return;
+	}
+	s3_export_prefetcher_destroy(d->pf);
+	d->pf = NULL;
+	d->pf_draining = false;
+	d->pf_drained_fn = NULL;
+	next(d);
+}
+
+/* Stop launching, wait for in-flight prefetch GETs, destroy, then call next.
+ * Never destroys inline: a prefetch callback may be on the stack. */
+static void
+decouple_pf_drain(struct s3lvol_decouple *d, void (*next)(struct s3lvol_decouple *d))
+{
+	s3_export_prefetcher_stop(d->pf);
+	d->pf_draining = true;
+	d->pf_drained_fn = next;
+	if (s3_export_prefetcher_idle(d->pf)) {
+		spdk_thread_send_msg(spdk_get_thread(), decouple_pf_drained_msg, d);
+	}
+	/* Otherwise the last completion's callback sends the message. */
+}
+
+static void
+decouple_pf_cb(void *cb_arg, uint64_t chunk_index, int status)
+{
+	struct s3lvol_decouple *d = cb_arg;
+
+	if (status != 0 && status != -ENOENT) {
+		SPDK_ERRLOG("Prefetch of chunk %" PRIu64 " of export %s for lvol '%s' "
+			    "failed: %s\n", chunk_index, d->uuid_str, d->lvol_name,
+			    spdk_strerror(-status));
+	}
+	if (d->pf_draining && s3_export_prefetcher_idle(d->pf)) {
+		spdk_thread_send_msg(spdk_get_thread(), decouple_pf_drained_msg, d);
+	}
+}
+
+/* Build the ordered list of present chunks under the clusters that will be
+ * materialised and start fetching them. A failure here is not fatal to the
+ * decouple: every read still goes through the whole-chunk path on demand. */
+static void
+decouple_pf_start(struct s3lvol_decouple *d)
+{
+	struct spdk_bs_dev *esnap = spdk_blob_get_esnap_bs_dev(d->lvol->blob);
+	uint64_t *chunks = NULL, n = 0, c, last = UINT64_MAX;
+	int rc;
+
+	if (!esnap || !s3_export_bs_dev_is_export(esnap)) {
+		SPDK_WARNLOG("lvol '%s': esnap parent is not an export device; "
+			     "decoupling without prefetch\n", d->lvol_name);
+		return;
+	}
+	chunks = calloc(d->m->present_chunks ? d->m->present_chunks : 1,
+			sizeof(*chunks));
+	if (!chunks) {
+		return;
+	}
+	for (c = 0; c < d->num_clusters; c++) {
+		uint64_t first, end, i;
+
+		if (decouple_cluster_is_hole(d, c)) {
+			continue;
+		}
+		first = (c * d->cluster_size) / d->chunk_size;
+		end = ((c + 1) * d->cluster_size - 1) / d->chunk_size + 1;
+		for (i = first; i < end && i < d->m->num_chunks; i++) {
+			if (i == last || (last != UINT64_MAX && i < last)) {
+				continue;
+			}
+			if (s3_export_manifest_is_present(d->m, i) &&
+			    n < d->m->present_chunks) {
+				chunks[n++] = i;
+				last = i;
+			}
+		}
+	}
+	rc = s3_export_prefetcher_create(esnap, chunks, n, d->window,
+					 decouple_pf_cb, d, &d->pf);
+	free(chunks);
+	if (rc != 0) {
+		SPDK_WARNLOG("lvol '%s': could not start the prefetch of export %s: "
+			     "%s; decoupling without it\n", d->lvol_name, d->uuid_str,
+			     spdk_strerror(-rc));
+		d->pf = NULL;
+		return;
+	}
+	SPDK_NOTICELOG("lvol '%s': prefetching %" PRIu64 " whole chunk(s) of export "
+		       "%s, %u in parallel\n", d->lvol_name, n, d->uuid_str,
+		       d->window ? d->window : S3_EXPORT_PREFETCH_DEFAULT);
+	s3_export_prefetcher_pump(d->pf);
+}
+
 static void
 decouple_ingest_ended(void *arg, int status)
 {
@@ -3958,9 +4254,20 @@ decouple_ingest_ended(void *arg, int status)
 	decouple_finish_complete(arg);
 }
 
+static void decouple_pf_drain(struct s3lvol_decouple *d,
+			      void (*next)(struct s3lvol_decouple *d));
+static void decouple_finish(struct s3lvol_decouple *d);
+
 static void
 decouple_finish(struct s3lvol_decouple *d)
 {
+	if (d->pf) {
+		/* GETs of the prefetcher may still be in flight into the esnap
+		 * device's slot table; wait for them before anything below can let
+		 * that device go. */
+		decouple_pf_drain(d, decouple_finish);
+		return;
+	}
 	if (d->ingest) {
 		d->ingest = false;
 		s3_bs_dev_ingest_end(s3lvol_lvstore_get_bs_dev(d->lvs),
@@ -4001,6 +4308,20 @@ decouple_finish_complete(struct s3lvol_decouple *d)
 			    "through to the export and can be decoupled again.\n",
 			    d->lvol_name, d->uuid_str, d->done, d->total,
 			    spdk_strerror(-status));
+	}
+
+	if (d->st) {
+		d->st->clusters_done = d->done;
+		if (status == 0) {
+			d->st->state = S3LVOL_IMPORT_DONE;
+			d->st->local_chunks = d->st->present_chunks;
+		} else if (status == -ECANCELED) {
+			d->st->state = S3LVOL_IMPORT_CANCELLED;
+			d->st->error = status;
+		} else {
+			d->st->state = S3LVOL_IMPORT_FAILED;
+			d->st->error = status;
+		}
 	}
 
 	if (d->lvol) {
@@ -4131,6 +4452,25 @@ decouple_next(struct s3lvol_decouple *d)
 	while (d->cluster < d->num_clusters && decouple_cluster_is_hole(d, d->cluster)) {
 		d->cluster++;
 	}
+	decouple_advance_local(d);
+
+	if (d->pf) {
+		struct s3_export_prefetch_progress pg;
+
+		s3_export_prefetcher_get_progress(d->pf, &pg);
+		if (pg.status != 0) {
+			/* Fail closed: an import that asked for its data to be local is
+			 * not allowed to look complete while a fetch of it failed. The
+			 * volume still reads through the export and can be decoupled
+			 * again. */
+			SPDK_ERRLOG("Decoupling lvol '%s' from export %s: prefetch "
+				    "failed: %s\n", d->lvol_name, d->uuid_str,
+				    spdk_strerror(-pg.status));
+			d->status = pg.status;
+			decouple_finish(d);
+			return;
+		}
+	}
 
 	if (d->cluster >= d->num_clusters) {
 		struct spdk_lvol_store *store = s3lvol_lvstore_get_lvs(d->lvs);
@@ -4162,6 +4502,12 @@ decouple_next(struct s3lvol_decouple *d)
 			return;
 		}
 
+		if (d->pf) {
+			/* Clearing the parent destroys the export device the
+			 * prefetcher points into. Let it go first. */
+			decouple_pf_drain(d, decouple_next);
+			return;
+		}
 		spdk_bs_blob_clear_external_parent(store->blobstore,
 						   spdk_blob_get_id(d->lvol->blob),
 						   decouple_cleared, d);
@@ -4256,6 +4602,8 @@ struct decouple_queued {
 	struct s3lvol_lvstore        *lvs;
 	struct spdk_lvol             *lvol;
 	char                          uuid_str[SPDK_UUID_STRING_LEN];
+	bool                          prefetch;
+	uint32_t                      window;
 	spdk_lvol_op_complete         cb_fn;
 	void                         *cb_arg;
 	TAILQ_ENTRY(decouple_queued)  link;
@@ -4302,7 +4650,8 @@ s3lvol_lvol_decouple_pending(const struct spdk_lvol *lvol)
  * treats that as retryable and leaves the queue entry in place. */
 static int
 decouple_start(struct s3lvol_lvstore *lvs, struct spdk_lvol *lvol,
-	       const char *uuid_str, spdk_lvol_op_complete cb_fn, void *cb_arg)
+	       const char *uuid_str, bool prefetch, uint32_t window,
+	       spdk_lvol_op_complete cb_fn, void *cb_arg)
 {
 	struct s3lvol_import *imp;
 	struct s3lvol_decouple *d;
@@ -4320,8 +4669,14 @@ decouple_start(struct s3lvol_lvstore *lvs, struct spdk_lvol *lvol,
 	d->lvol   = lvol;
 	d->cb_fn  = cb_fn;
 	d->cb_arg = cb_arg;
+	d->prefetch = prefetch;
+	d->window = window;
 	snprintf(d->uuid_str, sizeof(d->uuid_str), "%s", uuid_str);
 	snprintf(d->lvol_name, sizeof(d->lvol_name), "%s", lvol->name);
+	d->st = import_status_find(lvs, lvol->name);
+	if (!d->st && prefetch) {
+		d->st = import_status_begin(lvs, lvol->name, uuid_str, prefetch, window);
+	}
 
 	/* The manifest is the whole point: without its bitmap there is no way to tell
 	 * a hole from data, and the only safe reading of "no manifest" is to refuse
@@ -4389,11 +4744,30 @@ decouple_start(struct s3lvol_lvstore *lvs, struct spdk_lvol *lvol,
 	lvol->action_in_progress = true;
 	TAILQ_INSERT_TAIL(&g_decouples, d, link);
 
+	if (d->st) {
+		d->st->state = S3LVOL_IMPORT_RUNNING;
+		d->st->prefetch = prefetch;
+		d->st->window = window;
+		d->st->present_chunks = d->m->present_chunks;
+		d->st->clusters_total = d->total;
+		d->st->clusters_done = 0;
+		d->st->local_chunks = 0;
+		d->st->error = 0;
+	}
+
 	struct spdk_bs_dev *bs = s3lvol_lvstore_get_bs_dev(lvs);
 	struct s3_client *client = s3lvol_lvstore_get_client(lvs);
 	const char *bucket = s3_client_bucket(client);
 
-	if (bs && bucket && bucket[0] != '\0' && d->m->src.bucket[0] != '\0' &&
+	/* Prefetch mode never ingests: CopyObject makes the lvol own S3 objects
+	 * but leaves nothing local, so every later read would still be a GET.
+	 * The GET path writes each cluster through the WAL, which is local. */
+	if (prefetch) {
+		SPDK_NOTICELOG("Decoupling lvol '%s' from export %s with prefetch: "
+			       "%" PRIu64 " of %" PRIu64 " cluster(s) hold data\n",
+			       d->lvol_name, d->uuid_str, d->total, d->num_clusters);
+		decouple_pf_start(d);
+	} else if (bs && bucket && bucket[0] != '\0' && d->m->src.bucket[0] != '\0' &&
 	    strcmp(bucket, d->m->src.bucket) == 0 &&
 	    s3_bs_dev_get_chunk_size(bs) == d->chunk_size &&
 	    s3_bs_dev_ingest_begin(bs, d->m->src.bucket,
@@ -4453,7 +4827,8 @@ decouple_start_next_queued(void)
 		}
 
 		TAILQ_REMOVE(&g_decouple_queue, q, link);
-		rc = decouple_start(q->lvs, q->lvol, q->uuid_str, q->cb_fn, q->cb_arg);
+		rc = decouple_start(q->lvs, q->lvol, q->uuid_str, q->prefetch,
+				    q->window, q->cb_fn, q->cb_arg);
 		if (rc == 0) {
 			free(q);
 			return;
@@ -4466,6 +4841,15 @@ decouple_start_next_queued(void)
 		SPDK_ERRLOG("Queued decouple of lvol '%s' from export %s could not be "
 			    "started: %s\n", q->lvol->name, q->uuid_str,
 			    spdk_strerror(-rc));
+		{
+			struct import_status *st = import_status_find(q->lvs,
+						   q->lvol->name);
+
+			if (st) {
+				st->state = S3LVOL_IMPORT_FAILED;
+				st->error = rc;
+			}
+		}
 		cb_fn  = q->cb_fn;
 		cb_arg = q->cb_arg;
 		free(q);
@@ -4510,6 +4894,12 @@ void
 s3lvol_decouple_dequeue_lvol(struct spdk_lvol *lvol)
 {
 	struct decouple_queued *q = decouple_queued_find(lvol);
+	struct s3lvol_lvstore *lvs = lvol ? s3lvol_lvstore_of_lvol(lvol) : NULL;
+
+	/* The volume is going away; its import status goes with it. */
+	if (lvs && lvol->name[0] != '\0' && !decouple_find(lvol)) {
+		import_status_drop(lvs, lvol->name);
+	}
 
 	if (!q) {
 		return;
@@ -4548,6 +4938,12 @@ s3lvol_decouple_cancel(struct spdk_lvol *lvol, spdk_lvol_op_complete cb_fn,
 
 	q = decouple_queued_find(lvol);
 	if (q) {
+		struct import_status *st = import_status_find(q->lvs, lvol->name);
+
+		if (st) {
+			st->state = S3LVOL_IMPORT_CANCELLED;
+			st->error = -ECANCELED;
+		}
 		/* Never started, so there is nothing to unwind and nothing to wait
 		 * for. Note this leaves the volume with no materialised clusters at
 		 * all, which is correct: it never read anything out of the export. */
@@ -4582,6 +4978,14 @@ s3lvol_decouple_cancel(struct spdk_lvol *lvol, spdk_lvol_op_complete cb_fn,
 int
 s3lvol_lvol_decouple(struct s3lvol_lvstore *lvs, struct spdk_lvol *lvol,
 		   spdk_lvol_op_complete cb_fn, void *cb_arg)
+{
+	return s3lvol_lvol_decouple_ex(lvs, lvol, false, 0, cb_fn, cb_arg);
+}
+
+int
+s3lvol_lvol_decouple_ex(struct s3lvol_lvstore *lvs, struct spdk_lvol *lvol,
+			bool prefetch, uint32_t window,
+			spdk_lvol_op_complete cb_fn, void *cb_arg)
 {
 	if (s3lvol_lvol_source_held(lvol)) return -EBUSY;
 	if (s3lvol_lvstore_source_closed(lvs)) return -ESHUTDOWN;
@@ -4653,9 +5057,16 @@ s3lvol_lvol_decouple(struct s3lvol_lvstore *lvs, struct spdk_lvol *lvol,
 	 * Wait for it; see the comment on decouple_find_blocker() for why each of
 	 * those is a reason, and struct decouple_queued for why this waits rather than
 	 * refusing. */
+	if (prefetch) {
+		if (!import_status_begin(lvs, lvol->name, esnap_uuid, prefetch, window)) {
+			return -ENOMEM;
+		}
+	}
+
 	running = decouple_find_blocker(lvs, esnap_uuid);
 	if (!running) {
-		return decouple_start(lvs, lvol, esnap_uuid, cb_fn, cb_arg);
+		return decouple_start(lvs, lvol, esnap_uuid, prefetch, window,
+				      cb_fn, cb_arg);
 	}
 
 	q = calloc(1, sizeof(*q));
@@ -4666,6 +5077,8 @@ s3lvol_lvol_decouple(struct s3lvol_lvstore *lvs, struct spdk_lvol *lvol,
 	q->lvol   = lvol;
 	q->cb_fn  = cb_fn;
 	q->cb_arg = cb_arg;
+	q->prefetch = prefetch;
+	q->window = window;
 	snprintf(q->uuid_str, sizeof(q->uuid_str), "%s", esnap_uuid);
 	TAILQ_INSERT_TAIL(&g_decouple_queue, q, link);
 
@@ -4726,6 +5139,93 @@ s3lvol_decouple_get(const struct s3lvol_decouple *d, struct s3lvol_decouple_info
 	out->export_uuid    = d->uuid_str;
 	out->clusters_total = d->total;
 	out->clusters_done  = d->done;
+}
+
+int
+s3lvol_import_status_get(struct s3lvol_lvstore *lvs, struct spdk_lvol *lvol,
+			 bool start_if_idle, uint32_t window,
+			 struct s3lvol_import_status_info *out)
+{
+	struct import_status *st;
+	struct s3lvol_decouple *d;
+
+	if (!lvs || !lvol || !lvol->blob || !out) {
+		return -EINVAL;
+	}
+	memset(out, 0, sizeof(*out));
+	snprintf(out->lvol_name, sizeof(out->lvol_name), "%s", lvol->name);
+
+	st = import_status_find(lvs, lvol->name);
+	d = decouple_find(lvol);
+	if (d && d->pf) {
+		struct s3_export_prefetch_progress pg;
+
+		s3_export_prefetcher_get_progress(d->pf, &pg);
+		out->chunks_fetched = pg.fetched;
+		out->fetch_inflight = pg.inflight;
+	}
+
+	if (!spdk_blob_is_esnap_clone(lvol->blob)) {
+		/* Nothing reads an export any more: the volume is entirely local
+		 * (decoupled, or a local clone that never had an export parent). */
+		if (st) {
+			snprintf(out->export_uuid, sizeof(out->export_uuid), "%s",
+				 st->export_uuid);
+			out->present_chunks = st->present_chunks;
+			out->clusters_total = st->clusters_total;
+			out->clusters_done = st->clusters_total;
+			out->prefetch = st->prefetch;
+			out->window = st->window;
+		}
+		out->local_chunks = out->present_chunks;
+		out->state = S3LVOL_IMPORT_DONE;
+		out->done = true;
+		return 0;
+	}
+
+	if (!st && !decouple_find(lvol) && !decouple_queued_find(lvol)) {
+		/* An esnap clone nobody is decoupling: a restart dropped the record,
+		 * or the import opted out. Start it when asked, so a retried Create
+		 * that reuses a leftover volume does not wait for ever. */
+		if (start_if_idle) {
+			int rc = s3lvol_lvol_decouple_ex(lvs, lvol, true, window,
+							NULL, NULL);
+			if (rc != 0) {
+				return rc;
+			}
+			st = import_status_find(lvs, lvol->name);
+		}
+		if (!st) {
+			out->state = S3LVOL_IMPORT_IDLE;
+			return 0;
+		}
+	}
+
+	if (!st) {
+		/* A decouple started without a record (rcow_decouple_lvol). */
+		out->state = d ? S3LVOL_IMPORT_RUNNING : S3LVOL_IMPORT_QUEUED;
+		if (d) {
+			out->clusters_total = d->total;
+			out->clusters_done = d->done;
+		}
+		return 0;
+	}
+
+	if (st) {
+		snprintf(out->export_uuid, sizeof(out->export_uuid), "%s", st->export_uuid);
+		out->state = st->state;
+		out->prefetch = st->prefetch;
+		out->window = st->window;
+		out->present_chunks = st->present_chunks;
+		out->local_chunks = st->local_chunks;
+		out->clusters_total = st->clusters_total;
+		out->clusters_done = d ? d->done : st->clusters_done;
+		out->error = st->error;
+		/* A failed or cancelled run leaves the volume an esnap clone. A new
+		 * start clears it, so only report done when the blob says so. */
+		out->done = false;
+	}
+	return 0;
 }
 
 /* ==========================================================================

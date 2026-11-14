@@ -30,6 +30,55 @@
  *   longer referenced. That is why both the manifest and the S3 client are held
  *   by reference here: the import RPC that created this is long gone, and a
  *   release_export may have happened in between.
+ *
+ *   === Whole-chunk fetches and prefetch (B19) ===
+ *
+ *   Where an imported volume's reads go, in order of time:
+ *
+ *     1. Before decouple has materialised a cluster, blobstore reads it through
+ *        this device. This used to be one ranged GET per guest I/O, sized to the
+ *        I/O (often 4 KiB) and never cached. On Ceph RGW a single small GET took
+ *        6-28 s under load, so mounting an imported metadata disk timed out.
+ *     2. Once decouple has materialised a cluster on the GET path, blobstore
+ *        reads the importing lvol's own cluster. That goes through the lvstore
+ *        bs_dev: overlay/WAL first (the materialise write lands there), then,
+ *        after the flusher has uploaded it, s3_cache (the flusher populates it
+ *        with the whole chunk), and only on a cache miss a GET of the lvol's own
+ *        object.
+ *     3. The CopyObject ingest variant of decouple makes the lvol own objects
+ *        under its own prefix but writes nothing locally, so after it every
+ *        read is still a GET (of the new objects). That is why an import that
+ *        asks for prefetch skips ingest and uses the GET path (see
+ *        vbdev_s3lvol_xfer.c, decouple).
+ *
+ *   This device therefore never serves guest I/O with sub-chunk GETs any more.
+ *   Every present chunk is fetched as the whole object (valid_bytes for a REF
+ *   chunk, chunk_size for a dense one) into a slot of a small table owned by
+ *   home_thread, and every read of that chunk -- the one that missed and any
+ *   that arrive while the GET is in flight -- is copied out of the same buffer.
+ *   Reads arriving on other threads are bounced to home_thread for the lookup
+ *   and the answer is sent back to the thread that issued the read.
+ *
+ *   The table has two partitions, so memory is bounded:
+ *
+ *     - EXPORT_MISS_SLOTS slots for demand misses. Filled ones stay as an LRU
+ *       cache. When every one is in flight a miss gets a transient slot that is
+ *       freed as soon as its waiters are served (bounded by the guest's queue
+ *       depth), still a whole-object GET.
+ *     - S3_EXPORT_PREFETCH_MAX slots for the prefetcher. A prefetched chunk stays
+ *       *pinned* until its consumer releases it, so the prefetcher's window is
+ *       exactly the number of whole-chunk buffers it holds:
+ *       window x chunk_size bytes.
+ *
+ *   The prefetcher (s3_export_prefetcher_*) walks a list of present chunks in
+ *   order with at most `window` fetched-but-not-released chunks at a time. The
+ *   decouple that consumes it materialises clusters in the same order, so each
+ *   materialise finds its chunk already fetched (or in flight) and the copy into
+ *   the lvol's own clusters is local. Once decouple has finished, the volume no
+ *   longer reads this device at all.
+ *
+ *   Holes and the REF tail are unchanged: a chunk absent from the manifest, or a
+ *   byte range past a REF chunk's valid_bytes, is zero-filled without any I/O.
  */
 
 #include "spdk/stdinc.h"
@@ -41,6 +90,36 @@
 
 #include "s3lvol/s3_chunk_map.h"
 #include "s3lvol/s3_export.h"
+
+/* Demand-miss partition of the slot table. See the file comment. */
+#define EXPORT_MISS_SLOTS 16
+
+enum export_slot_state {
+	EXPORT_SLOT_FREE = 0,
+	EXPORT_SLOT_FETCHING,
+	EXPORT_SLOT_FILLED,
+};
+
+struct s3_export_chunk_io;
+struct export_pf_wait;
+
+/* One whole chunk object, fetched once and copied out to every reader. Owned by
+ * home_thread: every field is touched only there. */
+struct export_slot {
+	struct s3_export_dev       *dev;
+	enum export_slot_state      state;
+	bool                        transient;
+	bool                        prefetch_part;
+	uint64_t                    chunk_index;
+	char                        key[S3_EXPORT_KEY_MAX];
+	uint32_t                    object_len;   /* bytes the GET asked for */
+	uint8_t                    *buf;          /* chunk_size bytes, kept for reuse */
+	uint32_t                    pins;         /* prefetcher references */
+	uint64_t                    gen;          /* bumped on every reuse */
+	uint64_t                    lru;
+	TAILQ_HEAD(, s3_export_chunk_io) waiters;
+	TAILQ_HEAD(, export_pf_wait)     pf_waiters;
+};
 
 struct s3_export_dev {
 	/* Must be first: blobstore only ever holds &dev->bs_dev, and the cast
@@ -81,6 +160,13 @@ struct s3_export_dev {
 	uint64_t                   bytes_read;
 	uint64_t                   zero_fills;
 	uint64_t                   refetches;
+
+	/* Whole-chunk slot table, home_thread only. */
+	struct export_slot         slots[EXPORT_MISS_SLOTS + S3_EXPORT_PREFETCH_MAX];
+	uint64_t                   lru_clock;
+	uint32_t                   fetch_inflight;
+	bool                       destroy_pending;
+	struct s3_export_bs_dev_stats stats;
 };
 
 /* One bs_dev read, possibly spanning several chunks. */
@@ -130,7 +216,27 @@ struct s3_export_chunk_io {
 	 * far as the object store went, and the rest keeps whatever was there. */
 	uint32_t             expected;
 
+	/* Where in the chunk the read starts, where its bytes go, and how long the
+	 * whole object is (valid_bytes for REF, chunk_size for dense). The fetch
+	 * is always [0, object_len); the read copies its part out. */
+	uint32_t             offset_in_chunk;
+	uint8_t             *dst;
+	uint32_t             object_len;
+
+	/* Result carried back to the origin thread. */
+	int                  result_status;
+	uint64_t             result_bytes;
+
+	TAILQ_ENTRY(s3_export_chunk_io) slot_link;
+
 	char                 key[S3_EXPORT_KEY_MAX];
+};
+
+/* A prefetcher waiting for a slot it pinned to be filled. */
+struct export_pf_wait {
+	struct s3_export_prefetcher *p;
+	uint64_t                     chunk_index;
+	TAILQ_ENTRY(export_pf_wait)  link;
 };
 
 /* ==========================================================================
@@ -239,6 +345,308 @@ export_io_put(struct s3_export_io *io)
 	}
 }
 
+static void export_chunk_read_done(void *cb_arg, uint64_t bytes_read, int status);
+static void export_pf_slot_done(struct export_pf_wait *w, int status);
+static void export_destroy_now(struct s3_export_dev *dev);
+
+/* ==========================================================================
+ * Whole-chunk slot table (home_thread only)
+ * ========================================================================== */
+
+static bool
+export_on_home(const struct s3_export_dev *dev)
+{
+	return spdk_get_thread() == dev->home_thread;
+}
+
+static struct export_slot *
+export_slot_find(struct s3_export_dev *dev, uint64_t chunk_index, const char *key)
+{
+	uint32_t i;
+
+	for (i = 0; i < SPDK_COUNTOF(dev->slots); i++) {
+		struct export_slot *s = &dev->slots[i];
+
+		if (s->state != EXPORT_SLOT_FREE && s->chunk_index == chunk_index &&
+		    strcmp(s->key, key) == 0) {
+			return s;
+		}
+	}
+	return NULL;
+}
+
+/* A slot of the given partition to (re)use: a free one, else the least recently
+ * used filled one nobody pins. NULL when every slot is in flight or pinned. */
+static struct export_slot *
+export_slot_alloc(struct s3_export_dev *dev, bool prefetch_part, uint32_t window)
+{
+	struct export_slot *victim = NULL;
+	uint32_t i, lo, hi;
+
+	/* The prefetch partition is cut to the prefetcher's window, so the buffers
+	 * it ever allocates -- and keeps for reuse -- are window x chunk_size. */
+	lo = prefetch_part ? EXPORT_MISS_SLOTS : 0;
+	hi = prefetch_part ? EXPORT_MISS_SLOTS + window : EXPORT_MISS_SLOTS;
+	for (i = lo; i < hi; i++) {
+		struct export_slot *s = &dev->slots[i];
+
+		if (s->state == EXPORT_SLOT_FREE) {
+			victim = s;
+			break;
+		}
+		if (s->state == EXPORT_SLOT_FILLED && s->pins == 0 &&
+		    (!victim || s->lru < victim->lru)) {
+			victim = s;
+		}
+	}
+	if (!victim) {
+		return NULL;
+	}
+	if (victim->state == EXPORT_SLOT_FILLED) {
+		dev->stats.evictions++;
+	}
+	victim->dev = dev;
+	victim->state = EXPORT_SLOT_FREE;
+	victim->transient = false;
+	victim->prefetch_part = prefetch_part;
+	victim->pins = 0;
+	victim->gen++;
+	TAILQ_INIT(&victim->waiters);
+	TAILQ_INIT(&victim->pf_waiters);
+	return victim;
+}
+
+static void
+export_slot_release_transient(struct export_slot *s)
+{
+	free(s->buf);
+	free(s);
+}
+
+/* Copy a filled slot's bytes into one reader's buffer and record the result. */
+static void
+export_slot_copy_out(struct export_slot *s, struct s3_export_chunk_io *cio)
+{
+	uint64_t avail = s->object_len > cio->offset_in_chunk ?
+			 s->object_len - cio->offset_in_chunk : 0;
+	uint32_t n = (uint32_t)spdk_min(avail, (uint64_t)cio->expected);
+
+	if (n > 0) {
+		memcpy(cio->dst, s->buf + cio->offset_in_chunk, n);
+	}
+	cio->result_status = 0;
+	cio->result_bytes = n;
+}
+
+static void
+export_cio_deliver_msg(void *arg)
+{
+	struct s3_export_chunk_io *cio = arg;
+
+	export_chunk_read_done(cio, cio->result_bytes, cio->result_status);
+}
+
+/* Hand a finished sub-read back to the thread that owns its I/O. */
+static void
+export_cio_deliver(struct s3_export_chunk_io *cio)
+{
+	struct spdk_thread *origin = cio->io->origin;
+
+	if (origin == NULL || origin == spdk_get_thread()) {
+		export_cio_deliver_msg(cio);
+		return;
+	}
+	if (spdk_thread_send_msg(origin, export_cio_deliver_msg, cio) != 0) {
+		SPDK_ERRLOG("export: could not bounce a chunk read completion back to "
+			    "its thread; completing it here\n");
+		export_cio_deliver_msg(cio);
+	}
+}
+
+static void
+export_slot_fetch_done(void *cb_arg, uint64_t bytes_read, int status)
+{
+	struct export_slot *s = cb_arg;
+	struct s3_export_dev *dev = s->dev;
+	struct s3_export_chunk_io *cio, *ctmp;
+	struct export_pf_wait *w, *wtmp;
+	TAILQ_HEAD(, s3_export_chunk_io) waiters;
+	TAILQ_HEAD(, export_pf_wait) pf_waiters;
+
+	assert(dev->fetch_inflight > 0);
+	dev->fetch_inflight--;
+
+	if (status == 0 && bytes_read != s->object_len) {
+		/* Same rule as a ranged read: a short answer is an error, never zeroes. */
+		SPDK_ERRLOG("Short read of export chunk '%s': asked for %u byte(s), "
+			    "got %" PRIu64 ". Refusing to treat the remainder as "
+			    "zeroes.\n", s->key, s->object_len, bytes_read);
+		status = -EIO;
+	}
+	if (status == 0) {
+		s->state = EXPORT_SLOT_FILLED;
+		s->lru = ++dev->lru_clock;
+	} else {
+		if (status != -ENOENT) {
+			SPDK_ERRLOG("Failed to read export chunk '%s': %s\n", s->key,
+				    spdk_strerror(-status));
+		}
+		dev->stats.fetch_errors++;
+		s->state = EXPORT_SLOT_FREE;
+		s->pins = 0;
+	}
+
+	/* Detach both lists first: a completion can submit another read of the same
+	 * chunk (the retry after a refetch), which must not see this list. */
+	TAILQ_INIT(&waiters);
+	TAILQ_CONCAT(&waiters, &s->waiters, slot_link);
+	TAILQ_INIT(&pf_waiters);
+	TAILQ_CONCAT(&pf_waiters, &s->pf_waiters, link);
+
+	/* Copy into every reader before delivering to any. A delivery can run the
+	 * reader's completion inline, and that can submit a new read which reuses
+	 * this very slot for another chunk. */
+	TAILQ_FOREACH(cio, &waiters, slot_link) {
+		if (status == 0) {
+			export_slot_copy_out(s, cio);
+		} else {
+			cio->result_status = status;
+			cio->result_bytes = 0;
+		}
+	}
+	if (s->transient) {
+		export_slot_release_transient(s);
+		s = NULL;
+	}
+	TAILQ_FOREACH_SAFE(cio, &waiters, slot_link, ctmp) {
+		TAILQ_REMOVE(&waiters, cio, slot_link);
+		export_cio_deliver(cio);
+	}
+	TAILQ_FOREACH_SAFE(w, &pf_waiters, link, wtmp) {
+		TAILQ_REMOVE(&pf_waiters, w, link);
+		export_pf_slot_done(w, status);
+	}
+
+	if (dev->destroy_pending && dev->fetch_inflight == 0) {
+		export_destroy_now(dev);
+	}
+}
+
+/* Start the whole-object GET for a slot already set up with its key. */
+static int
+export_slot_start_fetch(struct s3_export_dev *dev, struct export_slot *s)
+{
+	int rc;
+
+	if (!s->buf) {
+		s->buf = malloc(dev->m->chunk_size);
+		if (!s->buf) {
+			return -ENOMEM;
+		}
+	}
+	s->state = EXPORT_SLOT_FETCHING;
+	dev->fetch_inflight++;
+	if (dev->fetch_inflight > dev->stats.peak_fetch_inflight) {
+		dev->stats.peak_fetch_inflight = dev->fetch_inflight;
+	}
+	dev->stats.whole_gets++;
+	dev->stats.get_bytes += s->object_len;
+	rc = s3_get_range(dev->client, s->key, 0, s->object_len, s->buf,
+			  export_slot_fetch_done, s);
+	if (rc != 0) {
+		dev->fetch_inflight--;
+		dev->stats.whole_gets--;
+		dev->stats.get_bytes -= s->object_len;
+		s->state = EXPORT_SLOT_FREE;
+		return rc;
+	}
+	return 0;
+}
+
+static void
+export_slot_setup(struct export_slot *s, uint64_t chunk_index, const char *key,
+		  uint32_t object_len)
+{
+	s->chunk_index = chunk_index;
+	snprintf(s->key, sizeof(s->key), "%s", key);
+	s->object_len = object_len;
+}
+
+/* On home_thread: serve one sub-read from the slot table, fetching the whole
+ * chunk if nobody has it. */
+static void
+export_fetch_on_home(void *arg)
+{
+	struct s3_export_chunk_io *cio = arg;
+	struct s3_export_dev *dev = cio->io->dev;
+	struct export_slot *s;
+	int rc;
+
+	s = export_slot_find(dev, cio->chunk_index, cio->key);
+	if (s && s->state == EXPORT_SLOT_FILLED) {
+		s->lru = ++dev->lru_clock;
+		dev->stats.slot_hits++;
+		export_slot_copy_out(s, cio);
+		export_cio_deliver(cio);
+		return;
+	}
+	if (s && s->state == EXPORT_SLOT_FETCHING) {
+		dev->stats.slot_joins++;
+		TAILQ_INSERT_TAIL(&s->waiters, cio, slot_link);
+		return;
+	}
+
+	s = export_slot_alloc(dev, false, 0);
+	if (!s) {
+		/* Every miss slot is in flight. Still a whole-object GET, in a buffer
+		 * that lives only as long as its readers. */
+		s = calloc(1, sizeof(*s));
+		if (!s) {
+			cio->result_status = -ENOMEM;
+			cio->result_bytes = 0;
+			export_cio_deliver(cio);
+			return;
+		}
+		s->dev = dev;
+		s->transient = true;
+		TAILQ_INIT(&s->waiters);
+		TAILQ_INIT(&s->pf_waiters);
+		dev->stats.transient_fetches++;
+	}
+	export_slot_setup(s, cio->chunk_index, cio->key, cio->object_len);
+	TAILQ_INSERT_TAIL(&s->waiters, cio, slot_link);
+	dev->stats.miss_fetches++;
+	rc = export_slot_start_fetch(dev, s);
+	if (rc != 0) {
+		SPDK_ERRLOG("Failed to submit a read of export chunk '%s': %s\n",
+			    cio->key, spdk_strerror(-rc));
+		TAILQ_REMOVE(&s->waiters, cio, slot_link);
+		if (s->transient) {
+			export_slot_release_transient(s);
+		}
+		cio->result_status = rc;
+		cio->result_bytes = 0;
+		export_cio_deliver(cio);
+	}
+}
+
+/* Submit one present-chunk sub-read: always through home_thread. */
+static void
+export_fetch_submit(struct s3_export_chunk_io *cio)
+{
+	struct s3_export_dev *dev = cio->io->dev;
+
+	if (export_on_home(dev)) {
+		export_fetch_on_home(cio);
+		return;
+	}
+	if (spdk_thread_send_msg(dev->home_thread, export_fetch_on_home, cio) != 0) {
+		cio->result_status = -ENOMEM;
+		cio->result_bytes = 0;
+		export_cio_deliver(cio);
+	}
+}
+
 static void
 export_chunk_read_done(void *cb_arg, uint64_t bytes_read, int status)
 {
@@ -261,8 +669,7 @@ export_chunk_read_done(void *cb_arg, uint64_t bytes_read, int status)
 		 * just fetched, so refetching again would find the same thing. */
 		io->saw_missing = true;
 	} else if (status != 0) {
-		SPDK_ERRLOG("Failed to read export chunk '%s': %s\n",
-			    cio->key, spdk_strerror(-status));
+		/* The fetch logged the cause once for all of its readers. */
 		if (io->status == 0) {
 			io->status = status;
 		}
@@ -354,7 +761,6 @@ export_read_internal(struct spdk_bs_dev *bs_dev, struct spdk_io_channel *channel
 						     chunk_size - offset_in_chunk);
 		struct s3_export_chunk_io *cio;
 		uint32_t get_len;
-		int rc;
 
 		/* A chunk with no object reads as zeroes. Not an optimisation: it is how
 		 * an export represents a hole, and it is the common case across the
@@ -422,19 +828,19 @@ export_read_internal(struct spdk_bs_dev *bs_dev, struct spdk_io_channel *channel
 		cio->io = io;
 		cio->chunk_index = chunk_index;
 		cio->expected = get_len;
+		cio->offset_in_chunk = offset_in_chunk;
+		cio->dst = buf;
+		cio->object_len = chunk_size;
+		if (io->m->layout == S3_EXPORT_LAYOUT_REF) {
+			cio->object_len = s3_export_manifest_get_ref(io->m,
+					  chunk_index)->valid_bytes;
+		}
 		export_chunk_key(io->m, chunk_index, cio->key, sizeof(cio->key));
 
+		/* Never a ranged GET sized to the guest I/O: the whole object is
+		 * fetched once into the slot table and this read copies its part. */
 		io->num_pending++;
-		rc = s3_get_range(dev->client, cio->key, offset_in_chunk, get_len, buf,
-				  export_chunk_read_done, cio);
-		if (rc != 0) {
-			SPDK_ERRLOG("Failed to submit a read of export chunk '%s': %s\n",
-				    cio->key, spdk_strerror(-rc));
-			io->num_pending--;
-			free(cio);
-			io->status = rc;
-			break;
-		}
+		export_fetch_submit(cio);
 
 next:
 		buf += length;
@@ -647,7 +1053,11 @@ static void
 export_io_device_unregistered(void *io_device)
 {
 	struct s3_export_dev *dev = io_device;
+	uint32_t i;
 
+	for (i = 0; i < SPDK_COUNTOF(dev->slots); i++) {
+		free(dev->slots[i].buf);
+	}
 	s3_export_manifest_unref(dev->m);
 	if (dev->client) {
 		s3_client_put(dev->client);
@@ -656,15 +1066,44 @@ export_io_device_unregistered(void *io_device)
 }
 
 static void
+export_destroy_now(struct s3_export_dev *dev)
+{
+	/* Frees in the callback: unregistering is asynchronous, and any channel
+	 * still open would otherwise be pointing at freed memory. */
+	spdk_io_device_unregister(dev, export_io_device_unregistered);
+}
+
+static void
+export_destroy_on_home(void *arg)
+{
+	struct s3_export_dev *dev = arg;
+
+	/* A whole-chunk GET still in flight writes into a slot of this device from
+	 * its completion. Normally there is none -- every fetch has a reader or a
+	 * prefetcher blobstore or decouple is still waiting for -- but a GET whose
+	 * last reader was satisfied elsewhere is not impossible, so the free waits
+	 * for it rather than racing it. */
+	if (dev->fetch_inflight > 0) {
+		dev->destroy_pending = true;
+		return;
+	}
+	export_destroy_now(dev);
+}
+
+static void
 export_destroy(struct spdk_bs_dev *bs_dev)
 {
 	struct s3_export_dev *dev = (struct s3_export_dev *)bs_dev;
 
 	SPDK_NOTICELOG("Releasing imported export %s: %" PRIu64 " read(s), "
-		       "%" PRIu64 " bytes from S3, %" PRIu64 " served as zeroes, "
-		       "%" PRIu64 " manifest refetch(es)\n",
+		       "%" PRIu64 " bytes served, %" PRIu64 " served as zeroes, "
+		       "%" PRIu64 " manifest refetch(es), %" PRIu64 " whole-chunk "
+		       "GET(s) (%" PRIu64 " prefetched, %" PRIu64 " on demand), "
+		       "%" PRIu64 " slot hit(s), %" PRIu64 " joined in flight\n",
 		       dev->m->uuid_str, dev->reads, dev->bytes_read, dev->zero_fills,
-		       dev->refetches);
+		       dev->refetches, dev->stats.whole_gets,
+		       dev->stats.prefetch_fetches, dev->stats.miss_fetches,
+		       dev->stats.slot_hits, dev->stats.slot_joins);
 
 	/* No wait for a refetch, deliberately.
 	 *
@@ -678,9 +1117,12 @@ export_destroy(struct spdk_bs_dev *bs_dev)
 	 * would leave blobstore waiting for ever, and the leak would look like a
 	 * hung volume rather than like anything to do with this file. */
 
-	/* Frees in the callback: unregistering is asynchronous, and any channel
-	 * still open would otherwise be pointing at freed memory. */
-	spdk_io_device_unregister(dev, export_io_device_unregistered);
+	if (export_on_home(dev)) {
+	 export_destroy_on_home(dev);
+	} else if (spdk_thread_send_msg(dev->home_thread, export_destroy_on_home,
+	 			dev) != 0) {
+	 export_destroy_now(dev);
+	}
 }
 
 /* ==========================================================================
@@ -1173,4 +1615,380 @@ s3_export_bs_dev_set_on_swap(struct spdk_bs_dev *bs_dev,
 	}
 	dev->on_swap = fn;
 	dev->on_swap_arg = arg;
+}
+
+bool
+s3_export_bs_dev_is_export(const struct spdk_bs_dev *bs_dev)
+{
+	return bs_dev != NULL && bs_dev->destroy == export_destroy;
+}
+
+int
+s3_export_bs_dev_get_stats(struct spdk_bs_dev *bs_dev,
+			   struct s3_export_bs_dev_stats *out)
+{
+	struct s3_export_dev *dev = (struct s3_export_dev *)bs_dev;
+
+	if (!s3_export_bs_dev_is_export(bs_dev) || !out) {
+		return -EINVAL;
+	}
+	*out = dev->stats;
+	out->fetch_inflight = dev->fetch_inflight;
+	return 0;
+}
+
+/* ==========================================================================
+ * Prefetcher
+ *
+ * Walks a caller-supplied list of present chunks in order and keeps at most
+ * `window` of them fetched-or-in-flight and pinned. A chunk stays pinned until
+ * the consumer releases it, so the window is also the memory bound. All calls
+ * on home_thread.
+ * ========================================================================== */
+
+struct s3_export_prefetcher {
+	struct s3_export_dev      *dev;
+	uint64_t                  *chunks;
+	uint64_t                   n;
+	uint64_t                   next;       /* next index into chunks to launch */
+	uint64_t                   released;   /* chunks[0..released) are released */
+	uint32_t                   window;
+	uint32_t                   inflight;   /* launched, fetch not completed */
+	uint64_t                   fetched;
+	uint64_t                   skipped;
+	int                        status;
+	bool                       pumping;
+	bool                       stopped;
+	s3_export_prefetch_cb      cb;
+	void                      *cb_arg;
+	/* chunks[i] holds a pin on pin_slot[i] while released <= i < next and
+	 * pin_slot[i] is set. pin_gen[i] is the slot's gen when pinned, so a slot
+	 * that has since been freed and reused is never unpinned by mistake. */
+	struct export_slot       **pin_slot;
+	uint64_t                  *pin_gen;
+};
+
+static uint32_t
+pf_held(const struct s3_export_prefetcher *p)
+{
+	return (uint32_t)(p->next - p->released);
+}
+
+static void s3_export_prefetcher_pump_internal(struct s3_export_prefetcher *p);
+
+static void
+pf_fetched(struct s3_export_prefetcher *p, uint64_t chunk_index, int status)
+{
+	assert(p->inflight > 0);
+	p->inflight--;
+	if (status == 0) {
+		p->fetched++;
+	} else if (status == -ENOENT) {
+		/* The object went away: the source materialised the export. Not a
+		 * prefetch failure -- the demand read that needs this chunk takes the
+		 * 404, refetches the manifest and retries (export_io_complete). */
+		p->skipped++;
+	} else if (p->status == 0) {
+		p->status = status;
+	}
+	if (p->cb) {
+		p->cb(p->cb_arg, chunk_index, status);
+	}
+}
+
+static void
+export_pf_slot_done(struct export_pf_wait *w, int status)
+{
+	struct s3_export_prefetcher *p = w->p;
+	uint64_t chunk_index = w->chunk_index;
+
+	free(w);
+	pf_fetched(p, chunk_index, status);
+	if (p->status == 0) {
+		s3_export_prefetcher_pump_internal(p);
+	}
+}
+
+struct pf_ready_msg {
+	struct s3_export_prefetcher *p;
+	uint64_t                     chunk_index;
+};
+
+static void
+pf_ready_msg(void *arg)
+{
+	struct pf_ready_msg *m = arg;
+	struct s3_export_prefetcher *p = m->p;
+	uint64_t chunk_index = m->chunk_index;
+
+	free(m);
+	pf_fetched(p, chunk_index, 0);
+	if (p->status == 0) {
+		s3_export_prefetcher_pump_internal(p);
+	}
+}
+
+/* Pin chunk i of the list, fetching it if needed. 0, or an error that stops the
+ * prefetcher. */
+static int
+pf_launch_one(struct s3_export_prefetcher *p, uint64_t i)
+{
+	struct s3_export_dev *dev = p->dev;
+	struct s3_export_manifest *m = dev->m;
+	uint64_t chunk_index = p->chunks[i];
+	char key[S3_EXPORT_KEY_MAX];
+	uint32_t object_len = m->chunk_size;
+	struct export_slot *s;
+	struct export_pf_wait *w;
+	int rc;
+
+	if (!s3_export_manifest_is_present(m, chunk_index)) {
+		/* A hole needs no fetch; count it as done without a pin. */
+		p->pin_slot[i] = NULL;
+		return 0;
+	}
+	if (m->layout == S3_EXPORT_LAYOUT_REF) {
+		const struct s3_export_ref *ref = s3_export_manifest_get_ref(m, chunk_index);
+
+		if (!ref || s3_export_manifest_chunk_prefix(m, chunk_index)[0] == '\0') {
+			return -EIO;
+		}
+		object_len = ref->valid_bytes;
+	}
+	export_chunk_key(m, chunk_index, key, sizeof(key));
+	if (key[0] == '\0' || object_len == 0) {
+		p->pin_slot[i] = NULL;
+		return 0;
+	}
+
+	s = export_slot_find(dev, chunk_index, key);
+	if (s) {
+		s->pins++;
+		p->pin_slot[i] = s;
+		p->pin_gen[i] = s->gen;
+		p->inflight++;
+		if (s->state == EXPORT_SLOT_FILLED) {
+			struct pf_ready_msg *msg = calloc(1, sizeof(*msg));
+
+			dev->stats.slot_hits++;
+			if (!msg) {
+				p->inflight--;
+				s->pins--;
+				p->pin_slot[i] = NULL;
+				return -ENOMEM;
+			}
+			msg->p = p;
+			msg->chunk_index = chunk_index;
+			/* Deferred so the callback never runs inside pump. */
+			spdk_thread_send_msg(spdk_get_thread(), pf_ready_msg, msg);
+			return 0;
+		}
+		w = calloc(1, sizeof(*w));
+		if (!w) {
+			p->inflight--;
+			s->pins--;
+			p->pin_slot[i] = NULL;
+			return -ENOMEM;
+		}
+		w->p = p;
+		w->chunk_index = chunk_index;
+		dev->stats.slot_joins++;
+		TAILQ_INSERT_TAIL(&s->pf_waiters, w, link);
+		return 0;
+	}
+
+	s = export_slot_alloc(dev, true, p->window);
+	if (!s) {
+		/* The window is at most S3_EXPORT_PREFETCH_MAX, and every pinned slot is
+		 * one of those, so this means the table is full of pins. */
+		return -EAGAIN;
+	}
+	w = calloc(1, sizeof(*w));
+	if (!w) {
+		return -ENOMEM;
+	}
+	w->p = p;
+	w->chunk_index = chunk_index;
+	export_slot_setup(s, chunk_index, key, object_len);
+	s->pins = 1;
+	TAILQ_INSERT_TAIL(&s->pf_waiters, w, link);
+	p->pin_slot[i] = s;
+	p->pin_gen[i] = s->gen;
+	p->inflight++;
+	dev->stats.prefetch_fetches++;
+	rc = export_slot_start_fetch(dev, s);
+	if (rc != 0) {
+		TAILQ_REMOVE(&s->pf_waiters, w, link);
+		free(w);
+		s->pins = 0;
+		p->pin_slot[i] = NULL;
+		p->inflight--;
+		return rc;
+	}
+	return 0;
+}
+
+static void
+s3_export_prefetcher_pump_internal(struct s3_export_prefetcher *p)
+{
+	if (p->pumping) {
+		return;
+	}
+	p->pumping = true;
+	while (p->status == 0 && !p->stopped && p->next < p->n &&
+	       pf_held(p) < p->window) {
+		uint64_t i = p->next++;
+		int rc = pf_launch_one(p, i);
+
+		if (rc == -EAGAIN) {
+			p->next--;
+			break;
+		}
+		if (rc != 0) {
+			/* Recorded, not reported through cb: this runs inside pump,
+			 * and a consumer is allowed to free p from its callback. The
+			 * consumer reads it through get_progress(). */
+			SPDK_ERRLOG("export prefetch: could not start chunk %" PRIu64
+				    ": %s\n", p->chunks[i], spdk_strerror(-rc));
+			p->status = rc;
+			break;
+		}
+	}
+	p->pumping = false;
+}
+
+static void
+pf_unpin(struct s3_export_prefetcher *p, uint64_t i)
+{
+	struct export_slot *s = p->pin_slot[i];
+
+	if (!s) {
+		return;
+	}
+	p->pin_slot[i] = NULL;
+	/* A failed fetch frees its slot (pins dropped to 0) and the slot may have
+	 * been reused since; only the pin this prefetcher took is given back. */
+	if (s->gen == p->pin_gen[i] && s->state != EXPORT_SLOT_FREE && s->pins > 0) {
+		s->pins--;
+	}
+}
+
+int
+s3_export_prefetcher_create(struct spdk_bs_dev *bs_dev, const uint64_t *chunks,
+			    uint64_t n, uint32_t window, s3_export_prefetch_cb cb,
+			    void *cb_arg, struct s3_export_prefetcher **out)
+{
+	struct s3_export_dev *dev = (struct s3_export_dev *)bs_dev;
+	struct s3_export_prefetcher *p;
+
+	if (!s3_export_bs_dev_is_export(bs_dev) || !out || (n > 0 && !chunks)) {
+		return -EINVAL;
+	}
+	if (!export_on_home(dev)) {
+		/* The slot table belongs to home_thread. */
+		return -EXDEV;
+	}
+	if (window == 0) {
+		window = S3_EXPORT_PREFETCH_DEFAULT;
+	}
+	if (window > S3_EXPORT_PREFETCH_MAX) {
+		window = S3_EXPORT_PREFETCH_MAX;
+	}
+	p = calloc(1, sizeof(*p));
+	if (!p) {
+		return -ENOMEM;
+	}
+	p->chunks = calloc(n ? n : 1, sizeof(*p->chunks));
+	p->pin_slot = calloc(n ? n : 1, sizeof(*p->pin_slot));
+	p->pin_gen = calloc(n ? n : 1, sizeof(*p->pin_gen));
+	if (!p->chunks || !p->pin_slot || !p->pin_gen) {
+		free(p->chunks);
+		free(p->pin_slot);
+		free(p->pin_gen);
+		free(p);
+		return -ENOMEM;
+	}
+	if (n > 0) {
+		memcpy(p->chunks, chunks, n * sizeof(*chunks));
+	}
+	p->dev = dev;
+	p->n = n;
+	p->window = window;
+	p->cb = cb;
+	p->cb_arg = cb_arg;
+	*out = p;
+	return 0;
+}
+
+void
+s3_export_prefetcher_pump(struct s3_export_prefetcher *p)
+{
+	if (p) {
+		s3_export_prefetcher_pump_internal(p);
+	}
+}
+
+void
+s3_export_prefetcher_release_below(struct s3_export_prefetcher *p, uint64_t chunk_bound)
+{
+	if (!p) {
+		return;
+	}
+	while (p->released < p->next && p->chunks[p->released] < chunk_bound) {
+		pf_unpin(p, p->released);
+		p->released++;
+	}
+	if (p->status == 0) {
+		s3_export_prefetcher_pump_internal(p);
+	}
+}
+
+void
+s3_export_prefetcher_get_progress(const struct s3_export_prefetcher *p,
+				  struct s3_export_prefetch_progress *out)
+{
+	if (!p || !out) {
+		return;
+	}
+	out->total = p->n;
+	out->launched = p->next;
+	out->fetched = p->fetched;
+	out->skipped = p->skipped;
+	out->released = p->released;
+	out->inflight = p->inflight;
+	out->held = pf_held(p);
+	out->status = p->status;
+}
+
+void
+s3_export_prefetcher_stop(struct s3_export_prefetcher *p)
+{
+	if (p) {
+		p->stopped = true;
+	}
+}
+
+bool
+s3_export_prefetcher_idle(const struct s3_export_prefetcher *p)
+{
+	return !p || p->inflight == 0;
+}
+
+void
+s3_export_prefetcher_destroy(struct s3_export_prefetcher *p)
+{
+	uint64_t i;
+
+	if (!p) {
+		return;
+	}
+	/* The caller waited for idle: no slot still has a waiter naming p. */
+	assert(p->inflight == 0);
+	for (i = p->released; i < p->next; i++) {
+		pf_unpin(p, i);
+	}
+	free(p->chunks);
+	free(p->pin_slot);
+	free(p->pin_gen);
+	free(p);
 }
