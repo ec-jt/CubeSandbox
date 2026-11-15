@@ -107,6 +107,11 @@ struct s3lvol_import {
 	 * One client and one poller regardless, because every source shares the
 	 * endpoint, bucket and region of `src` -- the writer refuses to reference
 	 * anything else -- and they all share the interval. */
+	/* A delta import's overlay reads the export only while it runs. The entry
+	 * exists for its lease and is never persisted: no blob names this export
+	 * as an esnap parent, so nothing needs the manifest after a restart. */
+	bool                         transient;
+
 	struct spdk_poller          *lease_poller;
 	struct s3_client            *lease_client;
 	char                       (*lease_keys)[S3_EXPORT_KEY_MAX];
@@ -546,7 +551,7 @@ imports_serialize(struct s3lvol_lvstore *lvs, char **out, size_t *out_len)
 		char *manifest_json = NULL;
 		size_t manifest_len = 0;
 
-		if (imp->lvs != lvs) {
+		if (imp->lvs != lvs || imp->transient) {
 			continue;
 		}
 		rc = s3_export_manifest_serialize(imp->m, &manifest_json, &manifest_len);
@@ -1612,16 +1617,43 @@ blob_by_id(struct spdk_lvol_store *store, spdk_blob_id id)
  * blobstore, which flattens the chain by itself, so it can handle every case this
  * declines.
  */
+/* S3LVOL_EXPORT_TEMPLATE_DELTA: off unless set to 1/true/yes. Read once. */
+bool
+s3lvol_export_template_delta_enabled(void)
+{
+	static int cached = -1;
+
+	if (cached < 0) {
+		const char *v = getenv("S3LVOL_EXPORT_TEMPLATE_DELTA");
+
+		cached = v && (strcmp(v, "1") == 0 || strcasecmp(v, "true") == 0 ||
+			       strcasecmp(v, "yes") == 0);
+		if (cached) {
+			SPDK_NOTICELOG("S3LVOL_EXPORT_TEMPLATE_DELTA is on: exports stop at "
+				       "template bases and publish deltas\n");
+		}
+	}
+	return cached == 1;
+}
+
+/* \p base_uuid, when not NULL, asks the walk to stop above a template base:
+ * the base is left out of the chain and its uuid is returned instead, so the
+ * manifest describes only what the layers above it own. The exported snapshot
+ * itself is never treated as a base -- exporting a base publishes the base. */
 static int
 export_build_chain(struct s3lvol_lvstore *lvs, struct spdk_blob *snapshot,
 		   struct spdk_blob **chain, uint32_t max, uint32_t *out_len,
-		   char *esnap_uuid, size_t esnap_uuid_len)
+		   char *esnap_uuid, size_t esnap_uuid_len,
+		   char *base_uuid, size_t base_uuid_len)
 {
 	struct spdk_lvol_store *store = s3lvol_lvstore_get_lvs(lvs);
 	struct spdk_blob *cur = snapshot;
 	uint32_t n = 0;
 
 	esnap_uuid[0] = '\0';
+	if (base_uuid) {
+		base_uuid[0] = '\0';
+	}
 
 	while (true) {
 		spdk_blob_id pid;
@@ -1681,6 +1713,12 @@ export_build_chain(struct s3lvol_lvstore *lvs, struct spdk_blob *snapshot,
 				    "of '%s' has open; exporting by copying instead\n",
 				    pid, s3lvol_lvstore_get_name(lvs));
 			return -ENOENT;
+		}
+		if (base_uuid && s3lvol_template_base_of(lvs, cur, base_uuid,
+							 base_uuid_len) == 0) {
+			/* Everything below is the template base, which every node
+			 * holds byte-identically. Stop here. */
+			break;
 		}
 	}
 
@@ -1758,6 +1796,8 @@ export_ref(struct export_ctx *ctx)
 	struct spdk_blob *chain[S3LVOL_DEFAULT_MAX_CHAIN_DEPTH];
 	struct s3_export_ref_opts opts = {0};
 	char esnap_uuid[SPDK_UUID_STRING_LEN];
+	char base_uuid[SPDK_UUID_STRING_LEN] = {0};
+	bool delta = s3lvol_export_template_delta_enabled();
 	uint32_t chain_len = 0;
 	int rc;
 	ctx->step = "ref";
@@ -1770,7 +1810,8 @@ export_ref(struct export_ctx *ctx)
 
 	rc = export_build_chain(ctx->lvs, ctx->snapshot->blob, chain,
 				SPDK_COUNTOF(chain), &chain_len,
-				esnap_uuid, sizeof(esnap_uuid));
+				esnap_uuid, sizeof(esnap_uuid),
+				delta ? base_uuid : NULL, sizeof(base_uuid));
 	if (rc != 0) {
 		SPDK_NOTICELOG("Export %s: layout dense (snapshot chain walk declined: "
 			       "%s)\n", ctx->info.export_uuid, spdk_strerror(-rc));
@@ -1803,6 +1844,13 @@ export_ref(struct export_ctx *ctx)
 		opts.parent = imp->m;
 	}
 
+	if (base_uuid[0] != '\0') {
+		/* The chain ended at a template base before it could reach an
+		 * export, so `parent` is necessarily NULL here. */
+		opts.base_uuid = base_uuid;
+		SPDK_NOTICELOG("Export %s: template delta over base %s\n",
+			       ctx->info.export_uuid, base_uuid);
+	}
 	opts.bs_dev = s3lvol_lvstore_get_bs_dev(ctx->lvs);
 	opts.chain = chain;
 	opts.chain_len = chain_len;
@@ -2844,6 +2892,22 @@ import_origin_read(struct spdk_lvol *lvol, struct import_origin_v1 *o)
 }
 
 int
+s3lvol_import_origin_export_uuid_is(struct spdk_lvol *lvol, const char *export_uuid)
+{
+	struct import_origin_v1 o;
+	int rc;
+
+	if (!export_uuid) {
+		return -EINVAL;
+	}
+	rc = import_origin_read(lvol, &o);
+	if (rc) {
+		return rc;
+	}
+	return strcmp(o.export_uuid, export_uuid) == 0 ? 0 : -EXDEV;
+}
+
+int
 s3lvol_import_origin_matches(struct spdk_lvol *lvol, const char *uuid,
 			    const char *endpoint, const char *bucket)
 {
@@ -2905,10 +2969,20 @@ struct import_ctx {
 	bool                       prefetch;
 	uint32_t                   prefetch_window;
 	struct spdk_lvol          *created_lvol;
+	char                       base_lvol[SPDK_LVOL_NAME_MAX];
 
 	s3lvol_lvol_op_cb          cb_fn;
 	void                      *cb_arg;
 };
+
+static int delta_import_start(struct import_ctx *ctx);
+static int delta_overlay_begin(struct import_ctx *ctx, struct spdk_lvol *lvol);
+
+/* Set on a delta-imported volume from the moment it exists until every chunk of
+ * the manifest is written. A volume carrying it is never reported local, so a
+ * restart in the middle of the overlay fails closed instead of handing out a
+ * template clone with half the sandbox's data. */
+#define DELTA_PENDING_XATTR "rcow.delta_import_pending.v1"
 
 static void
 import_report(struct import_ctx *ctx, struct spdk_lvol *lvol, int status)
@@ -2957,6 +3031,10 @@ import_origin_synced(void *cb_arg, int lvolerrno)
 		 * uncertain completion. Remove the unsynced in-memory evidence so a
 		 * retry cannot mistake a failed sync for a durable record. */
 		spdk_blob_remove_xattr(lvol->blob, IMPORT_ORIGIN_XATTR);
+		if (ctx->imp && ctx->imp->transient) {
+			/* A delta's lease entry: nothing on disk refers to it. */
+			import_remove(ctx->imp);
+		}
 		ctx->imp = NULL;
 		import_report(ctx, NULL, lvolerrno);
 		return;
@@ -2970,7 +3048,11 @@ import_origin_synced(void *cb_arg, int lvolerrno)
 			    "lvstore to expose it.\n", lvol->name, rc);
 		/* Deliberately does not remove the registry entry: the clone is real
 		 * and its blob metadata now names this export, so the manifest has to
-		 * stay reachable or the next attach fails. */
+		 * stay reachable or the next attach fails. A delta's transient entry
+		 * is the exception -- no blob names it. */
+		if (ctx->imp && ctx->imp->transient) {
+			import_remove(ctx->imp);
+		}
 		ctx->imp = NULL;
 		import_report(ctx, NULL, rc);
 		return;
@@ -2980,6 +3062,24 @@ import_origin_synced(void *cb_arg, int lvolerrno)
 		       "%" PRIu64 " of %" PRIu64 " chunk(s) present\n",
 		       ctx->uuid_str, lvol->name, ctx->m->size_bytes,
 		       ctx->m->present_chunks, ctx->m->num_chunks);
+
+	if (s3_export_manifest_is_delta(ctx->m)) {
+		/* Answer now, overlay in the background; rcow_import_status says when
+		 * the volume is local. A failure to start leaves the pending mark, so
+		 * the status fails closed and the caller's rollback deletes it. */
+		rc = delta_overlay_begin(ctx, lvol);
+		if (rc != 0) {
+			SPDK_ERRLOG("delta import '%s' could not start its overlay: %s\n",
+				    lvol->name, spdk_strerror(-rc));
+			import_status_fail(ctx->lvs, lvol->name, ctx->uuid_str, rc);
+			if (ctx->imp) {
+				import_remove(ctx->imp);
+				ctx->imp = NULL;
+			}
+		}
+		import_report(ctx, lvol, 0);
+		return;
+	}
 
 	/* Started before answering, so that a caller who asked for it cannot see the
 	 * import succeed and then find no decouple in the list. Not waited for: the
@@ -3018,6 +3118,11 @@ import_clone_done(void *cb_arg, struct spdk_lvol *lvol, int lvolerrno)
 	struct import_origin_v1 o = {0};
 	int rc;
 	if (lvolerrno) { import_report(ctx, NULL, lvolerrno); return; }
+	if (s3_export_manifest_is_delta(ctx->m)) {
+		rc = spdk_blob_set_xattr(lvol->blob, DELTA_PENDING_XATTR, ctx->m->base_uuid,
+					 (uint16_t)strlen(ctx->m->base_uuid) + 1);
+		if (rc) { import_report(ctx, NULL, rc); return; }
+	}
 	ctx->created_lvol = lvol;
 	lvol->action_in_progress = true;
 	o.version = htole32(1);
@@ -3279,6 +3384,18 @@ import_got_manifest(void *cb_arg, uint64_t bytes_read, int status)
 			     cluster_size);
 	}
 
+	/* A template delta is never an esnap parent: what it does not mention reads
+	 * from the base, which an export device cannot serve. It is materialised as
+	 * a local clone of the base instead, with the manifest's own chunks written
+	 * over it. Fails closed when the base is not here. */
+	if (s3_export_manifest_is_delta(ctx->m)) {
+		rc = delta_import_start(ctx);
+		if (rc != 0) {
+			import_report(ctx, NULL, rc);
+		}
+		return;
+	}
+
 	/* Before the registry: a local clone records nothing there, which is the
 	 * point. Nothing has been written or allocated yet either, so taking this
 	 * branch leaves no trace of the esnap path having been considered. */
@@ -3436,6 +3553,9 @@ s3lvol_lvol_import_admitted(struct s3lvol_lvstore *lvs, const struct s3lvol_impo
 	ctx->decouple = opts->decouple;
 	ctx->prefetch = opts->decouple && opts->prefetch;
 	ctx->prefetch_window = opts->prefetch_window;
+	if (opts->base_lvol) {
+		snprintf(ctx->base_lvol, sizeof(ctx->base_lvol), "%s", opts->base_lvol);
+	}
 	snprintf(ctx->lvol_name, sizeof(ctx->lvol_name), "%s", opts->lvol_name);
 	snprintf(ctx->uuid_str, sizeof(ctx->uuid_str), "%s", opts->export_uuid);
 
@@ -4011,7 +4131,7 @@ decouple_rewrite_drained(void *cb_arg, int status)
 
 	rc = export_build_chain(d->lvs, d->lvol->blob, ctx->chain,
 				SPDK_COUNTOF(ctx->chain), &ctx->chain_len,
-				esnap_uuid, sizeof(esnap_uuid));
+				esnap_uuid, sizeof(esnap_uuid), NULL, 0);
 	if (rc == 0 && esnap_uuid[0] != '\0') {
 		/* clear_external_parent completed before this path started. Seeing an
 		 * external parent now means publishing a local-only manifest would
@@ -5343,6 +5463,44 @@ s3lvol_import_status_get(struct s3lvol_lvstore *lvs, struct spdk_lvol *lvol,
 	}
 
 	if (!spdk_blob_is_esnap_clone(lvol->blob)) {
+		const void *pending = NULL;
+		size_t pending_len = 0;
+
+		if (spdk_blob_get_xattr_value(lvol->blob, DELTA_PENDING_XATTR, &pending,
+					      &pending_len) == 0) {
+			/* A template-delta import whose overlay has not finished. Never
+			 * "done": without the record (a restart mid-overlay) it is
+			 * reported failed, and the caller's rollback deletes it. */
+			if (st) {
+				snprintf(out->export_uuid, sizeof(out->export_uuid), "%s",
+					 st->export_uuid);
+				out->state = st->state;
+				out->prefetch = st->prefetch;
+				out->window = st->window;
+				out->present_chunks = st->present_chunks;
+				out->local_chunks = st->local_chunks;
+				out->clusters_total = st->clusters_total;
+				out->clusters_done = st->clusters_done;
+				out->error = st->error;
+				out->pf_bytes = st->pf_bytes;
+				out->pf_elapsed_ms = st->pf_elapsed_ms;
+				out->pf_retries = st->pf_retries;
+				out->pf_hedges_issued = st->pf_hedges_issued;
+				out->pf_hedges_won = st->pf_hedges_won;
+				if (out->state == S3LVOL_IMPORT_DONE) {
+					/* The mark outlived a completed run: the sync
+					 * that clears it failed. Not local. */
+					out->state = S3LVOL_IMPORT_FAILED;
+					out->error = out->error ? out->error : -EIO;
+				}
+			} else {
+				out->state = S3LVOL_IMPORT_FAILED;
+				out->error = -EIO;
+			}
+			out->done = false;
+			return 0;
+		}
+
 		/* Nothing reads an export any more: the volume is entirely local
 		 * (decoupled, or a local clone that never had an export parent). */
 		if (st) {
@@ -5408,6 +5566,470 @@ s3lvol_import_status_get(struct s3lvol_lvstore *lvs, struct spdk_lvol *lvol,
 		out->done = false;
 	}
 	return 0;
+}
+
+/* ==========================================================================
+ * Template-delta import
+ *
+ * A version 5 manifest names a template base and only the chunks the sandbox
+ * owns on top of it. Everything else must come from the base, so the import is
+ * a LOCAL clone of this node's copy of that base with the manifest's chunks
+ * written over it -- not an esnap clone, which would serve every unmentioned
+ * chunk as zeroes. The result keeps the base as its parent (no flattening), so
+ * its own next export is again a delta over the same base.
+ *
+ * The chunks are fetched through an export device built over the manifest,
+ * which is the B19/B20 whole-chunk path: prefetched in parallel ahead of the
+ * write loop, hedged, retried. Each one is then written into the clone through
+ * blobstore, so it lands in the local WAL like any write. Chunks the manifest
+ * records as zeroes are written as zeroes, because the base has data there.
+ *
+ * While the source's objects are read, a transient import entry renews their
+ * lease, so the source cannot drop the snapshot underneath; it is not persisted
+ * because no blob ever names this export as a parent.
+ *
+ * Fail closed throughout: no base here, a base that is not the one named, or a
+ * fetch that fails leaves a volume carrying DELTA_PENDING_XATTR, which
+ * rcow_import_status never reports local.
+ * ========================================================================== */
+
+struct delta_overlay {
+	struct s3lvol_lvstore       *lvs;
+	struct spdk_lvol            *lvol;
+	char                         lvol_name[SPDK_LVOL_NAME_MAX];
+	char                         uuid_str[SPDK_UUID_STRING_LEN];
+	struct s3_export_manifest   *m;
+	struct s3lvol_import        *imp;          /* transient, for the lease */
+	struct spdk_bs_dev          *src;          /* export device over m */
+	struct spdk_io_channel      *src_ch;
+	struct spdk_io_channel      *blob_ch;
+	struct s3_export_prefetcher *pf;
+	struct lvs_pf_budget        *budget;
+	struct import_status        *st;
+	uint8_t                     *buf;
+	uint64_t                     chunk;        /* next to consider */
+	uint64_t                     io_unit;
+	uint64_t                     start_ms;
+	uint32_t                     window;
+	int                          status;
+	bool                         finishing;
+	bool                         in_io;
+	struct spdk_bs_dev_cb_args   read_args;    /* one read in flight */
+};
+
+static void delta_overlay_next(struct delta_overlay *o);
+static void delta_overlay_finish(struct delta_overlay *o, int status);
+
+static void
+delta_overlay_free(struct delta_overlay *o)
+{
+	if (o->pf) {
+		s3_export_prefetcher_destroy(o->pf);
+	}
+	lvs_pf_budget_put(o->budget);
+	if (o->src_ch) {
+		o->src->destroy_channel(o->src, o->src_ch);
+	}
+	if (o->src) {
+		o->src->destroy(o->src);
+	}
+	if (o->blob_ch) {
+		spdk_bs_free_io_channel(o->blob_ch);
+	}
+	if (o->imp) {
+		import_remove(o->imp);
+	}
+	spdk_dma_free(o->buf);
+	s3_export_manifest_unref(o->m);
+	free(o);
+}
+
+static void
+delta_overlay_cleared(void *cb_arg, int bserrno)
+{
+	struct delta_overlay *o = cb_arg;
+	uint64_t elapsed = decouple_now_ms() - o->start_ms;
+
+	if (bserrno != 0) {
+		/* The mark stays (in memory and on disk), so the volume keeps
+		 * reporting not-local. */
+		o->status = bserrno;
+	}
+	if (o->st) {
+		o->st->state = o->status == 0 ? S3LVOL_IMPORT_DONE : S3LVOL_IMPORT_FAILED;
+		o->st->error = o->status;
+		o->st->pf_elapsed_ms = elapsed;
+		if (o->status == 0) {
+			o->st->local_chunks = o->st->present_chunks;
+			o->st->clusters_done = o->st->clusters_total;
+		}
+	}
+	if (o->status == 0) {
+		SPDK_NOTICELOG("lvol '%s' is local: delta %s over template base %s, %"
+			       PRIu64 " own chunk(s) in %" PRIu64 " ms\n", o->lvol_name,
+			       o->uuid_str, o->m->base_uuid, o->m->present_chunks, elapsed);
+	} else {
+		SPDK_ERRLOG("Delta import of '%s' from export %s failed: %s. The volume "
+			    "is not usable; delete it.\n", o->lvol_name, o->uuid_str,
+			    spdk_strerror(-o->status));
+	}
+	o->lvol->action_in_progress = false;
+	delta_overlay_free(o);
+	s3lvol_decouple_kick_queue();
+}
+
+static void
+delta_overlay_finish_msg(void *arg)
+{
+	struct delta_overlay *o = arg;
+
+	if (o->pf && !s3_export_prefetcher_idle(o->pf)) {
+		/* The last prefetch completion resends this. */
+		return;
+	}
+	if (o->pf) {
+		struct s3_export_prefetch_progress pg;
+
+		s3_export_prefetcher_get_progress(o->pf, &pg);
+		if (o->st) {
+			o->st->pf_bytes = pg.bytes;
+			o->st->pf_retries = pg.retries;
+			o->st->pf_hedges_issued = pg.hedges_issued;
+			o->st->pf_hedges_won = pg.hedges_won;
+		}
+		s3_export_prefetcher_destroy(o->pf);
+		o->pf = NULL;
+	}
+	if (o->status != 0) {
+		delta_overlay_cleared(o, 0);
+		return;
+	}
+	/* Every chunk is written: clear the mark durably, which is what makes the
+	 * volume local. */
+	spdk_blob_remove_xattr(o->lvol->blob, DELTA_PENDING_XATTR);
+	spdk_blob_sync_md(o->lvol->blob, delta_overlay_cleared, o);
+}
+
+static void
+delta_overlay_finish(struct delta_overlay *o, int status)
+{
+	if (o->finishing) {
+		return;
+	}
+	o->finishing = true;
+	if (status != 0 && o->status == 0) {
+		o->status = status;
+	}
+	if (o->pf) {
+		s3_export_prefetcher_stop(o->pf);
+	}
+	spdk_thread_send_msg(spdk_get_thread(), delta_overlay_finish_msg, o);
+}
+
+static void
+delta_overlay_pf_cb(void *cb_arg, uint64_t chunk_index, int status)
+{
+	struct delta_overlay *o = cb_arg;
+
+	if (status != 0 && status != -ENOENT) {
+		SPDK_ERRLOG("delta import '%s': prefetch of chunk %" PRIu64 " failed: %s\n",
+			    o->lvol_name, chunk_index, spdk_strerror(-status));
+	}
+	if (o->finishing && s3_export_prefetcher_idle(o->pf)) {
+		spdk_thread_send_msg(spdk_get_thread(), delta_overlay_finish_msg, o);
+	}
+}
+
+static void
+delta_overlay_next_msg(void *arg)
+{
+	delta_overlay_next(arg);
+}
+
+static void
+delta_overlay_written(void *cb_arg, int bserrno)
+{
+	struct delta_overlay *o = cb_arg;
+	bool present = s3_export_manifest_is_present(o->m, o->chunk);
+
+	o->in_io = false;
+	if (bserrno != 0) {
+		SPDK_ERRLOG("delta import '%s': writing chunk %" PRIu64 " failed: %s\n",
+			    o->lvol_name, o->chunk, spdk_strerror(-bserrno));
+		delta_overlay_finish(o, bserrno);
+		return;
+	}
+	if (o->st) {
+		o->st->clusters_done++;
+		if (present) {
+			o->st->local_chunks++;
+		}
+	}
+	o->chunk++;
+	if (o->pf) {
+		s3_export_prefetcher_release_below(o->pf, o->chunk);
+	}
+	/* Bounced: a write that completes inline would recurse per chunk. */
+	spdk_thread_send_msg(spdk_get_thread(), delta_overlay_next_msg, o);
+}
+
+static void
+delta_overlay_read_done(struct spdk_io_channel *channel, void *cb_arg, int bserrno)
+{
+	struct delta_overlay *o = cb_arg;
+	uint64_t per = o->m->chunk_size / o->io_unit;
+
+	(void)channel;
+	if (bserrno != 0) {
+		o->in_io = false;
+		SPDK_ERRLOG("delta import '%s': reading chunk %" PRIu64 " of export %s "
+			    "failed: %s\n", o->lvol_name, o->chunk, o->uuid_str,
+			    spdk_strerror(-bserrno));
+		delta_overlay_finish(o, bserrno);
+		return;
+	}
+	spdk_blob_io_write(o->lvol->blob, o->blob_ch, o->buf, o->chunk * per, per,
+			   delta_overlay_written, o);
+}
+
+static void
+delta_overlay_next(struct delta_overlay *o)
+{
+	uint64_t per = o->m->chunk_size / o->io_unit;
+
+	if (o->finishing) {
+		return;
+	}
+	if (o->pf) {
+		struct s3_export_prefetch_progress pg;
+
+		s3_export_prefetcher_get_progress(o->pf, &pg);
+		if (pg.status != 0) {
+			delta_overlay_finish(o, pg.status);
+			return;
+		}
+	}
+	/* BASE chunks are already right: the clone reads them from the base. */
+	while (o->chunk < o->m->num_chunks &&
+	       s3_export_manifest_chunk_source(o->m, o->chunk) == S3_EXPORT_CHUNK_BASE) {
+		o->chunk++;
+	}
+	if (o->chunk >= o->m->num_chunks) {
+		delta_overlay_finish(o, 0);
+		return;
+	}
+	o->in_io = true;
+	if (s3_export_manifest_chunk_source(o->m, o->chunk) == S3_EXPORT_CHUNK_ZERO) {
+		/* The base has data here; the sandbox zeroed it. */
+		spdk_blob_io_write_zeroes(o->lvol->blob, o->blob_ch, o->chunk * per, per,
+					  delta_overlay_written, o);
+		return;
+	}
+	/* One read in flight per overlay, so one args block each is enough; the
+	 * parallelism is in the prefetcher, which keeps the next chunks coming
+	 * while this one is written. */
+	o->read_args.cb_fn = delta_overlay_read_done;
+	o->read_args.channel = o->src_ch;
+	o->read_args.cb_arg = o;
+	o->src->read(o->src, o->src_ch, o->buf,
+		     (o->chunk * o->m->chunk_size) / S3LVOL_BLOCK_SIZE,
+		     (uint32_t)(o->m->chunk_size / S3LVOL_BLOCK_SIZE), &o->read_args);
+}
+
+static void
+delta_overlay_start(struct delta_overlay *o)
+{
+	uint64_t *chunks = NULL, n = 0, i, zeroes = 0;
+	int rc;
+
+	/* Held until the overlay ends: snapshot, clone, resize and delete of a
+	 * half-written volume are refused, as they are during a decouple. */
+	o->lvol->action_in_progress = true;
+	for (i = 0; i < o->m->num_chunks; i++) {
+		if (s3_export_manifest_is_zero(o->m, i)) {
+			zeroes++;
+		}
+	}
+	if (o->st) {
+		o->st->state = S3LVOL_IMPORT_RUNNING;
+		o->st->present_chunks = o->m->present_chunks;
+		o->st->clusters_total = o->m->present_chunks + zeroes;
+	}
+	chunks = calloc(o->m->present_chunks ? o->m->present_chunks : 1, sizeof(*chunks));
+	if (!chunks) {
+		delta_overlay_finish(o, -ENOMEM);
+		return;
+	}
+	for (i = 0; i < o->m->num_chunks && n < o->m->present_chunks; i++) {
+		if (s3_export_manifest_is_present(o->m, i)) {
+			chunks[n++] = i;
+		}
+	}
+	rc = s3_export_prefetcher_create(o->src, chunks, n, o->window,
+					 delta_overlay_pf_cb, o, &o->pf);
+	free(chunks);
+	if (rc != 0) {
+		/* Not fatal: reads still go through the whole-chunk path on demand. */
+		SPDK_WARNLOG("delta import '%s': no prefetch (%s)\n", o->lvol_name,
+			     spdk_strerror(-rc));
+		o->pf = NULL;
+	} else {
+		o->budget = lvs_pf_budget_get(o->lvs);
+		if (o->budget) {
+			s3_export_prefetcher_set_budget(o->pf, o->budget->b);
+		}
+		s3_export_prefetcher_pump(o->pf);
+	}
+	SPDK_NOTICELOG("Delta import '%s' from export %s over template base %s: %" PRIu64
+		       " own chunk(s), %" PRIu64 " zero chunk(s)\n", o->lvol_name,
+		       o->uuid_str, o->m->base_uuid, o->m->present_chunks, zeroes);
+	delta_overlay_next(o);
+}
+
+static void
+delta_overlay_resized(void *cb_arg, int lvolerrno)
+{
+	struct delta_overlay *o = cb_arg;
+
+	if (lvolerrno != 0) {
+		delta_overlay_finish(o, lvolerrno);
+		return;
+	}
+	delta_overlay_start(o);
+}
+
+static int
+delta_overlay_begin(struct import_ctx *ctx, struct spdk_lvol *lvol)
+{
+	struct spdk_lvol_store *store = s3lvol_lvstore_get_lvs(ctx->lvs);
+	struct delta_overlay *o;
+	struct s3_target target;
+	struct s3_client *client = NULL;
+	uint64_t cur_size;
+	int rc;
+
+	if (!ctx->imp) {
+		return -EINVAL;
+	}
+	o = calloc(1, sizeof(*o));
+	if (!o) {
+		return -ENOMEM;
+	}
+	o->lvs = ctx->lvs;
+	o->lvol = lvol;
+	o->m = ctx->m;
+	s3_export_manifest_ref(o->m);
+	o->imp = ctx->imp;
+	ctx->imp = NULL;      /* owned by the overlay from here on */
+	o->window = ctx->prefetch_window;
+	o->io_unit = spdk_bs_get_io_unit_size(store->blobstore);
+	o->start_ms = decouple_now_ms();
+	snprintf(o->lvol_name, sizeof(o->lvol_name), "%s", lvol->name);
+	snprintf(o->uuid_str, sizeof(o->uuid_str), "%s", ctx->uuid_str);
+	o->st = import_status_begin(ctx->lvs, lvol->name, ctx->uuid_str, true, o->window);
+
+	if (o->io_unit == 0 || o->m->chunk_size % o->io_unit != 0) {
+		rc = -EINVAL;
+		goto err;
+	}
+	o->buf = spdk_dma_zmalloc(o->m->chunk_size, S3LVOL_BLOCK_SIZE, NULL);
+	if (!o->buf) {
+		rc = -ENOMEM;
+		goto err;
+	}
+	import_build_target(o->imp, &target);
+	rc = s3_client_get_or_create(&target, &client);
+	if (rc != 0) {
+		goto err;
+	}
+	rc = s3_export_bs_dev_create(client, o->m, &o->src);
+	if (rc != 0) {
+		s3_client_put(client);
+		goto err;
+	}
+	o->src_ch = o->src->create_channel(o->src);
+	o->blob_ch = spdk_bs_alloc_io_channel(store->blobstore);
+	if (!o->src_ch || !o->blob_ch) {
+		rc = -ENOMEM;
+		goto err;
+	}
+
+	cur_size = spdk_blob_get_num_clusters(lvol->blob) * spdk_bs_get_cluster_size(store->blobstore);
+	if (cur_size < o->m->size_bytes) {
+		/* The sandbox grew its disk after cloning the template. */
+		rc = s3lvol_lvol_resize(lvol, o->m->size_bytes, delta_overlay_resized, o);
+		if (rc != 0) {
+			goto err;
+		}
+		return 0;
+	}
+	delta_overlay_start(o);
+	return 0;
+err:
+	if (o->st) {
+		o->st->state = S3LVOL_IMPORT_FAILED;
+		o->st->error = rc;
+	}
+	delta_overlay_free(o);
+	return rc;
+}
+
+/* Resolve the local base, take the lease, and clone. */
+static int
+delta_import_start(struct import_ctx *ctx)
+{
+	struct spdk_lvol_store *store = s3lvol_lvstore_get_lvs(ctx->lvs);
+	struct spdk_lvol *base;
+	char found[SPDK_UUID_STRING_LEN] = {0};
+	uint64_t base_size;
+	int rc;
+
+	if (ctx->base_lvol[0] != '\0') {
+		base = s3lvol_lvol_find(ctx->lvs, ctx->base_lvol);
+		if (base && s3lvol_template_base_of(ctx->lvs, base->blob, found,
+						    sizeof(found)) != 0) {
+			found[0] = '\0';
+		}
+		rc = s3_export_delta_base_check(ctx->m, base ? found : NULL);
+		if (rc == -ENOENT && base) {
+			/* The named lvol exists but is no verified base at all. */
+			rc = -EXDEV;
+		}
+	} else {
+		base = s3lvol_template_base_find(ctx->lvs, ctx->m->base_uuid);
+		rc = s3_export_delta_base_check(ctx->m, base ? ctx->m->base_uuid : NULL);
+	}
+	if (rc != 0) {
+		SPDK_ERRLOG("delta import '%s': %s template base %s (local: '%s'); "
+			    "refusing rather than mixing bases\n", ctx->lvol_name,
+			    rc == -ENOENT ? "this node has no" : "wrong",
+			    ctx->m->base_uuid, found[0] ? found : "none");
+		return rc;
+	}
+	base_size = spdk_blob_get_num_clusters(base->blob) *
+		    spdk_bs_get_cluster_size(store->blobstore);
+	if (base_size > ctx->m->size_bytes) {
+		/* A sandbox is never smaller than the template it was cloned from. */
+		SPDK_ERRLOG("delta import '%s': base %s is %" PRIu64 " bytes, larger than "
+			    "the %" PRIu64 "-byte export\n", ctx->lvol_name,
+			    ctx->m->base_uuid, base_size, ctx->m->size_bytes);
+		return -EINVAL;
+	}
+
+	/* The lease, not the registry: a transient entry is never persisted. */
+	ctx->imp = import_add(ctx->lvs, ctx->m, ctx->path_style, ctx->verify_tls);
+	if (!ctx->imp) {
+		return -ENOMEM;
+	}
+	ctx->imp->transient = true;
+
+	rc = s3lvol_lvol_create_clone(ctx->lvs, base, ctx->lvol_name,
+				      import_local_clone_done, ctx);
+	if (rc != 0) {
+		import_remove(ctx->imp);
+		ctx->imp = NULL;
+	}
+	return rc;
 }
 
 /* ==========================================================================

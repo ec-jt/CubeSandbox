@@ -76,6 +76,46 @@ int s3lvol_source_drain(struct s3lvol_lvstore *lvs,
 struct spdk_json_write_ctx;
 int s3lvol_import_origin_write_json(struct spdk_lvol *lvol,
 				  struct spdk_json_write_ctx *w);
+/* 0 when the lvol's verified import origin names \p export_uuid; -ENODATA when
+ * it has none; -EXDEV for another export. */
+int s3lvol_import_origin_export_uuid_is(struct spdk_lvol *lvol, const char *export_uuid);
+
+/* ==========================================================================
+ * Template bases (vbdev_s3lvol_tbase.c)
+ * ========================================================================== */
+
+#define S3LVOL_TBASE_ROLE_BUILDER  1   /* this lvstore published the base */
+#define S3LVOL_TBASE_ROLE_IMPORTED 2   /* imported, decoupled and snapshotted here */
+
+struct s3lvol_template_base_info {
+	struct spdk_lvol *anchor;    /* carries the mark */
+	struct spdk_lvol *base;      /* the base snapshot, NULL when !valid */
+	const char       *base_uuid;
+	uint32_t          role;
+	bool              valid;
+	int               error;     /* why !valid */
+};
+
+typedef void (*s3lvol_template_base_cb)(void *cb_arg,
+					const struct s3lvol_template_base_info *info);
+
+/** The verified template base snapshot with \p base_uuid, or NULL. */
+struct spdk_lvol *s3lvol_template_base_find(struct s3lvol_lvstore *lvs,
+					    const char *base_uuid);
+
+/** If \p snapshot is a verified template base, write its uuid. -ENOENT if not. */
+int s3lvol_template_base_of(struct s3lvol_lvstore *lvs, struct spdk_blob *snapshot,
+			    char *out_uuid, size_t out_len);
+
+/** Every marked anchor, valid or not. */
+int s3lvol_template_base_foreach(struct s3lvol_lvstore *lvs, s3lvol_template_base_cb cb,
+				 void *cb_arg);
+
+const char *s3lvol_template_base_role_name(uint32_t role);
+
+/* True when S3LVOL_EXPORT_TEMPLATE_DELTA asks exports to stop at template bases. */
+bool s3lvol_export_template_delta_enabled(void);
+
 int s3lvol_import_origin_matches(struct spdk_lvol *lvol, const char *export_uuid,
 			       const char *endpoint, const char *bucket);
 
@@ -751,6 +791,22 @@ int s3lvol_lvol_create_clone(struct s3lvol_lvstore *lvs, struct spdk_lvol *lvol,
 			     s3lvol_lvol_op_cb cb_fn, void *cb_arg);
 
 /**
+ * Mark read-only \p snapshot_name as template base \p base_uuid, anchored by
+ * \p anchor_name (an existing empty clone of it, or created here).
+ *
+ * Identity must be provable: either this lvstore exported that very snapshot
+ * under \p base_uuid (builder), or \p anchor_name is the decoupled import of
+ * that export and the snapshot was taken of it (importer).
+ *
+ * \return 0 and cb_fn later; -EALREADY when already marked; -EEXIST when the
+ * uuid already names another snapshot; -EAGAIN when the import is not local
+ * yet; other negative errno. (vbdev_s3lvol_tbase.c)
+ */
+int s3lvol_template_base_mark(struct s3lvol_lvstore *lvs, const char *snapshot_name,
+			      const char *anchor_name, const char *base_uuid,
+			      s3lvol_lvol_op_cb cb_fn, void *cb_arg);
+
+/**
  * Delete an lvol (unregistering its bdev too).
  *
  * Returns -EBUSY when the bdev is still claimed (e.g. attached to an nvmf
@@ -1153,6 +1209,14 @@ struct s3lvol_import_opts {
 	 * always sets it is asking for independence from the export, and a local
 	 * clone already has that. */
 	bool        decouple;
+
+	/* Template delta imports (manifest version 5). Optional: the name of the
+	 * local template base snapshot to clone. When NULL the base is resolved by
+	 * the manifest's base uuid. Either way the snapshot must be a verified
+	 * template base carrying that uuid, or the import fails closed (-ENOENT
+	 * when no such base is here, -EXDEV when the named one is another base).
+	 * Ignored for manifests that are not deltas. */
+	const char *base_lvol;
 
 	/* B19: with decouple, fetch every present chunk of the export whole and in
 	 * parallel ahead of the materialise loop, and materialise through the

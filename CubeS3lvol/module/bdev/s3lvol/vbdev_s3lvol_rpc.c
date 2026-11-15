@@ -2417,6 +2417,9 @@ struct rpc_import_lvol {
 	 * locally; wait on rcow_import_status. On by default with decouple. */
 	bool     prefetch;
 	uint32_t prefetch_parallel;   /* 0: S3LVOL_IMPORT_PREFETCH_PARALLEL or 32 */
+
+	/* Template delta imports only: the local base snapshot to clone. */
+	char    *base_lvol;
 };
 
 static void
@@ -2426,6 +2429,7 @@ free_rpc_import_lvol(struct rpc_import_lvol *req)
 	free(req->lvol_name);
 	free(req->export_uuid);
 	free(req->src_namespace);
+	free(req->base_lvol);
 }
 
 static const struct spdk_json_object_decoder rpc_import_lvol_decoders[] = {
@@ -2436,6 +2440,7 @@ static const struct spdk_json_object_decoder rpc_import_lvol_decoders[] = {
 	{"decouple",      offsetof(struct rpc_import_lvol, decouple),      spdk_json_decode_bool,   true},
 	{"prefetch",      offsetof(struct rpc_import_lvol, prefetch),      spdk_json_decode_bool,   true},
 	{"prefetch_parallel", offsetof(struct rpc_import_lvol, prefetch_parallel), spdk_json_decode_uint32, true},
+	{"base_lvol", offsetof(struct rpc_import_lvol, base_lvol), spdk_json_decode_string, true},
 };
 
 /* The lvstore a call means when it did not say. Sends the error response itself
@@ -2562,6 +2567,7 @@ rpc_rcow_import_lvol(struct spdk_jsonrpc_request *request,
 	opts.export_uuid   = req.export_uuid;
 	opts.src_namespace = req.src_namespace;
 	opts.decouple      = req.decouple;
+	opts.base_lvol     = req.base_lvol;
 	opts.prefetch      = req.decouple && req.prefetch;
 	opts.prefetch_window = req.prefetch_parallel ? req.prefetch_parallel :
 			       s3lvol_import_prefetch_window_default();
@@ -2630,6 +2636,154 @@ out:
 	free_rpc_import_lvol(&req);
 }
 SPDK_RPC_REGISTER("rcow_get_import_origin", rpc_rcow_get_import_origin, SPDK_RPC_RUNTIME)
+
+/* ==========================================================================
+ * Template bases
+ * ========================================================================== */
+
+struct rpc_tbase_mark {
+	char *lvs_name;
+	char *snapshot_name;
+	char *anchor_name;
+	char *base_uuid;
+};
+
+struct rpc_tbase_mark_ctx {
+	struct spdk_jsonrpc_request *request;
+	char base_uuid[SPDK_UUID_STRING_LEN];
+};
+
+static void
+rpc_tbase_mark_cb(void *cb_arg, struct spdk_lvol *anchor, int status)
+{
+	struct rpc_tbase_mark_ctx *ctx = cb_arg;
+	struct spdk_json_write_ctx *w;
+
+	if (status != 0) {
+		rpc_lvol_respond_err(ctx->request, status, NULL);
+		free(ctx);
+		return;
+	}
+	w = spdk_jsonrpc_begin_result(ctx->request);
+	spdk_json_write_object_begin(w);
+	spdk_json_write_named_bool(w, "bool_value", true);
+	spdk_json_write_named_string(w, "string_value", ctx->base_uuid);
+	spdk_json_write_named_string(w, "anchor", anchor ? anchor->name : "");
+	spdk_json_write_object_end(w);
+	spdk_jsonrpc_end_result(ctx->request, w);
+	free(ctx);
+}
+
+/* Mark a read-only snapshot as template base <base_uuid>. Idempotent: marking
+ * the same snapshot again answers success. */
+static void
+rpc_rcow_mark_template_base(struct spdk_jsonrpc_request *request,
+			    const struct spdk_json_val *params)
+{
+	struct rpc_tbase_mark req = {0};
+	const struct spdk_json_object_decoder decoders[] = {
+		{"lvs_name", offsetof(struct rpc_tbase_mark, lvs_name), spdk_json_decode_string, true},
+		{"snapshot_name", offsetof(struct rpc_tbase_mark, snapshot_name), spdk_json_decode_string, false},
+		{"anchor_name", offsetof(struct rpc_tbase_mark, anchor_name), spdk_json_decode_string, false},
+		{"base_uuid", offsetof(struct rpc_tbase_mark, base_uuid), spdk_json_decode_string, false},
+	};
+	struct rpc_tbase_mark_ctx *ctx;
+	struct s3lvol_lvstore *lvs;
+	int rc;
+
+	if (!params || spdk_json_decode_object(params, decoders, SPDK_COUNTOF(decoders), &req)) {
+		rpc_lvol_respond_err(request, -EINVAL, NULL);
+		goto out;
+	}
+	lvs = rpc_lvstore_for(request, req.lvs_name);
+	if (!lvs) {
+		goto out;
+	}
+	ctx = calloc(1, sizeof(*ctx));
+	if (!ctx) {
+		rpc_lvol_respond_err(request, -ENOMEM, NULL);
+		goto out;
+	}
+	ctx->request = request;
+	snprintf(ctx->base_uuid, sizeof(ctx->base_uuid), "%s", req.base_uuid);
+	rc = s3lvol_template_base_mark(lvs, req.snapshot_name, req.anchor_name,
+				       req.base_uuid, rpc_tbase_mark_cb, ctx);
+	if (rc == -EALREADY) {
+		rpc_tbase_mark_cb(ctx, s3lvol_lvol_find(lvs, req.anchor_name), 0);
+	} else if (rc != 0) {
+		rpc_lvol_respond_err(request, rc, NULL);
+		free(ctx);
+	}
+out:
+	free(req.lvs_name);
+	free(req.snapshot_name);
+	free(req.anchor_name);
+	free(req.base_uuid);
+}
+SPDK_RPC_REGISTER("rcow_mark_template_base", rpc_rcow_mark_template_base, SPDK_RPC_RUNTIME)
+
+static void
+rpc_tbase_list_one(void *cb_arg, const struct s3lvol_template_base_info *info)
+{
+	struct spdk_json_write_ctx *w = cb_arg;
+
+	spdk_json_write_object_begin(w);
+	spdk_json_write_named_string(w, "base_uuid", info->base_uuid);
+	spdk_json_write_named_string(w, "anchor", info->anchor->name);
+	spdk_json_write_named_string(w, "snapshot", info->base ? info->base->name : "");
+	spdk_json_write_named_string(w, "role", s3lvol_template_base_role_name(info->role));
+	spdk_json_write_named_bool(w, "valid", info->valid);
+	spdk_json_write_named_int32(w, "error", info->error);
+	spdk_json_write_object_end(w);
+}
+
+/* Every template base on the lvstore, optionally filtered by base_uuid. */
+static void
+rpc_rcow_get_template_bases(struct spdk_jsonrpc_request *request,
+			    const struct spdk_json_val *params)
+{
+	struct rpc_tbase_mark req = {0};
+	const struct spdk_json_object_decoder decoders[] = {
+		{"lvs_name", offsetof(struct rpc_tbase_mark, lvs_name), spdk_json_decode_string, true},
+		{"base_uuid", offsetof(struct rpc_tbase_mark, base_uuid), spdk_json_decode_string, true},
+	};
+	struct s3lvol_lvstore *lvs;
+	struct rpc_json_buf buf;
+	struct spdk_json_write_ctx *w;
+
+	if (params && spdk_json_decode_object(params, decoders, SPDK_COUNTOF(decoders), &req)) {
+		rpc_lvol_respond_err(request, -EINVAL, NULL);
+		goto out;
+	}
+	lvs = rpc_lvstore_for(request, req.lvs_name);
+	if (!lvs) {
+		goto out;
+	}
+	w = rpc_json_buf_begin(&buf);
+	if (!w) {
+		rpc_lvol_respond_err(request, -ENOMEM, NULL);
+		goto out;
+	}
+	spdk_json_write_object_begin(w);
+	if (req.base_uuid) {
+		struct spdk_lvol *base = s3lvol_template_base_find(lvs, req.base_uuid);
+
+		spdk_json_write_named_string(w, "base_uuid", req.base_uuid);
+		spdk_json_write_named_string(w, "snapshot", base ? base->name : "");
+		spdk_json_write_named_bool(w, "present", base != NULL);
+	}
+	spdk_json_write_named_array_begin(w, "bases");
+	s3lvol_template_base_foreach(lvs, rpc_tbase_list_one, w);
+	spdk_json_write_array_end(w);
+	spdk_json_write_named_bool(w, "export_template_delta",
+				   s3lvol_export_template_delta_enabled());
+	spdk_json_write_object_end(w);
+	rpc_json_buf_respond(request, w, &buf);
+out:
+	free(req.lvs_name);
+	free(req.base_uuid);
+}
+SPDK_RPC_REGISTER("rcow_get_template_bases", rpc_rcow_get_template_bases, SPDK_RPC_RUNTIME)
 
 #include "checkpoint_commit_rpc.h"
 

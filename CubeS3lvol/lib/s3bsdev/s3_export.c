@@ -289,7 +289,78 @@ s3_export_manifest_unref(struct s3_export_manifest *m)
 	free(m->refs);
 	free(m->srcs);
 	free(m->src_idx);
+	free(m->zeroes);
 	free(m);
+}
+
+int
+s3_export_manifest_set_base(struct s3_export_manifest *m, const char *base_uuid)
+{
+	struct spdk_uuid parsed;
+	uint64_t i;
+
+	if (!m || !base_uuid || m->layout != S3_EXPORT_LAYOUT_REF) {
+		return -EINVAL;
+	}
+	if (spdk_uuid_parse(&parsed, base_uuid) != 0) {
+		return -EINVAL;
+	}
+	if (!m->zeroes) {
+		m->zeroes = calloc(1, bitmap_bytes(m->num_chunks));
+		if (!m->zeroes) {
+			return -ENOMEM;
+		}
+	}
+	/* A chunk the walk settled as zeroes has to be said out loud in a delta:
+	 * absent from `present` means "read the base" here, not "zeroes". */
+	for (i = 0; i < m->num_chunks; i++) {
+		if (s3_export_manifest_is_resolved(m, i) &&
+		    !s3_export_manifest_is_present(m, i)) {
+			bitmap_set(m->zeroes, i);
+		}
+	}
+	copy_field(m->base_uuid, sizeof(m->base_uuid), base_uuid);
+	m->version = S3_EXPORT_DELTA_VERSION;
+	return 0;
+}
+
+bool
+s3_export_manifest_is_delta(const struct s3_export_manifest *m)
+{
+	return m && m->version == S3_EXPORT_DELTA_VERSION && m->base_uuid[0] != '\0';
+}
+
+bool
+s3_export_manifest_is_zero(const struct s3_export_manifest *m, uint64_t chunk_index)
+{
+	if (!m || !m->zeroes || chunk_index >= m->num_chunks) {
+		return false;
+	}
+	return bitmap_test(m->zeroes, chunk_index);
+}
+
+int
+s3_export_delta_base_check(const struct s3_export_manifest *m, const char *local_base_uuid)
+{
+	if (!s3_export_manifest_is_delta(m)) {
+		return -EINVAL;
+	}
+	if (!local_base_uuid || local_base_uuid[0] == '\0') {
+		return -ENOENT;
+	}
+	return strcasecmp(local_base_uuid, m->base_uuid) == 0 ? 0 : -EXDEV;
+}
+
+enum s3_export_chunk_source
+s3_export_manifest_chunk_source(const struct s3_export_manifest *m, uint64_t chunk_index)
+{
+	if (s3_export_manifest_is_present(m, chunk_index)) {
+		return S3_EXPORT_CHUNK_OWN;
+	}
+	if (!s3_export_manifest_is_delta(m) || s3_export_manifest_is_zero(m, chunk_index)) {
+		return S3_EXPORT_CHUNK_ZERO;
+	}
+	return S3_EXPORT_CHUNK_BASE;
 }
 
 void
@@ -774,30 +845,50 @@ s3_export_manifest_seal(struct s3_export_manifest *m)
 	 * contributes nothing here: the two ways of saying "everything comes from
 	 * srcs[0]" have to seal identically, or a manifest would fail its own crc
 	 * after a round trip that changed nothing. */
-	if (m->version < 3 || !m->src_idx) {
-		return;
-	}
-	/* Batched into a small buffer rather than fed a byte at a time.
-	 * spdk_crc32c_update() reads its input eight bytes at a time and masks the
-	 * tail, so handing it a one-byte object reads past that object -- which is a
-	 * segfault when the byte happens to sit near the end of a mapping, and
-	 * silently reads adjacent memory when it does not. The other stages avoid it
-	 * by passing whole arrays; this one has to skip holes, so it copies. */
-	uint8_t batch[64];
-	size_t n = 0;
+	if (m->version >= 3 && m->src_idx) {
+		/* Batched into a small buffer rather than fed a byte at a time.
+		 * spdk_crc32c_update() reads its input eight bytes at a time and masks
+		 * the tail, so handing it a one-byte object reads past that object --
+		 * which is a segfault when the byte happens to sit near the end of a
+		 * mapping, and silently reads adjacent memory when it does not. The
+		 * other stages avoid it by passing whole arrays; this one has to skip
+		 * holes, so it copies. */
+		uint8_t batch[64];
+		size_t n = 0;
 
-	for (i = 0; i < m->num_chunks; i++) {
-		if (!bitmap_test(m->present, i)) {
-			continue;
+		for (i = 0; i < m->num_chunks; i++) {
+			if (!bitmap_test(m->present, i)) {
+				continue;
+			}
+			batch[n++] = m->src_idx[i];
+			if (n == sizeof(batch)) {
+				m->crc32c = spdk_crc32c_update(batch, n, m->crc32c);
+				n = 0;
+			}
 		}
-		batch[n++] = m->src_idx[i];
-		if (n == sizeof(batch)) {
+		if (n != 0) {
 			m->crc32c = spdk_crc32c_update(batch, n, m->crc32c);
-			n = 0;
 		}
 	}
-	if (n != 0) {
-		m->crc32c = spdk_crc32c_update(batch, n, m->crc32c);
+
+	/* Version 5: the zero bitmap and the base identity. Both change what an
+	 * absent chunk means, so a flipped bit or a different base must fail the
+	 * crc rather than silently serve base bytes where zeroes were meant. */
+	if (m->version == S3_EXPORT_DELTA_VERSION) {
+		char base[SPDK_UUID_STRING_LEN] = {0};
+
+		if (m->zeroes) {
+			/* Bits outside the absent set describe nothing; clear them so
+			 * two equal manifests cannot disagree on their crc. */
+			for (i = 0; i < m->num_chunks; i++) {
+				if (bitmap_test(m->present, i)) {
+					bitmap_clear(m->zeroes, i);
+				}
+			}
+			m->crc32c = spdk_crc32c_update(m->zeroes, nbytes, m->crc32c);
+		}
+		memcpy(base, m->base_uuid, sizeof(base));
+		m->crc32c = spdk_crc32c_update(base, sizeof(base), m->crc32c);
 	}
 }
 
@@ -987,6 +1078,7 @@ s3_export_manifest_serialize(struct s3_export_manifest *m, char **out, size_t *o
 	char *refs_b64 = NULL;
 	char *partials_b64 = NULL;
 	char *src_idx_b64 = NULL;
+	char *zeroes_b64 = NULL;
 	uint8_t *packed = NULL;
 	size_t packed_len = 0;
 	size_t nbytes;
@@ -1049,8 +1141,26 @@ s3_export_manifest_serialize(struct s3_export_manifest *m, char **out, size_t *o
 				   m->src.prefix);
 		}
 
+		if (m->base_uuid[0] != '\0') {
+			/* A delta stays a delta whatever its source table holds: the
+			 * version is what makes an older reader refuse it. */
+			m->version = S3_EXPORT_DELTA_VERSION;
+			if (!m->zeroes) {
+				/* set_base() always allocates it. */
+				rc = -EINVAL;
+				goto err;
+			}
+			zeroes_b64 = encode_b64(m->zeroes, nbytes);
+			if (!zeroes_b64) {
+				rc = -ENOMEM;
+				goto err;
+			}
+		}
+
 		if (m->num_srcs > 1) {
-			m->version = 3;
+			if (m->version != S3_EXPORT_DELTA_VERSION) {
+				m->version = 3;
+			}
 
 			rc = pack_all_src_idx(m, &packed, &packed_len);
 			if (rc != 0) {
@@ -1139,10 +1249,15 @@ s3_export_manifest_serialize(struct s3_export_manifest *m, char **out, size_t *o
 			spdk_json_write_array_end(w);
 			spdk_json_write_named_string(w, "src_idx", src_idx_b64);
 		}
+		if (zeroes_b64) {
+			spdk_json_write_named_string(w, "base", m->base_uuid);
+			spdk_json_write_named_string(w, "zeroes", zeroes_b64);
+		}
 	}
 	spdk_json_write_object_end(w);
 
 	rc = spdk_json_write_end(w);
+	free(zeroes_b64);
 	free(src_idx_b64);
 	free(partials_b64);
 	free(refs_b64);
@@ -1158,6 +1273,7 @@ s3_export_manifest_serialize(struct s3_export_manifest *m, char **out, size_t *o
 	*out_len = buf.len;
 	return 0;
 err:
+	free(zeroes_b64);
 	free(src_idx_b64);
 	free(partials_b64);
 	free(refs_b64);
@@ -1248,6 +1364,8 @@ struct manifest_json {
 	uint64_t expires_at;
 	struct srcs_json  srcs;
 	char             *src_idx;
+	char             *base;
+	char             *zeroes;
 };
 
 static int
@@ -1291,6 +1409,10 @@ static const struct spdk_json_object_decoder manifest_decoders[] = {
 	{"srcs",    offsetof(struct manifest_json, srcs),    decode_srcs_array,       true},
 	{"src_idx", offsetof(struct manifest_json, src_idx), spdk_json_decode_string, true},
 	{"expires_at", offsetof(struct manifest_json, expires_at), spdk_json_decode_uint64, true},
+	/* Version 5. Optional so earlier versions decode; required together, and
+	 * only, on a version 5 manifest. */
+	{"base",   offsetof(struct manifest_json, base),   spdk_json_decode_string, true},
+	{"zeroes", offsetof(struct manifest_json, zeroes), spdk_json_decode_string, true},
 };
 
 static void
@@ -1303,6 +1425,8 @@ free_manifest_json(struct manifest_json *j)
 	free(j->full);
 	free(j->partials);
 	free(j->src_idx);
+	free(j->base);
+	free(j->zeroes);
 	free(j->src.endpoint);
 	free(j->src.region);
 	free(j->src.bucket);
@@ -1636,9 +1760,9 @@ s3_export_manifest_parse(const void *json, size_t len, struct s3_export_manifest
 	 * future zero-copy layout would name the source's own chunk objects, and
 	 * reading it as if it were dense would produce an lvol full of the wrong
 	 * data rather than an error. */
-	if (j.version < S3_EXPORT_VERSION_MIN || j.version > S3_EXPORT_ADMISSION_VERSION) {
+	if (j.version < S3_EXPORT_VERSION_MIN || j.version > S3_EXPORT_DELTA_VERSION) {
 		SPDK_ERRLOG("export manifest version %u is not supported (want %u..%u)\n",
-			    j.version, S3_EXPORT_VERSION_MIN, S3_EXPORT_ADMISSION_VERSION);
+			    j.version, S3_EXPORT_VERSION_MIN, S3_EXPORT_DELTA_VERSION);
 		rc = -ENOTSUP;
 		goto out;
 	}
@@ -1650,6 +1774,26 @@ s3_export_manifest_parse(const void *json, size_t len, struct s3_export_manifest
 	if (j.version == S3_EXPORT_ADMISSION_VERSION && layout != S3_EXPORT_LAYOUT_DENSE) {
 		rc = -ENOTSUP;
 		goto out;
+	}
+	/* A delta must say what it is a delta over, and nothing else may: a base
+	 * on a non-delta manifest means a writer that disagrees with the version
+	 * about how absent chunks read. */
+	if ((j.version == S3_EXPORT_DELTA_VERSION) !=
+	    (j.base != NULL && j.zeroes != NULL) ||
+	    (j.version != S3_EXPORT_DELTA_VERSION && (j.base || j.zeroes))) {
+		SPDK_ERRLOG("export manifest version %u %s a template base\n", j.version,
+			    j.base ? "carries" : "lacks");
+		rc = -EINVAL;
+		goto out;
+	}
+	if (j.version == S3_EXPORT_DELTA_VERSION) {
+		struct spdk_uuid parsed;
+
+		if (layout != S3_EXPORT_LAYOUT_REF || spdk_uuid_parse(&parsed, j.base) != 0) {
+			SPDK_ERRLOG("delta export manifest needs ref layout and a uuid base\n");
+			rc = -EINVAL;
+			goto out;
+		}
 	}
 	if ((layout == S3_EXPORT_LAYOUT_REF) != (j.refs != NULL)) {
 		/* A ref manifest without refs would read as all holes -- every chunk
@@ -1743,6 +1887,32 @@ s3_export_manifest_parse(const void *json, size_t len, struct s3_export_manifest
 		rc = parse_srcs(m, &j);
 		if (rc != 0) {
 			goto out;
+		}
+
+		if (j.version == S3_EXPORT_DELTA_VERSION) {
+			uint64_t i;
+
+			rc = decode_b64_exact(j.zeroes, &m->zeroes, nbytes, "zero bitmap");
+			if (rc != 0) {
+				goto out;
+			}
+			if (!m->zeroes) {
+				/* nbytes is never 0 for a valid manifest, but stay total. */
+				m->zeroes = calloc(1, nbytes ? nbytes : 1);
+				if (!m->zeroes) {
+					rc = -ENOMEM;
+					goto out;
+				}
+			}
+			for (i = 0; i < m->num_chunks; i++) {
+				if (bitmap_test(m->zeroes, i) && bitmap_test(m->present, i)) {
+					SPDK_ERRLOG("delta export manifest lists chunk %" PRIu64
+						    " as both present and zero\n", i);
+					rc = -EINVAL;
+					goto out;
+				}
+			}
+			copy_field(m->base_uuid, sizeof(m->base_uuid), j.base);
 		}
 	}
 

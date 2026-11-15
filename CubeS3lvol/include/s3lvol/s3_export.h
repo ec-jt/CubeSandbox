@@ -67,6 +67,19 @@
  * Never upgrade an already-published v2/v3 manifest in place. */
 #define S3_EXPORT_ADMISSION_VERSION 4
 
+/* Version 5: a template-delta manifest (ref layout only). It names a template
+ * base (`base`) and describes only the chunks the exported layers own on top of
+ * it; every chunk it does not mention reads from the base, not as zeroes. A
+ * chunk the layers zeroed is listed in the `zeroes` bitmap so it does not fall
+ * through to base data.
+ *
+ * A reader older than this refuses it on the version alone, which is the point:
+ * read as a version 3 manifest, every inherited chunk would come back as zeroes,
+ * silently. A delta manifest is also never usable as an esnap parent for the
+ * same reason; the only consumer is the delta import, which clones a local copy
+ * of the base and overlays this manifest on it. */
+#define S3_EXPORT_DELTA_VERSION 5
+
 /* The oldest a reader accepts. Writing is always at S3_EXPORT_VERSION; reading
  * has to span the range, because manifests already in a bucket outlive the binary
  * that wrote them -- including ones this binary wrote before being upgraded.
@@ -301,6 +314,15 @@ struct s3_export_manifest {
 	 * how a v2 manifest arrives. */
 	uint8_t *src_idx;
 
+	/* Version 5 only. The export uuid of the template base this manifest is a
+	 * delta over; empty for every other manifest. */
+	char     base_uuid[SPDK_UUID_STRING_LEN];
+
+	/* Version 5 only, NULL otherwise: one bit per chunk, set for a chunk the
+	 * exported layers settled as zeroes. Disjoint from `present`. Without it a
+	 * zeroed chunk would read the base's bytes on the importing node. */
+	uint8_t *zeroes;
+
 	/* Over the bitmap, and for a ref manifest over the full bitmap, the packed
 	 * uuids and the partial-length exceptions too, in that order -- and, from
 	 * version 3, src_idx after those. The stage list follows `version` rather
@@ -476,6 +498,49 @@ bool s3_export_manifest_is_present(const struct s3_export_manifest *m,
 
 bool s3_export_manifest_is_resolved(const struct s3_export_manifest *m,
 				    uint64_t chunk_index);
+
+/**
+ * Turn \p m into a template-delta manifest over \p base_uuid (version 5).
+ *
+ * Every chunk the construction marked resolved (settled as zeroes) is recorded
+ * in the `zeroes` bitmap. Call after the walk and before publishing.
+ *
+ * \return 0, -EINVAL for a non-ref manifest or an unparsable uuid, -ENOMEM.
+ */
+int s3_export_manifest_set_base(struct s3_export_manifest *m, const char *base_uuid);
+
+/** True when \p m is a template-delta manifest (version 5, base set). */
+bool s3_export_manifest_is_delta(const struct s3_export_manifest *m);
+
+/** True when the delta manifest \p m records chunk \p chunk_index as zeroes. */
+bool s3_export_manifest_is_zero(const struct s3_export_manifest *m,
+				uint64_t chunk_index);
+
+/* Where one chunk of a volume described by a manifest comes from. */
+enum s3_export_chunk_source {
+	S3_EXPORT_CHUNK_ZERO = 0,  /* reads as zeroes */
+	S3_EXPORT_CHUNK_OWN  = 1,  /* the manifest names an object for it */
+	S3_EXPORT_CHUNK_BASE = 2,  /* delta only: the template base supplies it */
+};
+
+/**
+ * The one rule both the delta import and its tests apply: present is the
+ * manifest's own object; for a delta, a recorded zero is zeroes and anything
+ * else is the base; for any other manifest, absent is zeroes.
+ */
+enum s3_export_chunk_source s3_export_manifest_chunk_source(
+	const struct s3_export_manifest *m, uint64_t chunk_index);
+
+/**
+ * May a delta manifest be applied over the local base whose verified uuid is
+ * \p local_base_uuid (NULL or "" when no base was found)?
+ *
+ * \return 0; -ENOENT when there is no local base; -EXDEV when the local base is
+ * another one; -EINVAL when \p m is not a delta. Never "close enough": two
+ * bases of one template differ in content, and mixing them corrupts silently.
+ */
+int s3_export_delta_base_check(const struct s3_export_manifest *m,
+			       const char *local_base_uuid);
 
 /**
  * True when no chunk in the range has an object, i.e. the whole range reads as
@@ -718,6 +783,13 @@ struct s3_export_ref_opts {
 	 * ref export of the same chunk size. Where any of that does not hold there
 	 * is nothing to express and the caller uses the copying engine. */
 	const struct s3_export_manifest *parent;
+
+	/* Template delta (S3LVOL_EXPORT_TEMPLATE_DELTA). Non-empty means the chain
+	 * stopped above a template base and the manifest describes only the layers
+	 * above it: it is published as version 5 with this base uuid, and chunks
+	 * the walk settled as zeroes are recorded explicitly. Mutually exclusive
+	 * with `parent`. */
+	const char *base_uuid;
 };
 
 /**

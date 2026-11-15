@@ -245,6 +245,14 @@ s3_export_run_ref(const struct s3_export_ref_opts *opts, s3_export_cb cb, void *
 		}
 	}
 
+	if (opts->base_uuid && opts->base_uuid[0] != '\0' && opts->parent) {
+		/* A delta names one base and nothing else; inheriting another
+		 * export's chunks on top would need two kinds of "absent". */
+		SPDK_ERRLOG("Export %s: a template delta cannot also inherit from an "
+			    "export\n", opts->uuid_str);
+		return -EINVAL;
+	}
+
 	/* An esnap chain with no parent manifest would produce a manifest that is
 	 * short exactly where the export it reads through holds data, and short in a
 	 * manifest means "reads as zeroes". Refused here as well as at the caller,
@@ -373,6 +381,21 @@ s3_export_run_ref(const struct s3_export_ref_opts *opts, s3_export_cb cb, void *
 		SPDK_DEBUGLOG(s3lvol_export, "Export %s: inherited %" PRIu64
 			      " chunk(s) from export %s\n", opts->uuid_str, inherited,
 			      opts->parent->uuid_str);
+	}
+
+	/* A template delta: everything the walk did not name reads from the base
+	 * on the importing node, so the chunks it settled as zeroes have to be
+	 * written down rather than left absent. */
+	if (opts->base_uuid && opts->base_uuid[0] != '\0') {
+		rc = s3_export_manifest_set_base(m, opts->base_uuid);
+		if (rc != 0) {
+			SPDK_ERRLOG("Export %s: cannot record template base %s: %s\n",
+				    opts->uuid_str, opts->base_uuid, spdk_strerror(-rc));
+			goto err;
+		}
+		SPDK_NOTICELOG("Export %s is a template delta over base %s: %" PRIu64
+			       " own chunk(s), %" PRIu64 " explicit zero chunk(s)\n",
+			       opts->uuid_str, opts->base_uuid, w.named, w.holes);
 	}
 
 	SPDK_NOTICELOG("Export %s references %" PRIu64 " object(s) holding %" PRIu64

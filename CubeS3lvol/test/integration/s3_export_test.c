@@ -1651,6 +1651,304 @@ out:
 	s3_export_manifest_unref(p);
 }
 
+/* ==========================================================================
+ * [16] Template delta (manifest version 5)
+ *
+ * A model of the three volumes involved, one byte of content per chunk:
+ *
+ *   base     the template, identical on every node
+ *   sandbox  base + what the sandbox wrote + what it zeroed
+ *
+ * The full export of the sandbox names every non-zero chunk. The delta export
+ * names only the chunks the sandbox owns and records the ones it zeroed. Both
+ * are serialised and parsed back, then reconstructed: the full one onto an
+ * empty volume, the delta one onto a copy of the base, chunk by chunk with
+ * s3_export_manifest_chunk_source() -- the same rule the delta import uses.
+ * The two reconstructions, and the sandbox itself, must hash the same.
+ * ========================================================================== */
+
+#define DELTA_CHUNKS 64
+
+static const char *BASE_UUID = "6d1f2a90-1b2c-4d3e-8f40-5a6b7c8d9e01";
+
+static uint32_t
+delta_hash(const uint8_t *v, size_t n)
+{
+	uint32_t h = 2166136261u;
+	size_t i;
+
+	for (i = 0; i < n; i++) {
+		h = (h ^ v[i]) * 16777619u;
+	}
+	return h;
+}
+
+/* Mark chunk i present with an object whose uuid encodes the content byte, so
+ * the reconstruction can recover "the object's bytes" from the ref alone. */
+static void
+delta_set_own(struct s3_export_manifest *m, uint64_t i, uint8_t content)
+{
+	struct spdk_uuid u;
+
+	memset(&u, 0, sizeof(u));
+	u.u.raw[0] = content;
+	u.u.raw[15] = (uint8_t)i;
+	s3_export_manifest_set_ref(m, i, &u, CHUNK_SIZE);
+}
+
+static struct s3_export_manifest *
+delta_round_trip(struct s3_export_manifest *m)
+{
+	struct s3_export_manifest *back = NULL;
+	char *json = NULL;
+	size_t len = 0;
+
+	s3_export_manifest_seal(m);
+	if (s3_export_manifest_serialize(m, &json, &len) != 0) {
+		return NULL;
+	}
+	if (s3_export_manifest_parse(json, len, &back) != 0) {
+		back = NULL;
+	}
+	free(json);
+	return back;
+}
+
+static void
+delta_fill_src(struct s3_export_manifest *m)
+{
+	snprintf(m->src.endpoint, sizeof(m->src.endpoint), "s3.example.invalid");
+	snprintf(m->src.bucket, sizeof(m->src.bucket), "b");
+	snprintf(m->src.prefix, sizeof(m->src.prefix), "srclvs");
+	m->cluster_size = CHUNK_SIZE;
+}
+
+static void
+test_template_delta(void)
+{
+	uint8_t base[DELTA_CHUNKS], sandbox[DELTA_CHUNKS];
+	uint8_t full_rebuilt[DELTA_CHUNKS], delta_rebuilt[DELTA_CHUNKS];
+	struct s3_export_manifest *full = NULL, *delta = NULL;
+	struct s3_export_manifest *full_back = NULL, *delta_back = NULL;
+	uint64_t i, own = 0, zeroed = 0, named = 0;
+	char *json = NULL;
+	size_t len = 0;
+
+	printf("\n[16] Template delta: own chunks only, explicit zeroes, same bytes\n");
+
+	/* The base: data in most chunks, a few holes. */
+	for (i = 0; i < DELTA_CHUNKS; i++) {
+		base[i] = (i % 7 == 3) ? 0 : (uint8_t)(0x40 + i);
+	}
+	/* The sandbox: rewrites some chunks, zeroes some base data, writes into a
+	 * base hole, and leaves the rest inherited. */
+	memcpy(sandbox, base, sizeof(base));
+	for (i = 0; i < DELTA_CHUNKS; i++) {
+		if (i % 5 == 0) {
+			sandbox[i] = (uint8_t)(0xa0 + i);    /* rewritten */
+		} else if (i % 11 == 1 && base[i] != 0) {
+			sandbox[i] = 0;                      /* zeroed over base data */
+		}
+	}
+	sandbox[3] = 0xee;                                   /* into a base hole */
+
+	check_int("full manifest create",
+		  s3_export_manifest_create(TEST_UUID, (uint64_t)DELTA_CHUNKS * CHUNK_SIZE,
+					    CHUNK_SIZE, S3_EXPORT_LAYOUT_REF, &full), 0);
+	check_int("delta manifest create",
+		  s3_export_manifest_create(TEST_UUID, (uint64_t)DELTA_CHUNKS * CHUNK_SIZE,
+					    CHUNK_SIZE, S3_EXPORT_LAYOUT_REF, &delta), 0);
+	if (!full || !delta) {
+		goto out;
+	}
+	delta_fill_src(full);
+	delta_fill_src(delta);
+
+	/* Full: every non-zero chunk of the sandbox (what the REF walk names
+	 * today, template layer included). */
+	for (i = 0; i < DELTA_CHUNKS; i++) {
+		if (sandbox[i] != 0) {
+			delta_set_own(full, i, sandbox[i]);
+		}
+	}
+	/* Delta: what the walk above the base finds -- the chunks the sandbox
+	 * wrote (own) and the ones it settled as zeroes (resolved). */
+	for (i = 0; i < DELTA_CHUNKS; i++) {
+		if (sandbox[i] == base[i]) {
+			continue;
+		}
+		if (sandbox[i] == 0) {
+			s3_export_manifest_set_resolved(delta, i);
+			zeroed++;
+		} else {
+			delta_set_own(delta, i, sandbox[i]);
+			own++;
+		}
+	}
+	check_int("set_base", s3_export_manifest_set_base(delta, BASE_UUID), 0);
+	check_true("delta is_delta", s3_export_manifest_is_delta(delta), NULL);
+
+	full_back = delta_round_trip(full);
+	delta_back = delta_round_trip(delta);
+	check_true("full round trip", full_back != NULL, NULL);
+	check_true("delta round trip", delta_back != NULL, NULL);
+	if (!full_back || !delta_back) {
+		goto out;
+	}
+	check_int("delta version on the wire", (int)delta_back->version,
+		  S3_EXPORT_DELTA_VERSION);
+	check_str("delta base on the wire", delta_back->base_uuid, BASE_UUID);
+	check_true("full is not a delta", !s3_export_manifest_is_delta(full_back), NULL);
+
+	/* The delta names only own chunks, and every zeroed chunk explicitly. */
+	for (i = 0; i < DELTA_CHUNKS; i++) {
+		if (s3_export_manifest_is_present(delta_back, i)) {
+			named++;
+		}
+	}
+	check_u64("delta names exactly the own chunks", named, own);
+	check_u64("delta present_chunks", delta_back->present_chunks, own);
+	{
+		uint64_t z = 0;
+
+		for (i = 0; i < DELTA_CHUNKS; i++) {
+			if (s3_export_manifest_is_zero(delta_back, i)) {
+				z++;
+			}
+		}
+		check_u64("delta records every zeroed chunk", z, zeroed);
+	}
+	check_true("delta is smaller than full",
+		   delta_back->present_chunks < full_back->present_chunks, NULL);
+
+	/* Reconstruct: full onto an empty volume, delta onto the base. */
+	for (i = 0; i < DELTA_CHUNKS; i++) {
+		const struct s3_export_ref *ref;
+
+		switch (s3_export_manifest_chunk_source(full_back, i)) {
+		case S3_EXPORT_CHUNK_OWN:
+			ref = s3_export_manifest_get_ref(full_back, i);
+			full_rebuilt[i] = ref->uuid.u.raw[0];
+			break;
+		default:
+			full_rebuilt[i] = 0;
+			break;
+		}
+		switch (s3_export_manifest_chunk_source(delta_back, i)) {
+		case S3_EXPORT_CHUNK_OWN:
+			ref = s3_export_manifest_get_ref(delta_back, i);
+			delta_rebuilt[i] = ref->uuid.u.raw[0];
+			break;
+		case S3_EXPORT_CHUNK_ZERO:
+			delta_rebuilt[i] = 0;
+			break;
+		case S3_EXPORT_CHUNK_BASE:
+			delta_rebuilt[i] = base[i];
+			break;
+		}
+	}
+	check_true("full import == sandbox",
+		   delta_hash(full_rebuilt, DELTA_CHUNKS) == delta_hash(sandbox, DELTA_CHUNKS),
+		   NULL);
+	check_true("delta import over the base == full import",
+		   delta_hash(delta_rebuilt, DELTA_CHUNKS) ==
+		   delta_hash(full_rebuilt, DELTA_CHUNKS) &&
+		   memcmp(delta_rebuilt, full_rebuilt, DELTA_CHUNKS) == 0, NULL);
+
+	/* Without the zero bitmap the zeroed chunks would read base data: the
+	 * reason the bitmap exists. */
+	{
+		bool would_leak = false;
+
+		for (i = 0; i < DELTA_CHUNKS; i++) {
+			if (s3_export_manifest_is_zero(delta_back, i) && base[i] != 0) {
+				would_leak = true;
+			}
+		}
+		check_true("a zeroed chunk has base data under it (test is meaningful)",
+			   would_leak, NULL);
+	}
+
+	/* Base checks: fail closed on missing or mismatched base. */
+	check_int("base check: matching", s3_export_delta_base_check(delta_back, BASE_UUID), 0);
+	check_int("base check: missing", s3_export_delta_base_check(delta_back, NULL), -ENOENT);
+	check_int("base check: empty", s3_export_delta_base_check(delta_back, ""), -ENOENT);
+	check_int("base check: other base",
+		  s3_export_delta_base_check(delta_back, "6d1f2a90-1b2c-4d3e-8f40-5a6b7c8d9e02"),
+		  -EXDEV);
+	check_int("base check: not a delta", s3_export_delta_base_check(full_back, BASE_UUID),
+		  -EINVAL);
+
+	/* An old reader refuses version 5 outright rather than misreading every
+	 * inherited chunk as zeroes. Simulated by the version window: a reader
+	 * built before this change accepted at most S3_EXPORT_ADMISSION_VERSION. */
+	check_true("version 5 is beyond every older reader's window",
+		   S3_EXPORT_DELTA_VERSION > S3_EXPORT_ADMISSION_VERSION, NULL);
+
+	/* Tampering: the crc covers the base and the zero bitmap. */
+	if (s3_export_manifest_serialize(delta, &json, &len) == 0) {
+		struct s3_export_manifest *bad = NULL;
+		char *p = strstr(json, BASE_UUID);
+
+		if (p) {
+			p[strlen(BASE_UUID) - 1] = '2';
+			check_true("a changed base fails the crc",
+				   s3_export_manifest_parse(json, len, &bad) != 0, NULL);
+			s3_export_manifest_unref(bad);
+		} else {
+			check_true("base present in json", false, NULL);
+		}
+		free(json);
+		json = NULL;
+	}
+	if (s3_export_manifest_serialize(delta, &json, &len) == 0) {
+		struct s3_export_manifest *bad = NULL;
+		char *p = strstr(json, "\"base\"");
+
+		/* A delta without its base: rename the member so it is ignored. */
+		if (p) {
+			memcpy(p, "\"bxse\"", 6);
+			check_true("version 5 without base is refused",
+				   s3_export_manifest_parse(json, len, &bad) != 0, NULL);
+			s3_export_manifest_unref(bad);
+		}
+		free(json);
+		json = NULL;
+	}
+	if (s3_export_manifest_serialize(full, &json, &len) == 0) {
+		struct s3_export_manifest *bad = NULL;
+		char *patched = malloc(len + 128);
+		int n;
+
+		/* A non-delta carrying a base is a writer that disagrees with its own
+		 * version; refused. */
+		if (patched && len > 1 && json[len - 1] == '}') {
+			n = snprintf(patched, len + 128, "%.*s,\"base\":\"%s\",\"zeroes\":\"\"}",
+				     (int)(len - 1), json, BASE_UUID);
+			check_true("a base on a non-delta manifest is refused",
+				   s3_export_manifest_parse(patched, (size_t)n, &bad) != 0, NULL);
+			s3_export_manifest_unref(bad);
+		}
+		free(patched);
+		free(json);
+		json = NULL;
+	}
+
+	/* Dense layouts cannot carry a base. */
+	{
+		struct s3_export_manifest *d = build_manifest(8ULL * CHUNK_SIZE);
+
+		check_int("set_base refuses dense", s3_export_manifest_set_base(d, BASE_UUID),
+			  -EINVAL);
+		s3_export_manifest_unref(d);
+	}
+out:
+	s3_export_manifest_unref(full_back);
+	s3_export_manifest_unref(delta_back);
+	s3_export_manifest_unref(full);
+	s3_export_manifest_unref(delta);
+}
+
 int
 main(int argc, char **argv)
 {
@@ -1680,6 +1978,7 @@ main(int argc, char **argv)
 	test_v3_multi_source();
 	test_src_limit();
 	test_inherit();
+	test_template_delta();
 
 	printf("\n=== %d passed, %d failed ===\n", g_pass, g_fail);
 	spdk_log_close();
