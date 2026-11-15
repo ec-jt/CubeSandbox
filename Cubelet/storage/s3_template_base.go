@@ -171,10 +171,38 @@ var s3lvolCall = func(ctx context.Context, method string, params any, out any) e
 	if resp.Error != nil {
 		return fmt.Errorf("s3lvol %s: %w", method, resp.Error)
 	}
-	if out != nil && len(resp.Result) > 0 {
-		if err := json.Unmarshal(resp.Result, out); err != nil {
-			return fmt.Errorf("s3lvol %s: decode: %w", method, err)
+	return decodeS3lvolResult(method, resp.Result, out)
+}
+
+// decodeS3lvolResult decodes an s3lvol reply into out. Most s3lvol replies,
+// including every JSON-document reply (rcow_get_template_bases,
+// rcow_get_snapshot_status, rcow_get_exports), travel inside the envelope
+// {"bool_value": true, "string_value": "<document>"}. A caller that asks for
+// the envelope itself (*rpcStringValue) gets it as is; any other out gets the
+// document carried in string_value. Decoding the envelope straight into a
+// document struct succeeds with every field empty, which is how a live base
+// looked absent and every export status looked like "".
+func decodeS3lvolResult(method string, raw json.RawMessage, out any) error {
+	if out == nil || len(raw) == 0 {
+		return nil
+	}
+	if _, wantsEnvelope := out.(*rpcStringValue); !wantsEnvelope {
+		var env struct {
+			BoolValue   *bool   `json:"bool_value"`
+			StringValue *string `json:"string_value"`
 		}
+		if json.Unmarshal(raw, &env) == nil && env.BoolValue != nil && env.StringValue != nil {
+			if !*env.BoolValue {
+				return fmt.Errorf("s3lvol %s: %s", method, *env.StringValue)
+			}
+			doc := strings.TrimSpace(*env.StringValue)
+			if strings.HasPrefix(doc, "{") || strings.HasPrefix(doc, "[") {
+				raw = json.RawMessage(doc)
+			}
+		}
+	}
+	if err := json.Unmarshal(raw, out); err != nil {
+		return fmt.Errorf("s3lvol %s: decode: %w", method, err)
 	}
 	return nil
 }
@@ -264,12 +292,25 @@ func publishOne(ctx context.Context, templateID, role string) (string, error) {
 	}
 
 	var exp rpcStringValue
+	uuid := ""
 	if err := s3lvolCall(ctx, "rcow_export_snapshot", map[string]any{
 		"snapshot_name": source, "release_safe": true,
 	}, &exp); err != nil {
-		return "", fmt.Errorf("export %s %s: %w", role, source, err)
+		// A release-safe export is refused once the snapshot already has a
+		// published export -- typically this publish's own export from an
+		// earlier attempt that failed after the export started. Adopt that
+		// export when it is a finished dense one; anything else stays an
+		// error.
+		prior, perr := priorDenseExport(ctx, source)
+		if perr != nil || prior == "" {
+			return "", fmt.Errorf("export %s %s: %w", role, source, err)
+		}
+		CubeLog.Infof("template %s: %s export of %s refused (%v); adopting finished export %s",
+			templateID, role, source, err, prior)
+		uuid = prior
+	} else {
+		uuid = strings.TrimSpace(exp.StringValue)
 	}
-	uuid := strings.TrimSpace(exp.StringValue)
 	if uuid == "" {
 		return "", fmt.Errorf("export %s %s returned no uuid", role, source)
 	}
@@ -281,6 +322,39 @@ func publishOne(ctx context.Context, templateID, role string) (string, error) {
 	}
 	CubeLog.Infof("template %s: published %s base %s from %s", templateID, role, uuid, source)
 	return uuid, nil
+}
+
+// priorDenseExport answers the uuid of a finished dense export of snapshot, or
+// "" when there is none. Only dense exports qualify: they carry every chunk
+// of the snapshot themselves, which is what a base must be.
+func priorDenseExport(ctx context.Context, snapshot string) (string, error) {
+	var exports []struct {
+		ExportUUID         string `json:"export_uuid"`
+		Snapshot           string `json:"snapshot"`
+		Layout             string `json:"layout"`
+		Generation         uint32 `json:"generation"`
+		PublicationPending bool   `json:"publication_pending"`
+		Reaping            bool   `json:"reaping"`
+	}
+	if err := s3lvolCall(ctx, "rcow_get_exports", nil, &exports); err != nil {
+		return "", err
+	}
+	for _, e := range exports {
+		if e.Snapshot != snapshot || e.Layout != "dense" || e.Generation != 0 ||
+			e.PublicationPending || e.Reaping || strings.TrimSpace(e.ExportUUID) == "" {
+			continue
+		}
+		var st struct {
+			ExportStatus string `json:"export_status"`
+		}
+		if err := s3lvolCall(ctx, "rcow_get_snapshot_status", map[string]any{"export_uuid": e.ExportUUID}, &st); err != nil {
+			continue
+		}
+		if strings.EqualFold(st.ExportStatus, "DONE") {
+			return e.ExportUUID, nil
+		}
+	}
+	return "", nil
 }
 
 var exportPollInterval = 500 * time.Millisecond

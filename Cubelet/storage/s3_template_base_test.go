@@ -27,6 +27,8 @@ type fakeS3lvol struct {
 	exports   []string
 	exportErr error
 	calls     []string
+	// priorExports is what rcow_get_exports lists.
+	priorExports []map[string]any
 }
 
 func useFakeS3lvol(t *testing.T) *fakeS3lvol {
@@ -72,6 +74,8 @@ func useFakeS3lvol(t *testing.T) *fakeS3lvol {
 			reply = rpcStringValue{BoolValue: true, StringValue: "11111111-2222-3333-4444-55555555" + str("snapshot_name")[len(str("snapshot_name"))-4:]}
 		case "rcow_get_snapshot_status":
 			reply = map[string]string{"export_status": "DONE"}
+		case "rcow_get_exports":
+			reply = f.priorExports
 		default:
 			return errors.New("unexpected " + method)
 		}
@@ -206,6 +210,61 @@ func TestPublishTemplateBases(t *testing.T) {
 	_, err = PublishTemplateBases(context.Background(), "tpl-x")
 	require.NoError(t, err)
 	require.Len(t, f.exports, 2)
+}
+
+// A publish whose export already exists (an earlier attempt failed after the
+// export started) must adopt the finished dense export instead of failing
+// forever with "File exists". Live 2026-11-15: every reconcile tick failed.
+func TestPublishTemplateBasesAdoptsFinishedExport(t *testing.T) {
+	f := useFakeS3lvol(t)
+	useTestCowStorageAt(t, &fakeCowEngine{volumeInfos: map[string]*cubecow.Volume{}})
+	f.exportErr = &s3lvolRPCError{Code: -32603, Message: "could not start exporting snapshot: File exists"}
+	rootfs := cowTemplateRootfsName("tpl-x")
+	f.priorExports = []map[string]any{
+		{"export_uuid": "aaaaaaaa-0000-0000-0000-000000000001", "snapshot": rootfs, "layout": "ref", "generation": 0},
+		{"export_uuid": "aaaaaaaa-0000-0000-0000-000000000002", "snapshot": rootfs, "layout": "dense", "generation": 0, "publication_pending": true},
+		{"export_uuid": "aaaaaaaa-0000-0000-0000-000000000003", "snapshot": rootfs, "layout": "dense", "generation": 0},
+		{"export_uuid": "aaaaaaaa-0000-0000-0000-000000000004", "snapshot": "other", "layout": "dense", "generation": 0},
+	}
+	b, err := PublishTemplateBases(context.Background(), "tpl-x")
+	require.NoError(t, err)
+	require.Equal(t, "aaaaaaaa-0000-0000-0000-000000000003", b.Rootfs)
+	require.Empty(t, b.Memory, "no memory snapshot on this node")
+
+	// Nothing adoptable: the original error stands.
+	f2 := useFakeS3lvol(t)
+	f2.exportErr = errors.New("File exists")
+	_, err = PublishTemplateBases(context.Background(), "tpl-y")
+	require.ErrorContains(t, err, "File exists")
+}
+
+// s3lvol wraps its JSON-document replies in {bool_value, string_value}.
+func TestDecodeS3lvolResultUnwrapsEnvelope(t *testing.T) {
+	var bases templateBasesReply
+	raw := json.RawMessage(`{"bool_value":true,"string_value":"{\"base_uuid\":\"u\",\"snapshot\":\"s\",\"present\":true,\"bases\":[],\"export_template_delta\":true}"}`)
+	require.NoError(t, decodeS3lvolResult("rcow_get_template_bases", raw, &bases))
+	require.True(t, bases.Present)
+	require.Equal(t, "s", bases.Snapshot)
+	require.True(t, bases.ExportTemplateDelta)
+
+	var st struct {
+		ExportStatus string `json:"export_status"`
+	}
+	raw = json.RawMessage(`{"bool_value":true,"string_value":"{\"export_status\":\"DONE\",\"deletable\":\"YES\"}"}`)
+	require.NoError(t, decodeS3lvolResult("rcow_get_snapshot_status", raw, &st))
+	require.Equal(t, "DONE", st.ExportStatus)
+
+	var list []map[string]any
+	require.NoError(t, decodeS3lvolResult("rcow_get_exports", json.RawMessage(`[{"export_uuid":"e"}]`), &list), "bare documents still decode")
+	require.Len(t, list, 1)
+
+	var env rpcStringValue
+	raw = json.RawMessage(`{"bool_value":true,"string_value":"6d1f2a90-1b2c-4d3e-8f40-5a6b7c8d9e01"}`)
+	require.NoError(t, decodeS3lvolResult("rcow_export_snapshot", raw, &env))
+	require.Equal(t, testBase, env.StringValue, "callers that want the envelope get it")
+
+	raw = json.RawMessage(`{"bool_value":false,"string_value":"lvol not found"}`)
+	require.ErrorContains(t, decodeS3lvolResult("rcow_get_template_bases", raw, &bases), "lvol not found")
 }
 
 func TestHandleTemplateBaseRequest(t *testing.T) {
