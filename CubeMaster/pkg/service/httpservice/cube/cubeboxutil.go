@@ -492,6 +492,17 @@ func dealCubeboxCreateReqWithTemplateCenter(ctx context.Context, templateID stri
 	}
 
 	applyTemplateAnnotationsAndLabels(templateReq, reqInOut)
+	// CUBE_TEMPLATE_S3_DISTRIBUTION: name the published bases so the node
+	// clones the shared base instead of its own build. Templates only; a
+	// snapshot restore clones its own package.
+	if !strings.EqualFold(templateKind, templatecenter.TemplateKindSnapshot) {
+		if ann := templatecenter.TemplateBaseCreateAnnotations(ctx, templateID); len(ann) > 0 {
+			if reqInOut.Annotations == nil {
+				reqInOut.Annotations = map[string]string{}
+			}
+			maps.Copy(reqInOut.Annotations, ann)
+		}
+	}
 	if err := templatecenter.InheritCreateBackendFromTemplate(reqInOut, templateReq); err != nil {
 		return err
 	}

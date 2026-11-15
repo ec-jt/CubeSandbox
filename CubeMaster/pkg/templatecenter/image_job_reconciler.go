@@ -147,6 +147,9 @@ func runImageJobReconcilePass(ctx context.Context) {
 		if err := reconcileTemplateReplicaBackfill(ctx); err != nil {
 			logger.Errorf("template replica backfill sweep: %v", err)
 		}
+		if err := reconcileTemplateBases(ctx); err != nil {
+			logger.Errorf("template base sweep: %v", err)
+		}
 		return nil
 	}); err != nil {
 		logger.Errorf("image job reconcile pass: %v", err)

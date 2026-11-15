@@ -243,6 +243,11 @@ const (
 	// definitions). Pause bindings live in PauseSnapshotTableName.
 	SnapshotTableName      = "t_cube_snapshot"
 	PauseSnapshotTableName = "t_cube_pause_snapshot"
+	// TemplateBaseTableName / TemplateBaseReplicaTableName track published
+	// template bases (CUBE_TEMPLATE_S3_DISTRIBUTION) and the nodes holding a
+	// verified copy.
+	TemplateBaseTableName        = "t_cube_template_base"
+	TemplateBaseReplicaTableName = "t_cube_template_base_replica"
 	// ArtifactNodePlacementTableName records on which nodes an ext4 rootfs
 	// artifact is physically present, independent of replica lifecycle, so the
 	// last-owner-cleanup / GC paths can enumerate every node that ever held an
