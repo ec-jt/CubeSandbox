@@ -107,6 +107,10 @@ struct spdk_lvol *s3lvol_template_base_find(struct s3lvol_lvstore *lvs,
 int s3lvol_template_base_of(struct s3lvol_lvstore *lvs, struct spdk_blob *snapshot,
 			    char *out_uuid, size_t out_len);
 
+/** The nearest verified template base at or below \p lvol in its chain. */
+int s3lvol_template_base_below(struct s3lvol_lvstore *lvs, struct spdk_lvol *lvol,
+			       char *out_uuid, size_t out_len);
+
 /** Every marked anchor, valid or not. */
 int s3lvol_template_base_foreach(struct s3lvol_lvstore *lvs, s3lvol_template_base_cb cb,
 				 void *cb_arg);

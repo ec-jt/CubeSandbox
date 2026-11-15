@@ -195,6 +195,42 @@ s3lvol_template_base_of(struct s3lvol_lvstore *lvs, struct spdk_blob *snapshot,
 }
 
 int
+s3lvol_template_base_below(struct s3lvol_lvstore *lvs, struct spdk_lvol *lvol,
+			   char *out_uuid, size_t out_len)
+{
+	struct spdk_lvol_store *store;
+	struct spdk_lvol *cur = lvol;
+	uint32_t depth = 0;
+
+	if (!lvs || !lvol || !out_uuid || out_len < SPDK_UUID_STRING_LEN) {
+		return -EINVAL;
+	}
+	store = s3lvol_lvstore_get_lvs(lvs);
+	if (!store) {
+		return -ENODEV;
+	}
+	/* The lvol itself counts: exporting a base publishes that base. */
+	while (cur && cur->blob && depth++ < S3LVOL_DEFAULT_MAX_CHAIN_DEPTH) {
+		spdk_blob_id pid;
+
+		if (s3lvol_template_base_of(lvs, cur->blob, out_uuid, out_len) == 0) {
+			return 0;
+		}
+		if (spdk_blob_is_esnap_clone(cur->blob)) {
+			break;
+		}
+		pid = spdk_blob_get_parent_snapshot(store->blobstore,
+						    spdk_blob_get_id(cur->blob));
+		if (pid == SPDK_BLOBID_INVALID) {
+			break;
+		}
+		cur = tbase_lvol_by_blob_id(store, pid);
+	}
+	out_uuid[0] = '\0';
+	return -ENOENT;
+}
+
+int
 s3lvol_template_base_foreach(struct s3lvol_lvstore *lvs, s3lvol_template_base_cb cb,
 			     void *cb_arg)
 {

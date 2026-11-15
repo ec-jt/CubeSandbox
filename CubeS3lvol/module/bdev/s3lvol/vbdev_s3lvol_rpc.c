@@ -2746,6 +2746,8 @@ rpc_rcow_get_template_bases(struct spdk_jsonrpc_request *request,
 	const struct spdk_json_object_decoder decoders[] = {
 		{"lvs_name", offsetof(struct rpc_tbase_mark, lvs_name), spdk_json_decode_string, true},
 		{"base_uuid", offsetof(struct rpc_tbase_mark, base_uuid), spdk_json_decode_string, true},
+		/* reuse: the lvol whose nearest base is wanted */
+		{"lvol_name", offsetof(struct rpc_tbase_mark, snapshot_name), spdk_json_decode_string, true},
 	};
 	struct s3lvol_lvstore *lvs;
 	struct rpc_json_buf buf;
@@ -2772,6 +2774,17 @@ rpc_rcow_get_template_bases(struct spdk_jsonrpc_request *request,
 		spdk_json_write_named_string(w, "snapshot", base ? base->name : "");
 		spdk_json_write_named_bool(w, "present", base != NULL);
 	}
+	if (req.snapshot_name) {
+		struct spdk_lvol *lvol = s3lvol_lvol_find(lvs, req.snapshot_name);
+		char below[SPDK_UUID_STRING_LEN] = {0};
+
+		if (lvol) {
+			s3lvol_template_base_below(lvs, lvol, below, sizeof(below));
+		}
+		spdk_json_write_named_string(w, "lvol_name", req.snapshot_name);
+		spdk_json_write_named_bool(w, "lvol_found", lvol != NULL);
+		spdk_json_write_named_string(w, "base_below", below);
+	}
 	spdk_json_write_named_array_begin(w, "bases");
 	s3lvol_template_base_foreach(lvs, rpc_tbase_list_one, w);
 	spdk_json_write_array_end(w);
@@ -2782,6 +2795,7 @@ rpc_rcow_get_template_bases(struct spdk_jsonrpc_request *request,
 out:
 	free(req.lvs_name);
 	free(req.base_uuid);
+	free(req.snapshot_name);
 }
 SPDK_RPC_REGISTER("rcow_get_template_bases", rpc_rcow_get_template_bases, SPDK_RPC_RUNTIME)
 
