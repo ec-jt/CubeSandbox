@@ -489,6 +489,7 @@ s3lvol_xfer_lvstore_fini(struct s3lvol_lvstore *lvs)
 		}
 	}
 	import_status_drop(lvs, NULL);
+	s3lvol_lvol_warm_forget_lvs(lvs);
 }
 
 /* ==========================================================================
@@ -1593,6 +1594,253 @@ blob_by_id(struct spdk_lvol_store *store, spdk_blob_id id)
 		}
 	}
 	return NULL;
+}
+
+/* ==========================================================================
+ * Cache warm-up of a volume's data (template and base snapshots)
+ *
+ * A template snapshot is read by every sandbox started from it, so its bytes
+ * belong in the local cache before a restore needs them -- a cold cache turns a
+ * snapshot restore into thousands of small S3 range GETs and the guest misses
+ * its readiness deadline. This collects every device chunk the volume reads
+ * through (its own clusters and every ancestor's, nearest layer wins) and hands
+ * them to s3_bs_dev_warm(), which fetches whole objects in parallel.
+ *
+ * Read-only with respect to the volume: nothing is written to any blob, only
+ * cache entries tagged with immutable object uuids are added.
+ * ========================================================================== */
+
+struct lvol_warm {
+	struct s3lvol_lvstore *lvs;
+	char                   lvol_name[SPDK_LVOL_NAME_MAX];
+	enum s3lvol_import_state state;
+	int                    error;
+	struct s3_warm_stats   st;
+	TAILQ_ENTRY(lvol_warm) link;
+};
+
+static TAILQ_HEAD(, lvol_warm) g_lvol_warms = TAILQ_HEAD_INITIALIZER(g_lvol_warms);
+
+static struct lvol_warm *
+lvol_warm_find(const struct s3lvol_lvstore *lvs, const char *name)
+{
+	struct lvol_warm *w;
+
+	TAILQ_FOREACH(w, &g_lvol_warms, link) {
+		if (w->lvs == lvs && strcmp(w->lvol_name, name) == 0) {
+			return w;
+		}
+	}
+	return NULL;
+}
+
+/* Collect the device chunk of every allocated cluster the volume reads through.
+ * Nearest layer first; an index already taken by a nearer layer is skipped, which
+ * is how blobstore resolves a read too. Returns a malloc'd array. */
+static int
+lvol_warm_collect(struct s3lvol_lvstore *lvs, struct spdk_blob *blob,
+		  uint64_t **out, uint64_t *out_n)
+{
+	struct spdk_lvol_store *store = s3lvol_lvstore_get_lvs(lvs);
+	struct spdk_bs_dev *dev = s3lvol_lvstore_get_bs_dev(lvs);
+	uint32_t chunk_size = dev ? s3_bs_dev_get_chunk_size(dev) : 0;
+	uint64_t io_units_per_cluster, nclusters, cap, n = 0;
+	uint64_t *chunks;
+	uint8_t *seen;
+	uint32_t depth = 0;
+	struct spdk_blob *cur = blob;
+
+	if (!store || !dev || chunk_size == 0 ||
+	    spdk_bs_get_cluster_size(store->blobstore) != chunk_size) {
+		/* One cluster per chunk is what makes the LBA arithmetic below
+		 * name whole objects; every s3lvol lvstore is built that way. */
+		return -ENOTSUP;
+	}
+	io_units_per_cluster = chunk_size / spdk_bs_get_io_unit_size(store->blobstore);
+	nclusters = spdk_blob_get_num_clusters(blob);
+	cap = nclusters ? nclusters : 1;
+	chunks = calloc(cap, sizeof(*chunks));
+	seen = calloc(cap, 1);
+	if (!chunks || !seen) {
+		free(chunks);
+		free(seen);
+		return -ENOMEM;
+	}
+
+	while (cur && depth++ < S3LVOL_DEFAULT_MAX_CHAIN_DEPTH) {
+		uint64_t layer_units = spdk_blob_get_num_io_units(cur);
+		uint64_t off = 0;
+		spdk_blob_id pid;
+
+		while (off < layer_units) {
+			uint64_t cl, lba;
+
+			off = spdk_blob_get_next_allocated_io_unit(cur, off);
+			if (off == UINT64_MAX || off >= layer_units) {
+				break;
+			}
+			cl = off / io_units_per_cluster;
+			if (cl < cap && !seen[cl]) {
+				lba = spdk_blob_get_io_unit_lba(cur, off);
+				if (lba != UINT64_MAX) {
+					seen[cl] = 1;
+					chunks[n++] = lba / (chunk_size / S3LVOL_BLOCK_SIZE);
+				}
+			}
+			off = (cl + 1) * io_units_per_cluster;
+		}
+		if (spdk_blob_is_esnap_clone(cur)) {
+			/* The rest is read through an export, not this lvstore's
+			 * chunk map; the import path keeps that local. */
+			break;
+		}
+		pid = spdk_blob_get_parent_snapshot(store->blobstore, spdk_blob_get_id(cur));
+		if (pid == SPDK_BLOBID_INVALID) {
+			break;
+		}
+		cur = blob_by_id(store, pid);
+	}
+	free(seen);
+	*out = chunks;
+	*out_n = n;
+	return 0;
+}
+
+static void
+lvol_warm_done(void *arg, int status, const struct s3_warm_stats *st)
+{
+	struct lvol_warm *w = arg;
+
+	w->st = *st;
+	w->error = status;
+	w->state = status == 0 ? S3LVOL_IMPORT_DONE :
+		   status == -ECANCELED ? S3LVOL_IMPORT_CANCELLED : S3LVOL_IMPORT_FAILED;
+	SPDK_NOTICELOG("cache warm-up of '%s' %s: %" PRIu64 " chunk(s), %" PRIu64
+		       " fetched, %" PRIu64 " warmed, %" PRIu64 " already local, %"
+		       PRIu64 " hole(s), %" PRIu64 " failed, %" PRIu64 " byte(s) in %"
+		       PRIu64 " ms\n", w->lvol_name, status == 0 ? "done" : spdk_strerror(-status),
+		       st->requested, st->fetched, st->warmed, st->already, st->holes,
+		       st->failed, st->bytes, st->elapsed_ms);
+}
+
+int
+s3lvol_lvol_warm(struct s3lvol_lvstore *lvs, struct spdk_lvol *lvol, uint32_t window)
+{
+	struct lvol_warm *w;
+	uint64_t *chunks = NULL, n = 0;
+	int rc;
+
+	if (!lvs || !lvol || !lvol->blob) {
+		return -EINVAL;
+	}
+	w = lvol_warm_find(lvs, lvol->name);
+	if (w && (w->state == S3LVOL_IMPORT_RUNNING || w->state == S3LVOL_IMPORT_QUEUED)) {
+		return 0;   /* already running: the caller polls the same status */
+	}
+	if (!w) {
+		w = calloc(1, sizeof(*w));
+		if (!w) {
+			return -ENOMEM;
+		}
+		w->lvs = lvs;
+		snprintf(w->lvol_name, sizeof(w->lvol_name), "%s", lvol->name);
+		TAILQ_INSERT_TAIL(&g_lvol_warms, w, link);
+	}
+	memset(&w->st, 0, sizeof(w->st));
+	w->error = 0;
+	rc = lvol_warm_collect(lvs, lvol->blob, &chunks, &n);
+	if (rc != 0) {
+		w->state = S3LVOL_IMPORT_FAILED;
+		w->error = rc;
+		return rc;
+	}
+	w->state = S3LVOL_IMPORT_RUNNING;
+	SPDK_NOTICELOG("cache warm-up of '%s': %" PRIu64 " chunk(s), window %u\n",
+		       lvol->name, n, window ? window : 32);
+	rc = s3_bs_dev_warm(s3lvol_lvstore_get_bs_dev(lvs), chunks, n, window,
+			    lvol_warm_done, w);
+	free(chunks);
+	if (rc != 0) {
+		w->state = S3LVOL_IMPORT_FAILED;
+		w->error = rc;
+	}
+	return rc;
+}
+
+int
+s3lvol_lvol_warm_status(struct s3lvol_lvstore *lvs, const char *lvol_name,
+			struct s3lvol_warm_status *out)
+{
+	struct lvol_warm *w = lvol_warm_find(lvs, lvol_name);
+
+	if (!out) {
+		return -EINVAL;
+	}
+	memset(out, 0, sizeof(*out));
+	if (!w) {
+		out->state = S3LVOL_IMPORT_NONE;
+		return 0;
+	}
+	out->state = w->state;
+	out->error = w->error;
+	out->requested = w->st.requested;
+	out->fetched = w->st.fetched;
+	out->warmed = w->st.warmed;
+	out->already = w->st.already;
+	out->holes = w->st.holes;
+	out->failed = w->st.failed;
+	out->bytes = w->st.bytes;
+	out->elapsed_ms = w->st.elapsed_ms;
+	return 0;
+}
+
+/* Template snapshots are the volumes every restore reads, and their names say so
+ * (tpl-*: tpl-tpl-<id>-rootfs, -memory-snap, versioned base snapshots). Warm them
+ * once the lvstore is attached, so a target restart does not leave the next
+ * restores reading S3 one small request at a time. */
+void
+s3lvol_lvstore_warm_templates(struct s3lvol_lvstore *lvs)
+{
+	struct spdk_lvol_store *store = s3lvol_lvstore_get_lvs(lvs);
+	struct spdk_lvol *lvol;
+	const char *off = getenv("S3LVOL_WARM_TEMPLATES");
+	uint32_t started = 0;
+
+	if (!store || (off && (strcmp(off, "0") == 0 || strcasecmp(off, "false") == 0))) {
+		return;
+	}
+	/* Template volumes only: "tpl-tpl-<template>-..." covers the template
+	 * snapshots (rootfs, memory-snap) and the template-base anchors that
+	 * base-backed sandboxes clone from. "tpl-snap-*" are per-sandbox pause
+	 * snapshots and are deliberately not warmed here: there can be many and
+	 * they would push the shared template data out of the cache. The build
+	 * volumes are scratch and never read by a sandbox. */
+	TAILQ_FOREACH(lvol, &store->lvols, link) {
+		if (!lvol->blob || strncmp(lvol->name, "tpl-tpl-", 8) != 0 ||
+		    strstr(lvol->name, "-build-") != NULL) {
+			continue;
+		}
+		if (s3lvol_lvol_warm(lvs, lvol, 0) == 0) {
+			started++;
+		}
+	}
+	if (started) {
+		SPDK_NOTICELOG("lvstore '%s': warming %u template snapshot(s) into the "
+			       "local cache\n", s3lvol_lvstore_get_name(lvs), started);
+	}
+}
+
+void
+s3lvol_lvol_warm_forget_lvs(struct s3lvol_lvstore *lvs)
+{
+	struct lvol_warm *w, *tmp;
+
+	TAILQ_FOREACH_SAFE(w, &g_lvol_warms, link, tmp) {
+		if (w->lvs == lvs && w->state != S3LVOL_IMPORT_RUNNING) {
+			TAILQ_REMOVE(&g_lvol_warms, w, link);
+			free(w);
+		}
+	}
 }
 
 /* Collect the snapshot's clone chain, nearest first.
@@ -5623,6 +5871,24 @@ s3lvol_import_status_get(struct s3lvol_lvstore *lvs, struct spdk_lvol *lvol,
  * rcow_import_status never reports local.
  * ========================================================================== */
 
+/* Chunks overlaid at once. The overlay used to run one chunk at a time -- read
+ * from the export, write into the clone, then the next -- so its rate was one
+ * S3 round trip plus one copy-on-write per chunk regardless of the prefetch
+ * window (measured: 258 chunks in 217 s, 843 ms each). Lanes make it the
+ * prefetcher's window that bounds the rate, as it does for a full import. */
+#define DELTA_OVERLAY_LANES_DEFAULT 32
+#define DELTA_OVERLAY_LANES_MAX     64
+
+struct delta_overlay;
+
+struct delta_lane {
+	struct delta_overlay        *o;
+	uint8_t                     *buf;
+	uint64_t                     chunk;
+	bool                         busy;
+	struct spdk_bs_dev_cb_args   read_args;
+};
+
 struct delta_overlay {
 	struct s3lvol_lvstore       *lvs;
 	struct spdk_lvol            *lvol;
@@ -5636,23 +5902,44 @@ struct delta_overlay {
 	struct s3_export_prefetcher *pf;
 	struct lvs_pf_budget        *budget;
 	struct import_status        *st;
-	uint8_t                     *buf;
+	struct delta_lane           *lanes;
+	uint32_t                     nlanes;
+	uint32_t                     busy;         /* lanes with I/O in flight */
 	uint64_t                     chunk;        /* next to consider */
 	uint64_t                     io_unit;
 	uint64_t                     start_ms;
 	uint32_t                     window;
 	int                          status;
+	uint32_t                     finish_msgs;  /* finish messages queued */
 	bool                         finishing;
-	bool                         in_io;
-	struct spdk_bs_dev_cb_args   read_args;    /* one read in flight */
+	bool                         pumping;      /* delta_overlay_next on the stack */
 };
 
 static void delta_overlay_next(struct delta_overlay *o);
 static void delta_overlay_finish(struct delta_overlay *o, int status);
 
+static uint32_t
+delta_overlay_lanes(void)
+{
+	const char *v = getenv("S3LVOL_DELTA_OVERLAY_LANES");
+	char *end = NULL;
+	unsigned long n;
+
+	if (!v || v[0] == '\0') {
+		return DELTA_OVERLAY_LANES_DEFAULT;
+	}
+	n = strtoul(v, &end, 10);
+	if (!end || *end != '\0' || n == 0) {
+		return DELTA_OVERLAY_LANES_DEFAULT;
+	}
+	return n > DELTA_OVERLAY_LANES_MAX ? DELTA_OVERLAY_LANES_MAX : (uint32_t)n;
+}
+
 static void
 delta_overlay_free(struct delta_overlay *o)
 {
+	uint32_t i;
+
 	if (o->pf) {
 		s3_export_prefetcher_destroy(o->pf);
 	}
@@ -5669,7 +5956,12 @@ delta_overlay_free(struct delta_overlay *o)
 	if (o->imp) {
 		import_remove(o->imp);
 	}
-	spdk_dma_free(o->buf);
+	if (o->lanes) {
+		for (i = 0; i < o->nlanes; i++) {
+			spdk_dma_free(o->lanes[i].buf);
+		}
+		free(o->lanes);
+	}
 	s3_export_manifest_unref(o->m);
 	free(o);
 }
@@ -5708,11 +6000,31 @@ delta_overlay_cleared(void *cb_arg, int bserrno)
 	s3lvol_decouple_kick_queue();
 }
 
+static void delta_overlay_finish_msg(void *arg);
+
+/* Every route to the end goes through here. Several can fire for one overlay --
+ * finish() itself, the last lane to land, the last prefetch to complete -- and
+ * the message frees the overlay, so only the last one queued may act. */
+static void
+delta_overlay_kick_finish(struct delta_overlay *o)
+{
+	o->finish_msgs++;
+	spdk_thread_send_msg(spdk_get_thread(), delta_overlay_finish_msg, o);
+}
+
 static void
 delta_overlay_finish_msg(void *arg)
 {
 	struct delta_overlay *o = arg;
 
+	assert(o->finish_msgs > 0);
+	if (--o->finish_msgs > 0) {
+		return;   /* a later one is queued; it decides */
+	}
+	if (o->busy > 0) {
+		/* The last lane to land resends this. */
+		return;
+	}
 	if (o->pf && !s3_export_prefetcher_idle(o->pf)) {
 		/* The last prefetch completion resends this. */
 		return;
@@ -5753,7 +6065,7 @@ delta_overlay_finish(struct delta_overlay *o, int status)
 	if (o->pf) {
 		s3_export_prefetcher_stop(o->pf);
 	}
-	spdk_thread_send_msg(spdk_get_thread(), delta_overlay_finish_msg, o);
+	delta_overlay_kick_finish(o);
 }
 
 static void
@@ -5765,8 +6077,8 @@ delta_overlay_pf_cb(void *cb_arg, uint64_t chunk_index, int status)
 		SPDK_ERRLOG("delta import '%s': prefetch of chunk %" PRIu64 " failed: %s\n",
 			    o->lvol_name, chunk_index, spdk_strerror(-status));
 	}
-	if (o->finishing && s3_export_prefetcher_idle(o->pf)) {
-		spdk_thread_send_msg(spdk_get_thread(), delta_overlay_finish_msg, o);
+	if (o->finishing && s3_export_prefetcher_idle(o->pf) && o->busy == 0) {
+		delta_overlay_kick_finish(o);
 	}
 }
 
@@ -5776,17 +6088,44 @@ delta_overlay_next_msg(void *arg)
 	delta_overlay_next(arg);
 }
 
-static void
-delta_overlay_written(void *cb_arg, int bserrno)
+/* Lanes complete out of order, so the prefetcher may only unpin what lies below
+	* the lowest chunk still being overlaid. */
+static uint64_t
+delta_overlay_low_water(const struct delta_overlay *o)
 {
-	struct delta_overlay *o = cb_arg;
-	bool present = s3_export_manifest_is_present(o->m, o->chunk);
+	uint64_t low = o->chunk;
+	uint32_t i;
 
-	o->in_io = false;
-	if (bserrno != 0) {
-		SPDK_ERRLOG("delta import '%s': writing chunk %" PRIu64 " failed: %s\n",
-			    o->lvol_name, o->chunk, spdk_strerror(-bserrno));
-		delta_overlay_finish(o, bserrno);
+	for (i = 0; i < o->nlanes; i++) {
+		if (o->lanes[i].busy && o->lanes[i].chunk < low) {
+			low = o->lanes[i].chunk;
+		}
+	}
+	return low;
+}
+
+static void
+delta_lane_done(struct delta_lane *lane, int status, const char *what)
+{
+	struct delta_overlay *o = lane->o;
+	bool present = s3_export_manifest_is_present(o->m, lane->chunk);
+
+	lane->busy = false;
+	assert(o->busy > 0);
+	o->busy--;
+	if (status != 0) {
+		SPDK_ERRLOG("delta import '%s': %s chunk %" PRIu64 " failed: %s\n",
+			    o->lvol_name, what, lane->chunk, spdk_strerror(-status));
+		if (o->finishing) {
+			if (o->status == 0) {
+				o->status = status;
+			}
+			if (o->busy == 0) {
+				delta_overlay_kick_finish(o);
+			}
+		} else {
+			delta_overlay_finish(o, status);
+		}
 		return;
 	}
 	if (o->st) {
@@ -5795,39 +6134,50 @@ delta_overlay_written(void *cb_arg, int bserrno)
 			o->st->local_chunks++;
 		}
 	}
-	o->chunk++;
 	if (o->pf) {
-		s3_export_prefetcher_release_below(o->pf, o->chunk);
+		s3_export_prefetcher_release_below(o->pf, delta_overlay_low_water(o));
 	}
-	/* Bounced: a write that completes inline would recurse per chunk. */
-	spdk_thread_send_msg(spdk_get_thread(), delta_overlay_next_msg, o);
+	if (o->finishing) {
+		if (o->busy == 0) {
+			delta_overlay_kick_finish(o);
+		}
+		return;
+	}
+	/* Bounced: a completion that runs inline would recurse per chunk. */
+	if (!o->pumping) {
+		spdk_thread_send_msg(spdk_get_thread(), delta_overlay_next_msg, o);
+	}
+}
+
+static void
+delta_overlay_written(void *cb_arg, int bserrno)
+{
+	delta_lane_done(cb_arg, bserrno, "writing");
 }
 
 static void
 delta_overlay_read_done(struct spdk_io_channel *channel, void *cb_arg, int bserrno)
 {
-	struct delta_overlay *o = cb_arg;
+	struct delta_lane *lane = cb_arg;
+	struct delta_overlay *o = lane->o;
 	uint64_t per = o->m->chunk_size / o->io_unit;
 
 	(void)channel;
 	if (bserrno != 0) {
-		o->in_io = false;
-		SPDK_ERRLOG("delta import '%s': reading chunk %" PRIu64 " of export %s "
-			    "failed: %s\n", o->lvol_name, o->chunk, o->uuid_str,
-			    spdk_strerror(-bserrno));
-		delta_overlay_finish(o, bserrno);
+		delta_lane_done(lane, bserrno, "reading");
 		return;
 	}
-	spdk_blob_io_write(o->lvol->blob, o->blob_ch, o->buf, o->chunk * per, per,
-			   delta_overlay_written, o);
+	spdk_blob_io_write(o->lvol->blob, o->blob_ch, lane->buf, lane->chunk * per, per,
+			   delta_overlay_written, lane);
 }
 
 static void
 delta_overlay_next(struct delta_overlay *o)
 {
 	uint64_t per = o->m->chunk_size / o->io_unit;
+	uint32_t i;
 
-	if (o->finishing) {
+	if (o->finishing || o->pumping) {
 		return;
 	}
 	if (o->pf) {
@@ -5835,35 +6185,52 @@ delta_overlay_next(struct delta_overlay *o)
 
 		s3_export_prefetcher_get_progress(o->pf, &pg);
 		if (pg.status != 0) {
+			/* finish() queues the message; with lanes still busy the last
+			 * one to land queues it again. */
 			delta_overlay_finish(o, pg.status);
 			return;
 		}
 	}
-	/* BASE chunks are already right: the clone reads them from the base. */
-	while (o->chunk < o->m->num_chunks &&
-	       s3_export_manifest_chunk_source(o->m, o->chunk) == S3_EXPORT_CHUNK_BASE) {
-		o->chunk++;
+	o->pumping = true;
+	while (!o->finishing && o->busy < o->nlanes) {
+		struct delta_lane *lane = NULL;
+
+		/* BASE chunks are already right: the clone reads them from the base. */
+		while (o->chunk < o->m->num_chunks &&
+		       s3_export_manifest_chunk_source(o->m, o->chunk) == S3_EXPORT_CHUNK_BASE) {
+			o->chunk++;
+		}
+		if (o->chunk >= o->m->num_chunks) {
+			break;
+		}
+		for (i = 0; i < o->nlanes; i++) {
+			if (!o->lanes[i].busy) {
+				lane = &o->lanes[i];
+				break;
+			}
+		}
+		assert(lane != NULL);
+		lane->busy = true;
+		lane->chunk = o->chunk++;
+		o->busy++;
+		if (s3_export_manifest_chunk_source(o->m, lane->chunk) == S3_EXPORT_CHUNK_ZERO) {
+			/* The base has data here; the sandbox zeroed it. */
+			spdk_blob_io_write_zeroes(o->lvol->blob, o->blob_ch, lane->chunk * per,
+						  per, delta_overlay_written, lane);
+			continue;
+		}
+		lane->read_args.cb_fn = delta_overlay_read_done;
+		lane->read_args.channel = o->src_ch;
+		lane->read_args.cb_arg = lane;
+		o->src->read(o->src, o->src_ch, lane->buf,
+			     (lane->chunk * o->m->chunk_size) / S3LVOL_BLOCK_SIZE,
+			     (uint32_t)(o->m->chunk_size / S3LVOL_BLOCK_SIZE),
+			     &lane->read_args);
 	}
-	if (o->chunk >= o->m->num_chunks) {
+	o->pumping = false;
+	if (!o->finishing && o->busy == 0 && o->chunk >= o->m->num_chunks) {
 		delta_overlay_finish(o, 0);
-		return;
 	}
-	o->in_io = true;
-	if (s3_export_manifest_chunk_source(o->m, o->chunk) == S3_EXPORT_CHUNK_ZERO) {
-		/* The base has data here; the sandbox zeroed it. */
-		spdk_blob_io_write_zeroes(o->lvol->blob, o->blob_ch, o->chunk * per, per,
-					  delta_overlay_written, o);
-		return;
-	}
-	/* One read in flight per overlay, so one args block each is enough; the
-	 * parallelism is in the prefetcher, which keeps the next chunks coming
-	 * while this one is written. */
-	o->read_args.cb_fn = delta_overlay_read_done;
-	o->read_args.channel = o->src_ch;
-	o->read_args.cb_arg = o;
-	o->src->read(o->src, o->src_ch, o->buf,
-		     (o->chunk * o->m->chunk_size) / S3LVOL_BLOCK_SIZE,
-		     (uint32_t)(o->m->chunk_size / S3LVOL_BLOCK_SIZE), &o->read_args);
 }
 
 static void
@@ -5910,9 +6277,14 @@ delta_overlay_start(struct delta_overlay *o)
 		}
 		s3_export_prefetcher_pump(o->pf);
 	}
+	/* Every own chunk is written over an unallocated cluster of the clone, and
+	 * blobstore fills such a cluster from the parent first -- the base. With
+	 * the base cold that is one more S3 read per chunk. Warm it alongside
+	 * (best effort; the clone's ancestors are the base). */
+	(void)s3lvol_lvol_warm(o->lvs, o->lvol, 0);
 	SPDK_NOTICELOG("Delta import '%s' from export %s over template base %s: %" PRIu64
-		       " own chunk(s), %" PRIu64 " zero chunk(s)\n", o->lvol_name,
-		       o->uuid_str, o->m->base_uuid, o->m->present_chunks, zeroes);
+		       " own chunk(s), %" PRIu64 " zero chunk(s), %u lane(s)\n", o->lvol_name,
+		       o->uuid_str, o->m->base_uuid, o->m->present_chunks, zeroes, o->nlanes);
 	delta_overlay_next(o);
 }
 
@@ -5949,10 +6321,24 @@ delta_overlay_begin(struct import_ctx *ctx, struct spdk_lvol *lvol)
 		rc = -EINVAL;
 		goto err;
 	}
-	o->buf = spdk_dma_zmalloc(o->m->chunk_size, S3LVOL_BLOCK_SIZE, NULL);
-	if (!o->buf) {
+	o->nlanes = delta_overlay_lanes();
+	o->lanes = calloc(o->nlanes, sizeof(*o->lanes));
+	if (!o->lanes) {
 		rc = -ENOMEM;
 		goto err;
+	}
+	{
+		uint32_t i;
+
+		for (i = 0; i < o->nlanes; i++) {
+			o->lanes[i].o = o;
+			o->lanes[i].buf = spdk_dma_zmalloc(o->m->chunk_size,
+							   S3LVOL_BLOCK_SIZE, NULL);
+			if (!o->lanes[i].buf) {
+				rc = -ENOMEM;
+				goto err;
+			}
+		}
 	}
 	import_build_target(o->imp, &target);
 	rc = s3_client_get_or_create(&target, &client);

@@ -1377,6 +1377,28 @@ struct s3lvol_import_status_info {
 
 const char *s3lvol_import_state_name(enum s3lvol_import_state state);
 
+/* Cache warm-up of a volume's data, its own clusters and every ancestor's. */
+struct s3lvol_warm_status {
+	enum s3lvol_import_state state;   /* NONE, RUNNING, DONE, FAILED, CANCELLED */
+	int                      error;
+	uint64_t                 requested;
+	uint64_t                 fetched;
+	uint64_t                 warmed;
+	uint64_t                 already;
+	uint64_t                 holes;
+	uint64_t                 failed;
+	uint64_t                 bytes;
+	uint64_t                 elapsed_ms;
+};
+
+/* Start warming (idempotent while one runs). window 0 = default 32. */
+int s3lvol_lvol_warm(struct s3lvol_lvstore *lvs, struct spdk_lvol *lvol, uint32_t window);
+int s3lvol_lvol_warm_status(struct s3lvol_lvstore *lvs, const char *lvol_name,
+			    struct s3lvol_warm_status *out);
+/* Warm every read-only tpl-* snapshot. S3LVOL_WARM_TEMPLATES=0 disables. */
+void s3lvol_lvstore_warm_templates(struct s3lvol_lvstore *lvs);
+void s3lvol_lvol_warm_forget_lvs(struct s3lvol_lvstore *lvs);
+
 /* S3LVOL_IMPORT_PREFETCH_PARALLEL, else S3_EXPORT_PREFETCH_DEFAULT (64); capped.
  * Both the per-volume window and the per-lvstore cap shared by every
  * prefetching volume of one lvstore. */

@@ -563,6 +563,44 @@ main(int argc, char **argv)
 					   AIO_BLOCK_SIZE, 0), NULL);
 	}
 
+	printf("\n[3b] s3_cache_fill_chunk: whole object, completion reported\n");
+	{
+		struct async_ctx fctx = {0};
+		struct spdk_uuid uuid_w;
+		uint64_t chunk = 11;
+		uint32_t valid = TEST_CHUNK_SIZE - 1000;   /* short tail object */
+
+		spdk_uuid_generate(&uuid_w);
+		fill_pattern(src, chunk, TEST_CHUNK_SIZE, 5);
+		rc = s3_cache_fill_chunk(cache, chunk, &uuid_w, src, valid,
+					 read_cb, &fctx);
+		check_u64("fill_chunk submitted", (uint64_t)-rc, 0);
+		check_true("fill_chunk completion reported",
+			   poll_until(&fctx.done) && fctx.status == 0, NULL);
+		check_true("the whole object is resident after fill_chunk",
+			   s3_cache_chunk_resident(cache, chunk, &uuid_w), NULL);
+
+		memset(dst, 0xEE, TEST_CHUNK_SIZE);
+		rc = read_sync(cache, chunk, &uuid_w, 0, TEST_CHUNK_SIZE, dst);
+		check_u64("read the filled chunk back", (uint64_t)-rc, 0);
+		check_true("filled bytes match up to valid_bytes",
+			   pattern_matches(dst, chunk, 0, valid, 5), NULL);
+		check_true("past valid_bytes reads as zeroes",
+			   all_zero((uint8_t *)dst + valid, TEST_CHUNK_SIZE - valid), NULL);
+
+		check_u64("a second fill of a resident object is -EALREADY",
+			  (uint64_t)-s3_cache_fill_chunk(cache, chunk, &uuid_w, src,
+							 valid, read_cb, &fctx),
+			  EALREADY);
+		check_true("another version reads as a miss",
+			   read_sync(cache, chunk, &uuid_a, 0, AIO_BLOCK_SIZE, dst) == -ENOENT,
+			   NULL);
+		check_u64("fill_chunk rejects a NULL callback",
+			  (uint64_t)-s3_cache_fill_chunk(cache, chunk, &uuid_w, src,
+							 valid, NULL, NULL), EINVAL);
+		s3_cache_drop_chunk(cache, chunk);
+	}
+
 	printf("\n[4] a different uuid on the same chunk is a miss\n");
 	{
 		/* The property the whole module rests on. An object is immutable

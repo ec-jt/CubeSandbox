@@ -115,6 +115,9 @@ struct s3_cache;
 
 typedef void (*s3_cache_read_cb)(void *cb_arg, int status);
 
+/* A s3_cache_fill_chunk() fill has landed (0) or failed (-EIO). */
+typedef void (*s3_cache_fill_cb)(void *cb_arg, int status);
+
 /* Fired once when a quiescing cache has no I/O and no frame of its own left on
  * the stack. The callback may destroy the cache. */
 typedef void (*s3_cache_quiesce_cb)(void *cb_arg);
@@ -240,6 +243,36 @@ void s3_cache_populate(struct s3_cache *cache, uint64_t chunk_index,
  * occupied until it reaches the end of the LRU.
  */
 void s3_cache_drop_chunk(struct s3_cache *cache, uint64_t chunk_index);
+
+/**
+ * Whether the whole of this object version is resident. Same answer as
+ * s3_cache_lookup(); named for the warm-up path, which asks it per chunk.
+ */
+bool s3_cache_chunk_resident(struct s3_cache *cache, uint64_t chunk_index,
+			     const struct spdk_uuid *uuid);
+
+/**
+ * Cache a whole object, writing straight from the caller's buffer, and say when
+ * it has landed.
+ *
+ * Unlike s3_cache_populate() this is not best effort: it is for the warm-up of
+ * template snapshots, which wants to know that the bytes are local before a
+ * restore reads them. It takes no staging buffer, so it does not compete with
+ * the read path's populates for the four staging slots.
+ *
+ * \param dma_buf  the object's bytes, DMA-capable, at least
+ *                 round_up(object_valid_bytes, block_size) long. The tail past
+ *                 object_valid_bytes is zeroed in place. Must stay alive until
+ *                 \p cb_fn runs.
+ * \return 0 with \p cb_fn to follow; -EALREADY when the whole object is already
+ *         resident (no callback); -EBUSY when the slot holds another version
+ *         with I/O in flight; -ENOSPC when every slot is pinned or filling;
+ *         -ESHUTDOWN when quiescing; other negative errno when not submitted.
+ */
+int s3_cache_fill_chunk(struct s3_cache *cache, uint64_t chunk_index,
+			const struct spdk_uuid *uuid, void *dma_buf,
+			uint32_t object_valid_bytes,
+			s3_cache_fill_cb cb_fn, void *cb_arg);
 
 /**
  * Whether the cache has no I/O of its own outstanding.

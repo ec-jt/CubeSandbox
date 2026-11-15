@@ -60,7 +60,11 @@ struct cache_staging {
 struct cache_fill {
 	struct s3_cache         *cache;
 	struct cache_slot       *slot;
+	/* NULL for a s3_cache_fill_chunk() fill, which writes straight from the
+	 * caller's buffer and tells the caller when it has landed. */
 	struct cache_staging    *staging;
+	s3_cache_fill_cb         cb_fn;
+	void                    *cb_arg;
 
 	/* The block range this fill makes present, to be marked on success. */
 	uint32_t                 first_block;
@@ -712,12 +716,147 @@ cache_fill_done(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
 		}
 	}
 
-	TAILQ_INSERT_HEAD(&cache->staging_free, fill->staging, link);
+	if (fill->staging) {
+		TAILQ_INSERT_HEAD(&cache->staging_free, fill->staging, link);
+	}
 	cache->fills_in_flight--;
 
-	free(fill);
+	if (fill->cb_fn) {
+		s3_cache_fill_cb cb_fn = fill->cb_fn;
+		void *cb_arg = fill->cb_arg;
+
+		free(fill);
+		/* A frame of ours: the callback may start the next fill, and a
+		 * quiesce must not be answered from inside it. */
+		cache->frames++;
+		cb_fn(cb_arg, success ? 0 : -EIO);
+		cache->frames--;
+	} else {
+		free(fill);
+	}
 
 	cache_maybe_quiesced(cache);   /* last: may free the cache */
+}
+
+bool
+s3_cache_chunk_resident(struct s3_cache *cache, uint64_t chunk_index,
+			const struct spdk_uuid *uuid)
+{
+	return s3_cache_lookup(cache, chunk_index, uuid);
+}
+
+int
+s3_cache_fill_chunk(struct s3_cache *cache, uint64_t chunk_index,
+		    const struct spdk_uuid *uuid, void *dma_buf,
+		    uint32_t object_valid_bytes,
+		    s3_cache_fill_cb cb_fn, void *cb_arg)
+{
+	struct cache_slot *slot;
+	struct cache_fill *fill;
+	uint32_t n_blocks;
+	int rc;
+
+	if (!cache || !uuid || !dma_buf || !cb_fn || object_valid_bytes == 0) {
+		return -EINVAL;
+	}
+	assert(cache->owner_thread == spdk_get_thread());
+
+	if (cache->quiescing) {
+		return -ESHUTDOWN;
+	}
+	if (chunk_index >= cache->num_chunks ||
+	    object_valid_bytes > cache->chunk_size) {
+		return -EINVAL;
+	}
+
+	n_blocks = spdk_divide_round_up(object_valid_bytes, cache->block_size);
+
+	slot = slot_for_chunk(cache, chunk_index);
+	if (slot) {
+		if (slot->resident && spdk_uuid_compare(&slot->uuid, uuid) == 0) {
+			if (slot->filled_blocks == n_blocks) {
+				/* Whole object already here. */
+				slot_lru_touch(cache, slot);
+				return -EALREADY;
+			}
+			/* Same object, partly here: write the whole of it over
+			 * the slot. Same uuid means same bytes, so rewriting what
+			 * is present is harmless. */
+		} else if (slot->fills > 0 || slot->pins > 0) {
+			return -EBUSY;
+		} else {
+			slot_release(cache, slot);
+			slot = TAILQ_FIRST(&cache->free_slots);
+			assert(slot != NULL);
+			TAILQ_REMOVE(&cache->free_slots, slot, link);
+		}
+	} else {
+		slot = slot_acquire(cache);
+		if (!slot) {
+			return -ENOSPC;
+		}
+	}
+
+	fill = calloc(1, sizeof(*fill));
+	if (!fill) {
+		if (!slot->resident) {
+			TAILQ_INSERT_HEAD(&cache->free_slots, slot, link);
+		}
+		return -ENOMEM;
+	}
+
+	/* The tail of the last block, past the object's end, is never read back
+	 * (reads clamp to valid_bytes), but zero it so the device does not get
+	 * whatever the caller's buffer held there. */
+	if ((uint64_t)n_blocks * cache->block_size > object_valid_bytes) {
+		memset((uint8_t *)dma_buf + object_valid_bytes, 0,
+		       (size_t)n_blocks * cache->block_size - object_valid_bytes);
+	}
+
+	if (!slot->resident) {
+		spdk_uuid_copy(&slot->uuid, uuid);
+		slot->chunk_index = chunk_index;
+		slot->resident    = true;
+		cache->chunk_to_slot[chunk_index] = (uint32_t)(slot - cache->slots);
+		cache->resident++;
+	}
+	slot->valid_bytes = object_valid_bytes;
+
+	fill->cache       = cache;
+	fill->slot        = slot;
+	fill->staging     = NULL;
+	fill->cb_fn       = cb_fn;
+	fill->cb_arg      = cb_arg;
+	fill->first_block = 0;
+	fill->n_blocks    = n_blocks;
+	fill->bytes       = object_valid_bytes;
+
+	slot->fills++;
+	slot_lru_remove(cache, slot);
+	cache->fills_in_flight++;
+
+	cache->frames++;
+	rc = spdk_bdev_write(cache->desc, cache->ch, dma_buf, slot_offset(cache, slot),
+			     (uint64_t)n_blocks * cache->block_size,
+			     cache_fill_done, fill);
+	if (rc != 0) {
+		cache->fills_in_flight--;
+		slot->fills--;
+		if (slot->fills == 0 && slot->pins == 0 &&
+		    slot->filled_blocks == 0) {
+			slot_release(cache, slot);
+		} else {
+			slot_lru_touch(cache, slot);
+		}
+		free(fill);
+		cache->stats.populates_dropped++;
+		cache->frames--;
+		cache_maybe_quiesced(cache);
+		return rc;
+	}
+	cache->frames--;
+	cache_maybe_quiesced(cache);
+	return 0;
 }
 
 void

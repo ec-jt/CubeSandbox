@@ -2974,6 +2974,104 @@ out:
 }
 SPDK_RPC_REGISTER("rcow_import_status", rpc_rcow_import_status, SPDK_RPC_RUNTIME)
 
+/* rcow_warm_lvol {lvol_name | device_name, lvs_name?, start?, parallel?}
+ *
+ * Make a volume's data -- its own clusters and every ancestor snapshot's --
+ * fully resident in the local read cache, so a restore that reads it does not
+ * go to S3 one small request at a time. start (default true) begins a warm-up
+ * when none is running; the reply is the status of the current or last one.
+ * A caller polls until state is "done" (or treats "failed" as degraded, not
+ * fatal: the data is still readable from S3, only slower). */
+struct rpc_warm_lvol {
+	char     *lvs_name;
+	char     *lvol_name;
+	char     *device_name;
+	bool      start;
+	uint32_t  parallel;
+};
+
+static void
+rpc_rcow_warm_lvol(struct spdk_jsonrpc_request *request,
+		   const struct spdk_json_val *params)
+{
+	struct rpc_warm_lvol req = { .start = true };
+	const struct spdk_json_object_decoder decoders[] = {
+		{"lvs_name", offsetof(struct rpc_warm_lvol, lvs_name), spdk_json_decode_string, true},
+		{"lvol_name", offsetof(struct rpc_warm_lvol, lvol_name), spdk_json_decode_string, true},
+		{"device_name", offsetof(struct rpc_warm_lvol, device_name), spdk_json_decode_string, true},
+		{"start", offsetof(struct rpc_warm_lvol, start), spdk_json_decode_bool, true},
+		{"parallel", offsetof(struct rpc_warm_lvol, parallel), spdk_json_decode_uint32, true},
+	};
+	struct s3lvol_warm_status st;
+	struct s3lvol_lvstore *lvs;
+	struct spdk_lvol *lvol;
+	struct rpc_json_buf buf;
+	struct spdk_json_write_ctx *w;
+	const char *name;
+	int rc;
+
+	if (!params || spdk_json_decode_object(params, decoders,
+					       SPDK_COUNTOF(decoders), &req)) {
+		rpc_lvol_respond_err(request, -EINVAL, "Invalid parameters");
+		goto out;
+	}
+	name = req.lvol_name ? req.lvol_name : req.device_name;
+	if (!name) {
+		rpc_lvol_respond_err(request, -EINVAL, "lvol_name is required");
+		goto out;
+	}
+	if (req.lvs_name) {
+		lvs = rpc_lvstore_for(request, req.lvs_name);
+		if (!lvs) {
+			goto out;
+		}
+		lvol = s3lvol_lvol_find(lvs, name);
+	} else {
+		lvol = s3lvol_lvol_find_any(name);
+		lvs = lvol ? s3lvol_lvstore_of_lvol(lvol) : NULL;
+	}
+	if (!lvol || !lvs) {
+		rpc_lvol_respond_err(request, -ENOENT, NULL);
+		goto out;
+	}
+	s3lvol_lvol_warm_status(lvs, lvol->name, &st);
+	if (req.start && st.state != S3LVOL_IMPORT_RUNNING) {
+		rc = s3lvol_lvol_warm(lvs, lvol, req.parallel);
+		if (rc != 0 && rc != -ENOTSUP) {
+			rpc_lvol_respond_err(request, rc, NULL);
+			goto out;
+		}
+		s3lvol_lvol_warm_status(lvs, lvol->name, &st);
+	}
+
+	w = rpc_json_buf_begin(&buf);
+	if (!w) {
+		rpc_lvol_respond_err(request, -ENOMEM, NULL);
+		goto out;
+	}
+	spdk_json_write_object_begin(w);
+	spdk_json_write_named_string(w, "lvol_name", lvol->name);
+	spdk_json_write_named_string(w, "state", s3lvol_import_state_name(st.state));
+	spdk_json_write_named_bool(w, "done", st.state == S3LVOL_IMPORT_DONE);
+	spdk_json_write_named_uint64(w, "chunks", st.requested);
+	spdk_json_write_named_uint64(w, "fetched", st.fetched);
+	spdk_json_write_named_uint64(w, "warmed", st.warmed);
+	spdk_json_write_named_uint64(w, "already", st.already);
+	spdk_json_write_named_uint64(w, "holes", st.holes);
+	spdk_json_write_named_uint64(w, "failed", st.failed);
+	spdk_json_write_named_uint64(w, "bytes", st.bytes);
+	spdk_json_write_named_uint64(w, "elapsed_ms", st.elapsed_ms);
+	spdk_json_write_named_int32(w, "error", st.error);
+	spdk_json_write_named_string(w, "error_msg", st.error ? spdk_strerror(-st.error) : "");
+	spdk_json_write_object_end(w);
+	rpc_json_buf_respond(request, w, &buf);
+out:
+	free(req.lvs_name);
+	free(req.lvol_name);
+	free(req.device_name);
+}
+SPDK_RPC_REGISTER("rcow_warm_lvol", rpc_rcow_warm_lvol, SPDK_RPC_RUNTIME)
+
 /* The decouples running right now, with how far each has got.
  *
  * The list arrives as a JSON array in string_value, so the caller parses the

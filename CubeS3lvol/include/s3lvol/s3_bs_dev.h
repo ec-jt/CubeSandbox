@@ -383,6 +383,39 @@ struct s3_bs_dev_stats {
 void s3_bs_dev_get_stats(struct spdk_bs_dev *bs_dev, struct s3_bs_dev_stats *out);
 
 /* ==========================================================================
+ * Cache warm-up
+ * ========================================================================== */
+
+struct s3_warm_stats {
+	uint64_t requested;   /* chunk indices handed in */
+	uint64_t fetched;     /* whole-object GETs issued */
+	uint64_t warmed;      /* objects written into the cache */
+	uint64_t already;     /* already resident, live in the overlay, or rewritten */
+	uint64_t holes;       /* unmapped: read as zeroes, nothing to cache */
+	uint64_t failed;
+	uint64_t bytes;
+	uint64_t elapsed_ms;
+};
+
+typedef void (*s3_bs_dev_warm_cb)(void *cb_arg, int status,
+				  const struct s3_warm_stats *stats);
+
+/**
+ * Make these device chunks fully resident in the local read cache, fetching each
+ * whole object once, at most \p window at a time (0 = default 32, max 128).
+ *
+ * Owner thread only. \p chunks is copied. \p cb_fn always runs exactly once,
+ * asynchronously or from inside this call, with 0 when every chunk is now
+ * resident (or needed nothing), the first error otherwise, or -ECANCELED when
+ * the device started tearing down. Teardown waits for running warm-ups.
+ *
+ * \return 0, or -EINVAL / -EXDEV / -ENOTSUP (no cache) / -ESHUTDOWN / -ENOMEM,
+ *         in which case \p cb_fn does not run.
+ */
+int s3_bs_dev_warm(struct spdk_bs_dev *bs_dev, const uint64_t *chunks, uint64_t n,
+		   uint32_t window, s3_bs_dev_warm_cb cb_fn, void *cb_arg);
+
+/* ==========================================================================
  * Read-only s3_export_bs_dev (the parent of a cross-node external snapshot)
  *
  * See s3lvol/s3_export.h -- it is not part of this module: read-only, no WAL /

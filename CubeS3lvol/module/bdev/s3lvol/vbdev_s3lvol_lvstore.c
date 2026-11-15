@@ -2822,6 +2822,8 @@ lvs_attach_lvols_done(struct lvs_setup_ctx *ctx)
 	}
 
 	ctx->status = 0;
+	/* Background, best effort: the attach does not wait for it. */
+	s3lvol_lvstore_warm_templates(lvs);
 	lvs_setup_report(ctx);
 }
 

@@ -251,6 +251,11 @@ struct s3_ctx {
 	 * way. Two things consult it -- ckpt_start() refuses to begin anything new,
 	 * and ckpt_finish() knows that a teardown is waiting for it. */
 	bool destroying;
+
+	/* Cache warm-ups in flight (s3_bs_dev_warm). Teardown waits for zero: a
+	 * warm-up holds GETs and cache fills that reach ctx and the cache. */
+	uint32_t warm_jobs;
+	bool teardown_waiting_warm;
 	bool source_hold;
 	bool scoped_source_hold;
 
@@ -2242,6 +2247,13 @@ s3_bs_dev_teardown(struct s3_ctx *ctx)
 	 * a delete still in flight then would be this owner mutating the bucket
 	 * after it advertised the lvstore as free. s3_deferred_deleted() resumes
 	 * here when the last one lands. */
+	if (ctx->warm_jobs > 0) {
+		SPDK_NOTICELOG("Destroying s3_bs_dev for '%s': waiting for %u cache "
+			       "warm-up(s) to stop\n", ctx->prefix, ctx->warm_jobs);
+		ctx->teardown_waiting_warm = true;
+		return;
+	}
+
 	if (ctx->deferred_inflight > 0) {
 		SPDK_NOTICELOG("Destroying s3_bs_dev for '%s': waiting for %u "
 			       "deferred delete(s) still in flight\n",
@@ -4223,4 +4235,288 @@ s3_bs_dev_kick_flusher(struct spdk_bs_dev *bs_dev)
 	if (ctx && ctx->flusher) {
 		s3_flusher_kick(ctx->flusher);
 	}
+}
+
+/* ==========================================================================
+ * Cache warm-up
+ *
+ * Make a set of chunks fully resident in the local read cache, fetching each
+ * whole object from S3 once, `window` at a time.
+ *
+ * Why this exists: the cache index is RAM-only, so every target restart brings
+ * the cache up empty. A sandbox restored from a template snapshot right after
+ * that reads the template's memory image and rootfs through the block device in
+ * small, scattered requests (memory restore is not prefaulted), and every one of
+ * them misses and becomes its own S3 range GET -- measured 0.1 to 9 s each, so
+ * the guest does not get ready inside the create's 30 s window. Template and
+ * base snapshots are read by every sandbox started from them, so they are kept
+ * warm on purpose instead of by accident.
+ *
+ * Correctness: a warm-up only ever adds cache entries tagged with the uuid the
+ * chunk map resolved at fetch time; an object is immutable, so the entry cannot
+ * be wrong. A chunk rewritten meanwhile simply resolves to a new uuid and the
+ * warmed entry is a miss, never stale data.
+ * ========================================================================== */
+
+#define S3_WARM_WINDOW_DEFAULT 32
+#define S3_WARM_WINDOW_MAX     128
+
+struct s3_warm_slot {
+	struct s3_warm_job *job;
+	void               *buf;
+	uint64_t            chunk;
+	struct spdk_uuid    uuid;
+	uint32_t            valid_bytes;
+	bool                busy;
+};
+
+struct s3_warm_job {
+	struct s3_ctx         *ctx;
+	uint64_t              *chunks;
+	uint64_t               n;
+	uint64_t               next;
+	uint32_t               window;
+	uint32_t               inflight;
+	struct s3_warm_slot   *slots;
+	struct s3_warm_stats   st;
+	uint64_t               start_us;
+	bool                   stopping;
+	int                    status;
+	s3_bs_dev_warm_cb      cb_fn;
+	void                  *cb_arg;
+};
+
+static uint64_t
+s3_warm_now_us(void)
+{
+	return spdk_get_ticks() * SPDK_SEC_TO_USEC / spdk_get_ticks_hz();
+}
+
+static void s3_warm_pump(struct s3_warm_job *job);
+
+static void
+s3_warm_finish(struct s3_warm_job *job)
+{
+	struct s3_ctx *ctx = job->ctx;
+	s3_bs_dev_warm_cb cb_fn = job->cb_fn;
+	void *cb_arg = job->cb_arg;
+	struct s3_warm_stats st = job->st;
+	int status = job->status;
+	uint32_t i;
+
+	st.elapsed_ms = (s3_warm_now_us() - job->start_us) / 1000;
+	for (i = 0; i < job->window; i++) {
+		spdk_dma_free(job->slots[i].buf);
+	}
+	free(job->slots);
+	free(job->chunks);
+	free(job);
+
+	assert(ctx->warm_jobs > 0);
+	ctx->warm_jobs--;
+	if (cb_fn) {
+		cb_fn(cb_arg, status, &st);
+	}
+	/* Last: teardown may free ctx. */
+	if (ctx->destroying && ctx->warm_jobs == 0 && ctx->teardown_waiting_warm) {
+		ctx->teardown_waiting_warm = false;
+		s3_bs_dev_teardown(ctx);
+	}
+}
+
+static void
+s3_warm_slot_done(struct s3_warm_slot *slot, int status)
+{
+	struct s3_warm_job *job = slot->job;
+
+	slot->busy = false;
+	assert(job->inflight > 0);
+	job->inflight--;
+	if (status == 0) {
+		job->st.warmed++;
+	} else if (status == -EALREADY) {
+		job->st.already++;
+	} else {
+		job->st.failed++;
+		if (job->status == 0) {
+			job->status = status;
+		}
+	}
+	s3_warm_pump(job);
+}
+
+static void
+s3_warm_fill_done(void *arg, int status)
+{
+	s3_warm_slot_done(arg, status);
+}
+
+static void
+s3_warm_get_done(void *arg, uint64_t bytes_read, int status)
+{
+	struct s3_warm_slot *slot = arg;
+	struct s3_warm_job *job = slot->job;
+	struct s3_ctx *ctx = job->ctx;
+	struct spdk_uuid now;
+	uint32_t now_valid = 0;
+	int rc;
+
+	if (status == 0 && bytes_read < slot->valid_bytes) {
+		status = -EIO;
+	}
+	if (status != 0) {
+		s3_warm_slot_done(slot, status);
+		return;
+	}
+	job->st.bytes += slot->valid_bytes;
+	/* The chunk may have been rewritten while the GET ran. The bytes are still
+	 * the old object's, and a cache entry under the old uuid would be a
+	 * harmless miss, but there is no point writing it. */
+	if (s3_chunk_map_lookup(ctx->chunk_map, slot->chunk, &now, &now_valid) != 0 ||
+	    spdk_uuid_compare(&now, &slot->uuid) != 0 || !ctx->cache || ctx->destroying) {
+		s3_warm_slot_done(slot, -EALREADY);
+		return;
+	}
+	rc = s3_cache_fill_chunk(ctx->cache, slot->chunk, &slot->uuid, slot->buf,
+				 slot->valid_bytes, s3_warm_fill_done, slot);
+	if (rc != 0) {
+		s3_warm_slot_done(slot, rc == -EALREADY ? -EALREADY : rc);
+	}
+}
+
+static void
+s3_warm_pump(struct s3_warm_job *job)
+{
+	struct s3_ctx *ctx = job->ctx;
+	char key[256];
+	uint32_t i;
+	int rc;
+
+	if (ctx->destroying || !ctx->cache) {
+		job->stopping = true;
+	}
+	while (!job->stopping && job->next < job->n && job->inflight < job->window) {
+		struct s3_warm_slot *slot = NULL;
+		uint64_t chunk = job->chunks[job->next++];
+		struct spdk_uuid uuid;
+		uint32_t valid = 0;
+
+		if (s3_chunk_map_lookup(ctx->chunk_map, chunk, &uuid, &valid) != 0 ||
+		    valid == 0) {
+			job->st.holes++;       /* reads as zeroes, nothing to cache */
+			continue;
+		}
+		if (s3_overlay_chunk_is_live(ctx->overlay, chunk)) {
+			job->st.already++;     /* served from the overlay anyway */
+			continue;
+		}
+		if (s3_cache_chunk_resident(ctx->cache, chunk, &uuid)) {
+			job->st.already++;
+			continue;
+		}
+		for (i = 0; i < job->window; i++) {
+			if (!job->slots[i].busy) {
+				slot = &job->slots[i];
+				break;
+			}
+		}
+		assert(slot != NULL);
+		slot->busy        = true;
+		slot->chunk       = chunk;
+		slot->valid_bytes = valid;
+		spdk_uuid_copy(&slot->uuid, &uuid);
+		job->inflight++;
+		job->st.fetched++;
+
+		s3_data_key(ctx, &uuid, key, sizeof(key));
+		rc = s3_get_range(ctx->client, key, 0, valid, slot->buf,
+				  s3_warm_get_done, slot);
+		if (rc != 0) {
+			job->st.fetched--;
+			s3_warm_slot_done(slot, rc);
+			return;   /* s3_warm_slot_done re-entered the pump */
+		}
+	}
+	if (job->inflight == 0 && (job->stopping || job->next >= job->n)) {
+		if (job->stopping && job->status == 0 && job->next < job->n) {
+			job->status = -ECANCELED;
+		}
+		s3_warm_finish(job);
+	}
+}
+
+int
+s3_bs_dev_warm(struct spdk_bs_dev *bs_dev, const uint64_t *chunks, uint64_t n,
+	       uint32_t window, s3_bs_dev_warm_cb cb_fn, void *cb_arg)
+{
+	struct s3_ctx *ctx = (struct s3_ctx *)bs_dev;
+	struct s3_warm_job *job;
+	uint32_t i;
+
+	if (!ctx || !cb_fn || (n > 0 && !chunks)) {
+		return -EINVAL;
+	}
+	assert(ctx->owner_thread == NULL || ctx->owner_thread == spdk_get_thread());
+	if (ctx->owner_thread && ctx->owner_thread != spdk_get_thread()) {
+		return -EXDEV;
+	}
+	if (!ctx->cache) {
+		return -ENOTSUP;
+	}
+	if (ctx->destroying) {
+		return -ESHUTDOWN;
+	}
+	if (window == 0) {
+		window = S3_WARM_WINDOW_DEFAULT;
+	}
+	if (window > S3_WARM_WINDOW_MAX) {
+		window = S3_WARM_WINDOW_MAX;
+	}
+	if (n > 0 && window > n) {
+		window = (uint32_t)n;
+	}
+	if (window == 0) {
+		window = 1;
+	}
+
+	job = calloc(1, sizeof(*job));
+	if (!job) {
+		return -ENOMEM;
+	}
+	job->ctx = ctx;
+	job->n = n;
+	job->window = window;
+	job->cb_fn = cb_fn;
+	job->cb_arg = cb_arg;
+	job->start_us = s3_warm_now_us();
+	job->st.requested = n;
+	job->chunks = calloc(n ? n : 1, sizeof(*job->chunks));
+	job->slots = calloc(window, sizeof(*job->slots));
+	if (!job->chunks || !job->slots) {
+		free(job->chunks);
+		free(job->slots);
+		free(job);
+		return -ENOMEM;
+	}
+	if (n) {
+		memcpy(job->chunks, chunks, n * sizeof(*chunks));
+	}
+	for (i = 0; i < window; i++) {
+		job->slots[i].job = job;
+		job->slots[i].buf = spdk_dma_malloc(1u << ctx->chunk_shift,
+						    S3LVOL_BLOCK_SIZE, NULL);
+		if (!job->slots[i].buf) {
+			while (i-- > 0) {
+				spdk_dma_free(job->slots[i].buf);
+			}
+			free(job->chunks);
+			free(job->slots);
+			free(job);
+			return -ENOMEM;
+		}
+	}
+
+	ctx->warm_jobs++;
+	s3_warm_pump(job);
+	return 0;
 }
