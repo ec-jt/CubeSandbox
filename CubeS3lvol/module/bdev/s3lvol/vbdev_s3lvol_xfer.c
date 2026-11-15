@@ -3197,10 +3197,40 @@ import_registry_saved(void *cb_arg, int status)
 	}
 }
 
+static void
+delta_clone_resized(void *cb_arg, int lvolerrno)
+{
+	struct import_ctx *ctx = cb_arg;
+
+	import_clone_done(ctx, ctx->created_lvol, lvolerrno);
+}
+
 /* Local clones need the same durable origin; they have no esnap to decouple. */
 static void
 import_local_clone_done(void *cb_arg, struct spdk_lvol *lvol, int lvolerrno)
 {
+	struct import_ctx *ctx = cb_arg;
+
+	if (lvolerrno == 0 && lvol && s3_export_manifest_is_delta(ctx->m)) {
+		struct spdk_lvol_store *store = s3lvol_lvstore_get_lvs(ctx->lvs);
+		uint64_t cur = spdk_blob_get_num_clusters(lvol->blob) *
+			       spdk_bs_get_cluster_size(store->blobstore);
+
+		if (cur < ctx->m->size_bytes) {
+			/* The sandbox grew its disk after cloning the template.
+			 * Grown before the import answers, so the caller sees the
+			 * size the origin will record. */
+			int rc;
+
+			ctx->created_lvol = lvol;
+			rc = s3lvol_lvol_resize(lvol, ctx->m->size_bytes,
+						delta_clone_resized, ctx);
+			if (rc != 0) {
+				import_clone_done(ctx, lvol, rc);
+			}
+			return;
+		}
+	}
 	import_clone_done(cb_arg, lvol, lvolerrno);
 }
 
@@ -5886,18 +5916,6 @@ delta_overlay_start(struct delta_overlay *o)
 	delta_overlay_next(o);
 }
 
-static void
-delta_overlay_resized(void *cb_arg, int lvolerrno)
-{
-	struct delta_overlay *o = cb_arg;
-
-	if (lvolerrno != 0) {
-		delta_overlay_finish(o, lvolerrno);
-		return;
-	}
-	delta_overlay_start(o);
-}
-
 static int
 delta_overlay_begin(struct import_ctx *ctx, struct spdk_lvol *lvol)
 {
@@ -5905,7 +5923,6 @@ delta_overlay_begin(struct import_ctx *ctx, struct spdk_lvol *lvol)
 	struct delta_overlay *o;
 	struct s3_target target;
 	struct s3_client *client = NULL;
-	uint64_t cur_size;
 	int rc;
 
 	if (!ctx->imp) {
@@ -5954,15 +5971,6 @@ delta_overlay_begin(struct import_ctx *ctx, struct spdk_lvol *lvol)
 		goto err;
 	}
 
-	cur_size = spdk_blob_get_num_clusters(lvol->blob) * spdk_bs_get_cluster_size(store->blobstore);
-	if (cur_size < o->m->size_bytes) {
-		/* The sandbox grew its disk after cloning the template. */
-		rc = s3lvol_lvol_resize(lvol, o->m->size_bytes, delta_overlay_resized, o);
-		if (rc != 0) {
-			goto err;
-		}
-		return 0;
-	}
 	delta_overlay_start(o);
 	return 0;
 err:
