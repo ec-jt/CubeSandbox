@@ -141,6 +141,9 @@ func (s *SandboxImport) Rootfs(ctx context.Context, gen uint32) (string, string,
 		return "", "", fmt.Errorf("cross-node restore of sandbox %s carries no rootfs export", s.SandboxID)
 	}
 	name := SandboxRootfsName(s.SandboxID, gen)
+	if err := ensureDeltaBase(ctx, s.UUIDs.TemplateID, TemplateBaseRoleRootfs, s.UUIDs.RootfsBase); err != nil {
+		return "", "", fmt.Errorf("cross-node restore of sandbox %s: rootfs: %w", s.SandboxID, err)
+	}
 	dev, err := s.importOne(ctx, name, "rootfs", uuid)
 	if err != nil {
 		return "", "", err
@@ -157,6 +160,9 @@ func (s *SandboxImport) Memory(ctx context.Context) (string, string, error) {
 		return "", "", nil
 	}
 	name := SandboxMemoryName(s.SandboxID)
+	if err := ensureDeltaBase(ctx, s.UUIDs.TemplateID, TemplateBaseRoleMemory, s.UUIDs.MemoryBase); err != nil {
+		return "", "", fmt.Errorf("cross-node restore of sandbox %s: memory: %w", s.SandboxID, err)
+	}
 	dev, err := s.importOne(ctx, name, "memory", uuid)
 	if err != nil {
 		return "", "", err

@@ -28,6 +28,7 @@ import (
 	"github.com/tencentcloud/CubeSandbox/Cubelet/pkg/utils"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/plugins/chi"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/plugins/cube/internals/cubes"
+	"github.com/tencentcloud/CubeSandbox/Cubelet/storage"
 	"github.com/tencentcloud/CubeSandbox/pkgs/CubeLog"
 	cubebox "github.com/tencentcloud/CubeSandbox/pkgs/proto/services/cubebox/v1"
 	"github.com/tencentcloud/CubeSandbox/pkgs/proto/services/errorcode/v1"
@@ -233,6 +234,18 @@ func (s *service) CreateImage(ctx context.Context, req *images.CreateImageReques
 	if req.GetSpec() == nil {
 		rsp.Ret.RetMsg = "Spec should be provided"
 		rsp.Ret.RetCode = errorcode.ErrorCode_InvalidParamFormat
+		return rsp, nil
+	}
+
+	// Template-base operations ride on CreateImage (no proto change): Master
+	// sets an op annotation and the reply's RetMsg carries the result.
+	if handled, msg, err := storage.HandleTemplateBaseRequest(ctx, req.GetSpec().GetAnnotations()); handled {
+		if err != nil {
+			rsp.Ret.RetCode = errorcode.ErrorCode_Unknown
+			rsp.Ret.RetMsg = err.Error()
+		} else {
+			rsp.Ret.RetMsg = msg
+		}
 		return rsp, nil
 	}
 

@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/tencentcloud/CubeSandbox/Cubelet/storage/cow"
+	CubeLog "github.com/tencentcloud/CubeSandbox/pkgs/CubeLog"
 )
 
 type s3UploadEntry struct {
@@ -75,8 +76,10 @@ func (m *S3Cow) Upload(ctx context.Context, snapshotID string) (*cow.RemoteUUIDs
 		switch ref.Role {
 		case "rootfs":
 			uuids.Rootfs = uuid
+			uuids.RootfsBase = exportedBaseOf(settleCtx, ref.Name)
 		case "memory":
 			uuids.Memory = uuid
+			uuids.MemoryBase = exportedBaseOf(settleCtx, ref.Name)
 		case "metadata":
 			uuids.Metadata = uuid
 		}
@@ -100,6 +103,21 @@ func (m *S3Cow) Upload(ctx context.Context, snapshotID string) (*cow.RemoteUUIDs
 	// Export accepted; upload may still be in flight on the S3 backend.
 	m.setUpload(id, cow.RemoteStateRunning, "export started", uuids)
 	return uuids, nil
+}
+
+// exportedBaseOf names the template base a just-exported snapshot was
+// published as a delta over. s3lvol stops at a base only with
+// S3LVOL_EXPORT_TEMPLATE_DELTA on, and templateBaseBelow answers "" otherwise,
+// so with the writer off the remote uuids stay exactly as they were. A lookup
+// failure is not fatal: with no base recorded, an importing node that lacks
+// the base fails closed in s3lvol rather than reading wrong data.
+var exportedBaseOf = func(ctx context.Context, snapshot string) string {
+	base, err := templateBaseBelow(ctx, snapshot)
+	if err != nil {
+		CubeLog.Warnf("template base of %s: %v", snapshot, err)
+		return ""
+	}
+	return base
 }
 
 // exportSettleBudget caps the total time Upload spends spacing out a

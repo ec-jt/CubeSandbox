@@ -1037,6 +1037,27 @@ func (l *local) prefetchRestoreMemoryVolURL(ctx context.Context, opts *workflow.
 	if volumeName == "" {
 		return "", "", nil
 	}
+	// CUBE_TEMPLATE_S3_DISTRIBUTION: a template cold start clones its memory
+	// off the distributed base when this node holds it, so the sandbox's
+	// pause export is a delta over a snapshot every node has.
+	if pauseOwner == "" && strings.TrimSpace(annotations[constants.MasterAnnotationRuntimeSnapshotID]) == "" {
+		if snap := templateBaseSnapshotFor(ctx, annotations, TemplateBaseRoleMemory); snap != "" {
+			if sb := strings.TrimSpace(opts.GetSandboxID()); sb != "" {
+				store, serr := l.storeForBackend(backend)
+				if serr != nil {
+					return "", "", serr
+				}
+				cloned, cerr := store.CloneSandboxMemory(ctx, sb, snap)
+				if cerr != nil {
+					return "", "", fmt.Errorf("clone template base memory %s for sandbox %s: %w", snap, sb, cerr)
+				}
+				if cloned == nil || strings.TrimSpace(cloned.FilePath) == "" {
+					return "", "", fmt.Errorf("clone template base memory %s: empty device path", snap)
+				}
+				return cowFileURLFromPath(cloned.FilePath), cloned.VolumeName, nil
+			}
+		}
+	}
 	if pauseOwner != "" {
 		store, err := l.storeForBackend(backend)
 		if err != nil {
@@ -1400,6 +1421,15 @@ func (l *local) allocateSnapshotRootfs(ctx context.Context, opts *workflow.Creat
 			return nil, err
 		}
 		return newCowVolume(name, cowKindVolume, 0, dev), nil
+	}
+	// CUBE_TEMPLATE_S3_DISTRIBUTION: clone the distributed base instead of
+	// the node-local build, so this sandbox's exports are deltas over bytes
+	// every node holds. Only for a template cold start: a pause resume or a
+	// snapshot restore clones its own package.
+	if strings.TrimSpace(opts.ReqInfo.GetAnnotations()[constants.MasterAnnotationRuntimeSnapshotID]) == "" {
+		if snap := templateBaseSnapshotFor(ctx, opts.ReqInfo.GetAnnotations(), TemplateBaseRoleRootfs); snap != "" {
+			return store.RollbackDeriveNewGen(ctx, sandboxID, snap, 0, desiredSizeBytes)
+		}
 	}
 	// Cold start and same-node Pause Resume: always clone the package rootfs
 	// snapshot into a sandbox-private RW volume (sb-<id>-rootfs-genN). Do not

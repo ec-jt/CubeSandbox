@@ -46,6 +46,15 @@ type RemoteUUIDs struct {
 	Rootfs   string `json:"rootfs,omitempty"`
 	Memory   string `json:"memory,omitempty"`
 	Metadata string `json:"metadata,omitempty"`
+
+	// Template bases the rootfs / memory exports are deltas over (manifest
+	// version 5), recorded at pause when the s3lvol writer produced a delta.
+	// Empty for full exports. A node importing a delta installs the base
+	// first; an older reader ignores these and the import fails closed in
+	// s3lvol, which refuses version 5 without its base.
+	RootfsBase string `json:"rootfs_base,omitempty"`
+	MemoryBase string `json:"memory_base,omitempty"`
+	TemplateID string `json:"template_id,omitempty"`
 }
 
 func (u *RemoteUUIDs) Empty() bool {
