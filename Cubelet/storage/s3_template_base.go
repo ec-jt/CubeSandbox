@@ -177,28 +177,36 @@ var s3lvolCall = func(ctx context.Context, method string, params any, out any) e
 // decodeS3lvolResult decodes an s3lvol reply into out. Most s3lvol replies,
 // including every JSON-document reply (rcow_get_template_bases,
 // rcow_get_snapshot_status, rcow_get_exports), travel inside the envelope
-// {"bool_value": true, "string_value": "<document>"}. A caller that asks for
-// the envelope itself (*rpcStringValue) gets it as is; any other out gets the
-// document carried in string_value. Decoding the envelope straight into a
-// document struct succeeds with every field empty, which is how a live base
-// looked absent and every export status looked like "".
+// {"bool_value": true, "string_value": "<document>"}, and most failures come
+// back the same way with bool_value false and the message in string_value --
+// not as a JSON-RPC error. So:
+//   - bool_value false is an error for every caller, including out == nil
+//     (rcow_mark_template_base) and *rpcStringValue (rcow_export_snapshot,
+//     which otherwise took the error text for an export uuid);
+//   - a caller that asks for the envelope (*rpcStringValue) gets it as is;
+//   - any other out gets the document carried in string_value. Decoding the
+//     envelope straight into a document struct succeeds with every field
+//     empty, which is how a live base looked absent and every export status
+//     looked like "".
 func decodeS3lvolResult(method string, raw json.RawMessage, out any) error {
-	if out == nil || len(raw) == 0 {
+	if len(raw) == 0 {
 		return nil
 	}
-	if _, wantsEnvelope := out.(*rpcStringValue); !wantsEnvelope {
-		var env struct {
-			BoolValue   *bool   `json:"bool_value"`
-			StringValue *string `json:"string_value"`
-		}
-		if json.Unmarshal(raw, &env) == nil && env.BoolValue != nil && env.StringValue != nil {
-			if !*env.BoolValue {
-				return fmt.Errorf("s3lvol %s: %s", method, *env.StringValue)
-			}
-			doc := strings.TrimSpace(*env.StringValue)
-			if strings.HasPrefix(doc, "{") || strings.HasPrefix(doc, "[") {
-				raw = json.RawMessage(doc)
-			}
+	var env struct {
+		BoolValue   *bool   `json:"bool_value"`
+		StringValue *string `json:"string_value"`
+	}
+	isEnvelope := json.Unmarshal(raw, &env) == nil && env.BoolValue != nil && env.StringValue != nil
+	if isEnvelope && !*env.BoolValue {
+		return fmt.Errorf("s3lvol %s: %s", method, *env.StringValue)
+	}
+	if out == nil {
+		return nil
+	}
+	if _, wantsEnvelope := out.(*rpcStringValue); !wantsEnvelope && isEnvelope {
+		doc := strings.TrimSpace(*env.StringValue)
+		if strings.HasPrefix(doc, "{") || strings.HasPrefix(doc, "[") {
+			raw = json.RawMessage(doc)
 		}
 	}
 	if err := json.Unmarshal(raw, out); err != nil {

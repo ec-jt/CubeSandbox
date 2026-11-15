@@ -265,6 +265,16 @@ func TestDecodeS3lvolResultUnwrapsEnvelope(t *testing.T) {
 
 	raw = json.RawMessage(`{"bool_value":false,"string_value":"lvol not found"}`)
 	require.ErrorContains(t, decodeS3lvolResult("rcow_get_template_bases", raw, &bases), "lvol not found")
+
+	// Refusals travel as bool_value false for envelope callers and callers
+	// without an out too: rcow_export_snapshot must not take the message for
+	// a uuid, and rcow_mark_template_base must not swallow it.
+	raw = json.RawMessage(`{"bool_value":false,"string_value":"could not start exporting snapshot 's': File exists"}`)
+	env = rpcStringValue{}
+	require.ErrorContains(t, decodeS3lvolResult("rcow_export_snapshot", raw, &env), "File exists")
+	require.Empty(t, env.StringValue)
+	require.ErrorContains(t, decodeS3lvolResult("rcow_mark_template_base", raw, nil), "File exists")
+	require.NoError(t, decodeS3lvolResult("rcow_mark_template_base", json.RawMessage(`{"bool_value":true,"string_value":"u","anchor":"a"}`), nil))
 }
 
 func TestHandleTemplateBaseRequest(t *testing.T) {
