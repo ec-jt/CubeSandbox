@@ -392,6 +392,9 @@ func cleanupTemplateMetadata(ctx context.Context, templateID string) error {
 		Where("snapshot_id = ?", templateID).Delete(&models.SnapshotRecord{}).Error; err != nil {
 		cleanupErr = errors.Join(cleanupErr, err)
 	}
+	if err := retireTemplateBasesOf(ctx, templateID); err != nil {
+		cleanupErr = errors.Join(cleanupErr, err)
+	}
 	return cleanupErr
 }
 

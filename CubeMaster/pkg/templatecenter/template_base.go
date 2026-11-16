@@ -369,6 +369,20 @@ var templateBaseReferences = func(ctx context.Context, baseUUID string) (int64, 
 	return total, nil
 }
 
+// retireTemplateBasesOf marks every READY base of a deleted template RETIRED,
+// so gcTemplateBases releases them (and their replicas on every node) once
+// the grace period passed and no pause or snapshot row references them. A
+// deleted template's bases used to stay READY forever: nothing else retires
+// a base except a rebuild of the same template.
+func retireTemplateBasesOf(ctx context.Context, templateID string) error {
+	if strings.TrimSpace(templateID) == "" || store.db == nil {
+		return nil
+	}
+	return store.db.WithContext(ctx).Model(&models.TemplateBase{}).
+		Where("template_id = ? AND status = ?", templateID, TemplateBaseStatusReady).
+		Updates(map[string]any{"status": TemplateBaseStatusRetired, "updated_at": templateBaseNow()}).Error
+}
+
 // gcTemplateBases releases RETIRED bases that nothing references any more.
 func gcTemplateBases(ctx context.Context) error {
 	var retired []models.TemplateBase

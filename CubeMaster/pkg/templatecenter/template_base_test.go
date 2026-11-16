@@ -237,3 +237,40 @@ func TestTemplateBaseReferencesCountSnapshots(t *testing.T) {
 	require.Zero(t, n)
 	require.Equal(t, constants.SnapshotTableName, (models.SnapshotRecord{}).TableName())
 }
+
+// Deleting a template retires its bases; GC then releases them everywhere.
+func TestDeletedTemplateBasesAreRetiredAndCollected(t *testing.T) {
+	db := newTemplateBaseTestDB(t)
+	a, b := testNode("node-a", "10.0.0.1"), testNode("node-b", "10.0.0.2")
+	f := useFakeCubelets(t, []*node.Node{a, b})
+	t.Setenv(envTemplateBaseGCGrace, "0s")
+	ctx := context.Background()
+
+	f.publish = publishedBases{Rootfs: baseR1, Memory: baseM1}
+	def := seedBuilt(t, db, "tpl-del", "art-1", a)
+	require.NoError(t, publishTemplateBase(ctx, def))
+	require.NoError(t, installTemplateBases(ctx, def))
+	require.True(t, f.held["10.0.0.2"][baseR1])
+
+	// A READY base is never collected.
+	require.NoError(t, gcTemplateBases(ctx))
+	require.True(t, f.held["10.0.0.2"][baseR1])
+
+	require.NoError(t, retireTemplateBasesOf(ctx, "tpl-del"))
+	var n int64
+	require.NoError(t, db.Model(&models.TemplateBase{}).Where("template_id = ? AND status = ?", "tpl-del", TemplateBaseStatusRetired).Count(&n).Error)
+	require.EqualValues(t, 2, n)
+	require.Empty(t, TemplateBaseCreateAnnotations(ctx, "tpl-del"))
+
+	templateBaseNow = func() time.Time { return time.Now().Add(time.Minute) }
+	t.Cleanup(func() { templateBaseNow = time.Now })
+	require.NoError(t, gcTemplateBases(ctx))
+	for _, ip := range []string{"10.0.0.1", "10.0.0.2"} {
+		require.False(t, f.held[ip][baseR1], ip)
+		require.False(t, f.held[ip][baseM1], ip)
+	}
+	require.NoError(t, db.Model(&models.TemplateBase{}).Where("template_id = ?", "tpl-del").Count(&n).Error)
+	require.Zero(t, n)
+	require.NoError(t, db.Model(&models.TemplateBaseReplica{}).Where("base_uuid IN ?", []string{baseR1, baseM1}).Count(&n).Error)
+	require.Zero(t, n)
+}
