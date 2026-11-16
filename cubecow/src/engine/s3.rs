@@ -212,11 +212,33 @@ impl S3Engine {
         }
         let mut cleaned_index = name_index;
         cleaned_index.retain(|n, _| !n.starts_with(TMPCLONE_PREFIX));
-        if !leftovers.is_empty() {
+        let mut dirty = !leftovers.is_empty();
+        if dirty {
             warn!(
                 count = leftovers.len(),
                 "swept leftover __cbc_tmpclone_* entries at startup"
             );
+        }
+
+        // index.json is a local cache of names; s3lvol is the authority. An
+        // entry s3lvol no longer has (deleted out of band, lost on a crash
+        // between the native delete and the index write) makes every later
+        // ListVolumes count a name it cannot return, and the finalizer then
+        // refuses all publication with "incomplete S3 volume listing".
+        match native_lvol_names(&rpc) {
+            Some(native) => {
+                let dropped = reconcile_index_with_native(&mut cleaned_index, &native);
+                for name in &dropped {
+                    warn!(name = %name, "dropping index.json entry that s3lvol does not have");
+                }
+                if !dropped.is_empty() {
+                    warn!(count = dropped.len(), "reconciled s3 index.json against s3lvol");
+                    dirty = true;
+                }
+            }
+            None => warn!("s3lvol lvstores not fully loaded; skipping index.json reconcile"),
+        }
+        if dirty {
             persist_index(&s3_cfg.state_dir, &cleaned_index)?;
         }
 
@@ -1572,6 +1594,46 @@ fn parse_snapshot_status(nested: &str) -> CubecowResult<(String, Option<bool>)> 
     Ok((status, deletable))
 }
 
+/// Names of every lvol s3lvol has loaded, or `None` when that answer is not
+/// authoritative (RPC failed, no lvstore, or any lvstore not fully loaded):
+/// pruning against a partial listing would drop live names.
+fn native_lvol_names(rpc: &JsonRpcClient) -> Option<std::collections::HashSet<String>> {
+    let resp = rpc.call_raw("rcow_get_lvstores", &serde_json::Value::Null).ok()?;
+    native_lvol_names_from(&resp)
+}
+
+fn native_lvol_names_from(resp: &serde_json::Value) -> Option<std::collections::HashSet<String>> {
+    let stores = resp.as_array()?;
+    if stores.is_empty() {
+        return None;
+    }
+    let mut out = std::collections::HashSet::new();
+    for store in stores {
+        let state = store.get("lifecycle").and_then(|l| l.get("state")).and_then(|s| s.as_str());
+        if state != Some("loaded") {
+            return None;
+        }
+        for lvol in store.get("lvols")?.as_array()? {
+            out.insert(lvol.get("name")?.as_str()?.to_string());
+        }
+    }
+    Some(out)
+}
+
+/// Drop index entries whose name s3lvol does not have. Returns the dropped
+/// names, sorted.
+fn reconcile_index_with_native(
+    idx: &mut HashMap<String, NameKind>,
+    native: &std::collections::HashSet<String>,
+) -> Vec<String> {
+    let mut dropped: Vec<String> = idx.keys().filter(|n| !native.contains(*n)).cloned().collect();
+    dropped.sort();
+    for n in &dropped {
+        idx.remove(n);
+    }
+    dropped
+}
+
 /// Map an s3lvol textual error into the closest [`CubecowError`].
 fn map_rpc_error(msg: &str) -> CubecowError {
     let lower = msg.to_lowercase();
@@ -1664,6 +1726,38 @@ fn persist_index(state_dir: &Path, idx: &HashMap<String, NameKind>) -> std::io::
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn lvstores(state: &str, names: &[&str]) -> serde_json::Value {
+        serde_json::json!([{ "lvs_name":"rcow-x", "lifecycle":{"state":state},
+            "lvols": names.iter().map(|n| serde_json::json!({"name":n})).collect::<Vec<_>>() }])
+    }
+
+    #[test]
+    fn index_reconcile_drops_names_s3lvol_lacks() {
+        let native = native_lvol_names_from(&lvstores("loaded", &["live", "snap"])).unwrap();
+        let mut idx = HashMap::from([
+            ("live".to_string(), NameKind::Volume { size_bytes: 1, created_at: "t".into(), activated: None }),
+            ("snap".to_string(), NameKind::Snapshot { origin_volume: "live".into(), size_bytes: 1, created_at: "t".into(), activated: None, export_uuid: String::new() }),
+            ("gone-b".to_string(), NameKind::Volume { size_bytes: 1, created_at: "t".into(), activated: None }),
+            ("gone-a".to_string(), NameKind::Volume { size_bytes: 1, created_at: "t".into(), activated: None }),
+        ]);
+        assert_eq!(reconcile_index_with_native(&mut idx, &native), vec!["gone-a", "gone-b"]);
+        let mut keys: Vec<_> = idx.keys().cloned().collect(); keys.sort();
+        assert_eq!(keys, vec!["live", "snap"]);
+        assert!(reconcile_index_with_native(&mut idx, &native).is_empty());
+    }
+
+    #[test]
+    fn index_reconcile_skips_unauthoritative_listings() {
+        assert!(native_lvol_names_from(&lvstores("loading", &["a"])).is_none());
+        assert!(native_lvol_names_from(&serde_json::json!([])).is_none());
+        assert!(native_lvol_names_from(&serde_json::json!({"bool_value":false})).is_none());
+        assert!(native_lvol_names_from(&serde_json::json!([{"lifecycle":{"state":"loaded"}}])).is_none());
+        let two = serde_json::json!([
+            {"lifecycle":{"state":"loaded"},"lvols":[{"name":"a"}]},
+            {"lifecycle":{"state":"loaded"},"lvols":[{"name":"b"}]}]);
+        assert_eq!(native_lvol_names_from(&two).unwrap().len(), 2);
+    }
 
     #[test]
     fn capacity_geometry_rejects_invalid_and_identity_mismatch() {
