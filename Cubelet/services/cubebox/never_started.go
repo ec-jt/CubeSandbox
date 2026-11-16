@@ -45,6 +45,9 @@ type runtimeProbe interface {
 	ContainerExists(ctx context.Context, id string) (bool, error)
 	TaskExists(ctx context.Context, id string) (bool, error)
 	ShimExists(ctx context.Context, id string) (bool, error)
+	// ProcessExists reports a live host process whose command line names
+	// the id (shim "-id <id>", VMM paths under the sandbox id).
+	ProcessExists(ctx context.Context, id string) (bool, error)
 }
 
 // shimStateRoots are the host directories where a shim keeps its bundle
@@ -101,6 +104,41 @@ func (p *containerdRuntimeProbe) ShimExists(ctx context.Context, id string) (boo
 	return false, nil
 }
 
+// procRoot is a variable so tests can point the process scan at a fake tree.
+var procRoot = "/proc"
+
+func (p *containerdRuntimeProbe) ProcessExists(_ context.Context, id string) (bool, error) {
+	return hostProcessMentions(procRoot, id)
+}
+
+// hostProcessMentions scans procRoot/<pid>/cmdline for id. A process that
+// exits during the scan is skipped; any other read failure of the directory
+// itself is an error (cannot tell).
+func hostProcessMentions(root, id string) (bool, error) {
+	if strings.TrimSpace(id) == "" {
+		return false, fmt.Errorf("empty id")
+	}
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		return false, err
+	}
+	self := fmt.Sprint(os.Getpid())
+	for _, e := range entries {
+		name := e.Name()
+		if name == self || name == "" || name[0] < '0' || name[0] > '9' {
+			continue
+		}
+		raw, err := os.ReadFile(filepath.Join(root, name, "cmdline"))
+		if err != nil {
+			continue
+		}
+		if strings.Contains(string(raw), id) {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
 func existsFromErr(err error) (bool, error) {
 	if err == nil {
 		return true, nil
@@ -149,31 +187,100 @@ func (l *local) provablyNeverStarted(ctx context.Context, sb *cubeboxstore.CubeB
 	if sb.Endpoint.Pid != 0 {
 		return false, fmt.Sprintf("record carries endpoint pid %d", sb.Endpoint.Pid)
 	}
+	if reason, ok := l.noRuntimeArtifacts(ctx, sb, false); !ok {
+		return false, reason
+	}
+	return true, "pid 0, never started, no containerd container, task or shim"
+}
+
+// noRuntimeArtifacts asks containerd and the host for any trace of a runtime
+// for the sandbox and its containers. withProcess adds the host process scan.
+// It returns ok=false with the reason on any trace or query error.
+func (l *local) noRuntimeArtifacts(ctx context.Context, sb *cubeboxstore.CubeBox, withProcess bool) (string, bool) {
 	ns := sb.Namespace
 	if ns == "" {
 		ns = namespaces.Default
 	}
 	ctx = namespaces.WithNamespace(ctx, ns)
 	probe := l.runtimeEvidenceProbe()
+	type check struct {
+		what string
+		fn   func(context.Context, string) (bool, error)
+	}
+	checks := []check{
+		{"containerd container", probe.ContainerExists},
+		{"containerd task", probe.TaskExists},
+		{"shim", probe.ShimExists},
+	}
+	if withProcess {
+		checks = append(checks, check{"host process", probe.ProcessExists})
+	}
 	for _, id := range sandboxShimLookupIDs(sb) {
-		for _, check := range []struct {
-			what string
-			fn   func(context.Context, string) (bool, error)
-		}{
-			{"containerd container", probe.ContainerExists},
-			{"containerd task", probe.TaskExists},
-			{"shim", probe.ShimExists},
-		} {
-			exists, err := check.fn(ctx, id)
+		for _, c := range checks {
+			exists, err := c.fn(ctx, id)
 			if err != nil {
-				return false, fmt.Sprintf("cannot query %s for %s: %v", check.what, id, err)
+				return fmt.Sprintf("cannot query %s for %s: %v", c.what, id, err), false
 			}
 			if exists {
-				return false, fmt.Sprintf("%s exists for %s", check.what, id)
+				return fmt.Sprintf("%s exists for %s", c.what, id), false
 			}
 		}
 	}
-	return true, "pid 0, never started, no containerd container, task or shim"
+	return "", true
+}
+
+// provablyExited reports whether a persisted record that did run is now
+// provably without a runtime. This covers a record recovered after a Cubelet
+// restart: its status says EXITED but it carries no pid (pids are not
+// persisted), so Destroy had no pid to wait on and refused forever with
+// "runtime ownership unknown". It requires, failing closed on any doubt:
+//   - no snapshot publication hold, not paused or pausing;
+//   - the sandbox status is EXITED (FinishedAt set) and no status carries a pid;
+//   - no runtime start attempted in this process that is unresolved;
+//   - containerd has no container, task or shim and no shim bundle directory
+//     exists for the sandbox or any of its containers;
+//   - no live host process names the sandbox or container ids.
+func (l *local) provablyExited(ctx context.Context, sb *cubeboxstore.CubeBox) (bool, string) {
+	if sb == nil {
+		return false, "no record"
+	}
+	if sb.GetPublicationHold() != nil {
+		return false, "snapshot publication hold"
+	}
+	if sb.GetStatus() == nil {
+		return false, "record has no status"
+	}
+	if e := workflow.LifecycleCleanupFrom(ctx); e != nil && e.RuntimeMayExist && !e.RuntimeGone {
+		return false, "a runtime start was attempted in this process and is unresolved"
+	}
+	main := sb.GetStatus().Get()
+	if main.PausedAt != 0 || main.PausingAt != 0 {
+		return false, fmt.Sprintf("record is paused (state %s)", main.State())
+	}
+	if main.FinishedAt == 0 {
+		return false, fmt.Sprintf("record has not exited (state %s)", main.State())
+	}
+	statuses := []*cubeboxstore.StatusStorage{sb.GetStatus()}
+	for _, ctr := range sb.AllContainers() {
+		if ctr != nil {
+			statuses = append(statuses, ctr.Status)
+		}
+	}
+	for _, s := range statuses {
+		if s == nil {
+			continue
+		}
+		if pid := s.Get().Pid; pid != 0 {
+			return false, fmt.Sprintf("record carries pid %d", pid)
+		}
+	}
+	if sb.Endpoint.Pid != 0 {
+		return false, fmt.Sprintf("record carries endpoint pid %d", sb.Endpoint.Pid)
+	}
+	if reason, ok := l.noRuntimeArtifacts(ctx, sb, true); !ok {
+		return false, reason
+	}
+	return true, "exited, pid 0, no containerd container, task, shim or host process"
 }
 
 // recordRollbackReleasesStorage applies the Create rollback policy to a
@@ -201,6 +308,18 @@ func (l *local) requireRuntimeCleanupEvidenceFor(ctx context.Context, sb *cubebo
 	id := sb.ID
 	ok, reason := l.provablyNeverStarted(ctx, sb)
 	if !ok {
+		// A record that ran and exited, recovered without pids after a
+		// restart, can still prove its runtime is gone. Storage policy is
+		// the ordinary Destroy policy: PreserveStorage is left as it is.
+		if exited, why := l.provablyExited(ctx, sb); exited {
+			if evidence := workflow.LifecycleCleanupFrom(ctx); evidence != nil {
+				log.G(ctx).Warnf("sandbox %s: %s; runtime absence proven, releasing record", id, why)
+				workflow.MarkRuntimeGone(ctx)
+				return nil
+			}
+		} else {
+			reason = reason + "; " + why
+		}
 		log.G(ctx).Infof("sandbox %s: runtime absence not provable: %s", id, reason)
 		return requireRuntimeCleanupEvidence(ctx, id)
 	}

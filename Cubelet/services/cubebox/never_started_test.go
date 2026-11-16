@@ -29,8 +29,8 @@ import (
 )
 
 type fakeRuntimeProbe struct {
-	containers, tasks, shims map[string]bool
-	err                      error
+	containers, tasks, shims, procs map[string]bool
+	err                             error
 }
 
 func (f *fakeRuntimeProbe) check(m map[string]bool, id string) (bool, error) {
@@ -47,6 +47,9 @@ func (f *fakeRuntimeProbe) TaskExists(_ context.Context, id string) (bool, error
 }
 func (f *fakeRuntimeProbe) ShimExists(_ context.Context, id string) (bool, error) {
 	return f.check(f.shims, id)
+}
+func (f *fakeRuntimeProbe) ProcessExists(_ context.Context, id string) (bool, error) {
+	return f.check(f.procs, id)
 }
 
 // crossNodeRecord mirrors the record left on the target node in the
