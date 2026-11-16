@@ -69,12 +69,13 @@ type s3MetadataKV interface {
 var (
 	formatS3MetadataBaseDevice = formatS3MetadataBaseDeviceImpl
 	mountS3MetadataDevice      = mountS3MetadataDeviceImpl
-	// mountS3MetadataDeviceTimeout mounts with an explicit timeout instead of
-	// cmdTimeout. Used for the imported metadata disk of a cross-node restore
-	// (B19, MountImportedS3MetadataAt).
+	// mountS3MetadataDeviceTimeout mounts with an explicit timeout. Every
+	// metadata mount goes through it (metadata_mount_timeout, retried; the
+	// imported disk of a cross-node restore may ask for a longer one, B19).
 	mountS3MetadataDeviceTimeout = mountS3MetadataDeviceTimeoutImpl
 	unmountS3MetadataPath        = unmountS3MetadataPathImpl
 	s3MetadataIsMounted          = s3MetadataIsMountedImpl
+	s3MetadataMountSourceFn      = s3MetadataMountSourceImpl
 
 	s3MetadataMu     sync.Mutex
 	s3MetadataMounts = map[string]string{} // snapshotID → current mount path
@@ -409,7 +410,7 @@ func MountS3MetadataAt(ctx context.Context, backend, snapshotID, mountPath strin
 // MountImportedS3MetadataAt is MountS3MetadataAt for the metadata disk a
 // cross-node restore imported (B19). Its mount gets importedMountTimeout
 // (storage config imported_metadata_mount_timeout, default 120s) rather than
-// the global cmdTimeout (default 3s): the import has already been waited to
+// metadata_mount_timeout (default 60s) when larger: the import was waited to
 // local by then, but the first mount of a freshly decoupled disk still does
 // ext4 journal and inode-table reads that do not belong under a 3s budget.
 func MountImportedS3MetadataAt(ctx context.Context, backend, snapshotID, mountPath string) error {
@@ -686,10 +687,24 @@ func mountS3MetadataLocked(snapshotID, devicePath, mountPath string) error {
 	return mountS3MetadataLockedTimeout(snapshotID, devicePath, mountPath, 0)
 }
 
-// mountS3MetadataLockedTimeout mounts with cmdTimeout when timeout is 0, and
-// with timeout otherwise.
+// effectiveMetadataMountTimeout is the timeout one metadata mount attempt
+// gets: metadataMountTimeout (storage config metadata_mount_timeout, default
+// 60s) unless the caller asks for a longer one. cmd_timeout (default 3s) is
+// never used for metadata mounts: the first mount of a freshly derived or
+// imported s3lvol disk reads the ext4 superblock and group descriptors
+// through the s3lvol cache, and a cold read there can take seconds.
+func effectiveMetadataMountTimeout(requested time.Duration) time.Duration {
+	if requested > metadataMountTimeout {
+		return requested
+	}
+	return metadataMountTimeout
+}
+
+// mountS3MetadataLockedTimeout mounts with effectiveMetadataMountTimeout and
+// retries a failed mount up to metadataMountAttempts times in total.
 func mountS3MetadataLockedTimeout(snapshotID, devicePath, mountPath string,
 	timeout time.Duration) error {
+	timeout = effectiveMetadataMountTimeout(timeout)
 	if err := pathutil.ValidateNoTraversal(mountPath); err != nil {
 		return fmt.Errorf("invalid s3 metadata mount path: %w", err)
 	}
@@ -713,17 +728,34 @@ func mountS3MetadataLockedTimeout(snapshotID, devicePath, mountPath string,
 			return fmt.Errorf("s3 metadata mount %s busy (%s), umount for %s: %w", mountPath, src, want, err)
 		}
 	}
-	mount := mountS3MetadataDevice
-	if timeout > 0 {
-		mount = func(dev, path string) error {
-			return mountS3MetadataDeviceTimeout(dev, path, timeout)
+	attempts := metadataMountAttempts
+	if attempts < 1 {
+		attempts = 1
+	}
+	var lastErr error
+	for attempt := 1; attempt <= attempts; attempt++ {
+		lastErr = mountS3MetadataDeviceTimeout(devicePath, mountPath, timeout)
+		if lastErr == nil {
+			s3MetadataMounts[snapshotID] = filepath.Clean(mountPath)
+			return nil
 		}
+		if attempt == attempts {
+			break
+		}
+		CubeLog.Warnf("mount s3 metadata %s at %s attempt %d/%d failed, retrying: %v",
+			devicePath, mountPath, attempt, attempts, lastErr)
+		// A mount that timed out may still have completed in the kernel.
+		if s3MetadataIsMounted(mountPath) {
+			src := s3MetadataMountSource(mountPath)
+			want := filepath.Clean(strings.TrimSpace(devicePath))
+			if src != "" && (src == want || filepath.Base(src) == filepath.Base(want)) {
+				s3MetadataMounts[snapshotID] = filepath.Clean(mountPath)
+				return nil
+			}
+		}
+		metadataMountRetrySleep(time.Duration(attempt) * metadataMountRetryBackoff)
 	}
-	if err := mount(devicePath, mountPath); err != nil {
-		return err
-	}
-	s3MetadataMounts[snapshotID] = filepath.Clean(mountPath)
-	return nil
+	return fmt.Errorf("after %d attempt(s): %w", attempts, lastErr)
 }
 
 func unmountS3MetadataPathIfMounted(mountPath string) error {
@@ -883,7 +915,7 @@ func formatS3MetadataBaseDeviceImpl(devicePath string) error {
 		{"mkfs.ext4", "-F", "-O", "^has_journal", "-b", "4096", devicePath},
 	}
 	for _, cmd := range cmds {
-		if _, stderr, err := utils.ExecV(cmd, cmdTimeout); err != nil {
+		if _, stderr, err := utils.ExecV(cmd, metadataMountTimeout); err != nil {
 			return fmt.Errorf("mkfs.ext4 s3 metadata base failed:%s", stderr)
 		}
 	}
@@ -891,7 +923,7 @@ func formatS3MetadataBaseDeviceImpl(devicePath string) error {
 }
 
 func mountS3MetadataDeviceImpl(devicePath, mountPath string) error {
-	return mountS3MetadataDeviceTimeoutImpl(devicePath, mountPath, cmdTimeout)
+	return mountS3MetadataDeviceTimeoutImpl(devicePath, mountPath, metadataMountTimeout)
 }
 
 func mountS3MetadataDeviceTimeoutImpl(devicePath, mountPath string, timeout time.Duration) error {
@@ -907,8 +939,8 @@ func mountS3MetadataDeviceTimeoutImpl(devicePath, mountPath string, timeout time
 }
 
 func unmountS3MetadataPathImpl(mountPath string) error {
-	if _, stderr, err := utils.ExecV([]string{"umount", mountPath}, cmdTimeout); err != nil {
-		if _, _, lazyErr := utils.ExecV([]string{"umount", "-l", mountPath}, cmdTimeout); lazyErr != nil {
+	if _, stderr, err := utils.ExecV([]string{"umount", mountPath}, metadataMountTimeout); err != nil {
+		if _, _, lazyErr := utils.ExecV([]string{"umount", "-l", mountPath}, metadataMountTimeout); lazyErr != nil {
 			return fmt.Errorf("umount s3 metadata %s failed:%s", mountPath, stderr)
 		}
 	}
@@ -939,7 +971,7 @@ func s3MetadataIsMountedImpl(mountPath string) bool {
 }
 
 // s3MetadataMountSource returns the mount source device for mountPath (e.g. /dev/nvme6n1), or "".
-func s3MetadataMountSource(mountPath string) string {
+func s3MetadataMountSourceImpl(mountPath string) string {
 	mountPath = filepath.Clean(strings.TrimSpace(mountPath))
 	if mountPath == "" || mountPath == "." {
 		return ""
@@ -980,4 +1012,8 @@ func s3MetadataIsMountedByDev(mountPath string) bool {
 		return false
 	}
 	return st.Dev != parent.Dev
+}
+
+func s3MetadataMountSource(mountPath string) string {
+	return s3MetadataMountSourceFn(mountPath)
 }

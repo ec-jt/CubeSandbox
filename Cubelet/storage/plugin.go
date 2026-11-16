@@ -120,6 +120,16 @@ type Config struct {
 	// (B19). Default 120s.
 	ImportedMetadataMountTimeout tomlext.Duration `toml:"imported_metadata_mount_timeout"`
 
+	// MetadataMountTimeout bounds one mount, umount or base mkfs of an
+	// s3-meta-* metadata disk (pause, create, template). Used instead of
+	// cmd_timeout. Default 60s. The imported-disk mount uses the larger of
+	// this and imported_metadata_mount_timeout.
+	MetadataMountTimeout tomlext.Duration `toml:"metadata_mount_timeout"`
+
+	// MetadataMountAttempts is the total number of attempts for a metadata
+	// disk mount before the request fails. Default 3.
+	MetadataMountAttempts int `toml:"metadata_mount_attempts"`
+
 	// VolumePlugins lists external volume plugin configurations.
 	// Built-in plugins are registered in code and do not need entries here.
 	//

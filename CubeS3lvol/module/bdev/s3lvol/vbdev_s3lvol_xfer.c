@@ -54,6 +54,7 @@
 #include "source_control_ticket.h"
 #include "export_admission_io.h"
 #include "export_b16_ctl.h"
+#include "lvol_warm_select.h"
 
 /* Serializes admission/detach with local publication and store lifetime. */
 struct admission_work {
@@ -1795,7 +1796,8 @@ s3lvol_lvol_warm_status(struct s3lvol_lvstore *lvs, const char *lvol_name,
 }
 
 /* Template snapshots are the volumes every restore reads, and their names say so
- * (tpl-*: tpl-tpl-<id>-rootfs, -memory-snap, versioned base snapshots). Warm them
+ * (tpl-tpl-<id>-rootfs, -memory-snap, versioned base snapshots, and the
+ * s3-meta-tpl-<id> package metadata disk). Warm them
  * once the lvstore is attached, so a target restart does not leave the next
  * restores reading S3 one small request at a time. */
 void
@@ -1809,15 +1811,11 @@ s3lvol_lvstore_warm_templates(struct s3lvol_lvstore *lvs)
 	if (!store || (off && (strcmp(off, "0") == 0 || strcasecmp(off, "false") == 0))) {
 		return;
 	}
-	/* Template volumes only: "tpl-tpl-<template>-..." covers the template
-	 * snapshots (rootfs, memory-snap) and the template-base anchors that
-	 * base-backed sandboxes clone from. "tpl-snap-*" are per-sandbox pause
-	 * snapshots and are deliberately not warmed here: there can be many and
-	 * they would push the shared template data out of the cache. The build
-	 * volumes are scratch and never read by a sandbox. */
+	/* Template volumes only (tpl-tpl-* and the s3-meta-tpl-* package
+	 * metadata disks); see lvol_warm_select.h for what is and is not warmed
+	 * and why. */
 	TAILQ_FOREACH(lvol, &store->lvols, link) {
-		if (!lvol->blob || strncmp(lvol->name, "tpl-tpl-", 8) != 0 ||
-		    strstr(lvol->name, "-build-") != NULL) {
+		if (!lvol->blob || !s3lvol_warm_template_name(lvol->name)) {
 			continue;
 		}
 		if (s3lvol_lvol_warm(lvs, lvol, 0) == 0) {

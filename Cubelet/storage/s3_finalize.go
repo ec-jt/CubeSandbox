@@ -222,7 +222,7 @@ func FinalizeS3PackageSnapshots(ctx context.Context, backend, snapshotID string)
 // mount can retain dirty pages and open writers after disappearing from the
 // mount table. Keep this stricter operation local to package finalization.
 var unmountS3FinalizePath = func(path string) error {
-	if _, stderr, err := utils.ExecV([]string{"umount", path}, cmdTimeout); err != nil {
+	if _, stderr, err := utils.ExecV([]string{"umount", path}, metadataMountTimeout); err != nil {
 		return fmt.Errorf("strict umount s3 metadata %s failed: %s: %w", path, stderr, err)
 	}
 	return nil

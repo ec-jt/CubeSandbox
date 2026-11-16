@@ -37,6 +37,14 @@ const (
 	defaultImportPrefetchPoll    = 500 * time.Millisecond
 	importPrefetchProgressEvery  = 5 * time.Second
 	defaultImportedMountTimeout  = 120 * time.Second
+	// defaultMetadataMountTimeout bounds one mount (and umount / base mkfs)
+	// of any s3-meta-* metadata disk. It replaces cmd_timeout (3s) for those
+	// commands: a pause creates and mounts a fresh metadata disk, and a cold
+	// s3lvol cache made that mount miss 3s on the live cluster.
+	defaultMetadataMountTimeout = 60 * time.Second
+	// defaultMetadataMountAttempts is the total number of mount attempts.
+	defaultMetadataMountAttempts = 3
+	defaultMetadataMountBackoff  = time.Second
 )
 
 // Package-level knobs, set from Config during plugin init (see plugin.go) and
@@ -46,6 +54,11 @@ var (
 	importPrefetchPoll    = defaultImportPrefetchPoll
 	importProgressEvery   = importPrefetchProgressEvery
 	importedMountTimeout  = defaultImportedMountTimeout
+
+	metadataMountTimeout      = defaultMetadataMountTimeout
+	metadataMountAttempts     = defaultMetadataMountAttempts
+	metadataMountRetryBackoff = defaultMetadataMountBackoff
+	metadataMountRetrySleep   = time.Sleep
 )
 
 // cowImportStatuser is the engine capability behind rcow_import_status.
@@ -172,6 +185,16 @@ func applyImportTimeouts(cfg *Config) error {
 		return fmt.Errorf("imported_metadata_mount_timeout must be non-negative, got %v", d)
 	} else if d > 0 {
 		importedMountTimeout = d
+	}
+	if d := tomlext.ToStdTime(cfg.MetadataMountTimeout); d < 0 {
+		return fmt.Errorf("metadata_mount_timeout must be non-negative, got %v", d)
+	} else if d > 0 {
+		metadataMountTimeout = d
+	}
+	if cfg.MetadataMountAttempts < 0 {
+		return fmt.Errorf("metadata_mount_attempts must be non-negative, got %d", cfg.MetadataMountAttempts)
+	} else if cfg.MetadataMountAttempts > 0 {
+		metadataMountAttempts = cfg.MetadataMountAttempts
 	}
 	return nil
 }
