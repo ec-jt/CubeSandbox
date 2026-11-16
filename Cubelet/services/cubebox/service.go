@@ -749,6 +749,13 @@ func (s *service) Destroy(ctx context.Context, req *cubebox.DestroyCubeSandboxRe
 			rsp.Ret.RetMsg = err.Error()
 			return rsp, nil
 		}
+		if forceDestroyRequested(req) {
+			if err := s.cubeboxMgr.forceReclaimRuntime(ctx, sb); err != nil {
+				rsp.Ret.RetCode = errorcode.ErrorCode_PreConditionFailed
+				rsp.Ret.RetMsg = err.Error()
+				return rsp, nil
+			}
+		}
 	}
 
 	if req.GetAnnotations() != nil {
