@@ -802,6 +802,12 @@ impl Task for TaskService {
         let mut sb = self.sandbox.lock().await;
         let retention = crate::common::retained::Guard::host().map_err(Others)?;
         retention.require_absent(sb.sandbox_id()).map_err(Others)?;
+        // The retention check is admission only. The host flock serializes
+        // every sandbox on the node, and destroy_sandbox below can block for
+        // as long as the VMM thread takes to exit (unbounded when the guest is
+        // wedged). Holding the flock across it stalled every pause on the
+        // node. The sandbox lock (`sb`) still serializes this sandbox.
+        drop(retention);
         // After PauseToSnapshot the sandbox is Paused (MicroVM already gone).
         // Allow shutdown so Cubelet can reap the shim; skip destroy_sandbox
         // when already paused because there is no live VM to tear down.
@@ -1059,6 +1065,19 @@ fn is_internal_probe_exec_id(exec_id: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // shutdown must not keep the node-wide retention flock across
+    // destroy_sandbox (an unbounded wait for the VMM to exit): a wedged guest
+    // otherwise blocks every pause/delete on the node with EAGAIN.
+    #[test]
+    fn shutdown_releases_retention_lock_before_destroy() {
+        let src = include_str!("task_srv.rs");
+        let start = src.find("async fn shutdown(").expect("shutdown fn");
+        let body = &src[start..];
+        let drop_at = body.find("drop(retention);").expect("retention dropped in shutdown");
+        let destroy_at = body.find("destroy_sandbox().await").expect("destroy call");
+        assert!(drop_at < destroy_at, "retention must be dropped before destroy_sandbox");
+    }
 
     #[test]
     fn internal_probe_exec_requires_exec_id_prefix() {

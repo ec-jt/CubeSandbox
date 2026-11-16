@@ -314,6 +314,18 @@ mod tests {
     }
 
     #[test]
+    fn retained_guard_is_exclusive_until_dropped() {
+        // Every shim on the node opens the same lock; a guard that stays
+        // alive across a long native call blocks all of them (EAGAIN).
+        let f = Fixture::new();
+        let g = f.guard();
+        let busy = Guard::open(&f.dir.join("records"), unsafe { libc::geteuid() });
+        assert!(matches!(busy, Err(ref e) if e.contains("retention operation busy")));
+        drop(g);
+        Guard::open(&f.dir.join("records"), unsafe { libc::geteuid() }).unwrap();
+    }
+
+    #[test]
     fn retained_ordinary_missing_entry_allows_cleanup() {
         let f = Fixture::new(); let g = f.guard();
         assert!(g.load("source-1").unwrap().is_none());
