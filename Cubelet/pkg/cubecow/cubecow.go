@@ -458,6 +458,27 @@ func (e *Engine) AbandonUnpublishedExport(exportUUID string) error {
 	return nil
 }
 
+// ReconcileExport records a publication whose manifest reached S3 but whose
+// completion was lost. The native side refuses unless the manifest proves
+// this export's own first publication.
+func (e *Engine) ReconcileExport(exportUUID string) error {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+
+	ptr, err := e.openHandle()
+	if err != nil {
+		return err
+	}
+	defer e.mu.RUnlock()
+
+	cUUID := C.CString(exportUUID)
+	defer C.free(unsafe.Pointer(cUUID))
+	if rc := C.cubecow_reconcile_export(C.CubecowEngineHandle(ptr), cUUID); rc != 0 {
+		return makeError(rc)
+	}
+	return nil
+}
+
 func (e *Engine) CheckpointRecord(request string) (string, error) {
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()

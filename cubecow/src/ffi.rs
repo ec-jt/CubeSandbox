@@ -1088,6 +1088,36 @@ pub extern "C" fn cubecow_abandon_unpublished_export(
     }
 }
 
+/// Record a publication whose manifest reached S3 but whose completion was
+/// lost. The backend refuses unless the manifest proves a first publication.
+///
+/// # Returns
+/// 0 on success, negative error code on failure.
+#[no_mangle]
+pub extern "C" fn cubecow_reconcile_export(
+    engine: *mut std::ffi::c_void,
+    export_uuid: *const c_char,
+) -> i32 {
+    let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+        // SAFETY: `engine` was created by `cubecow_init` and is valid.
+        let eng = unsafe { engine_ref(engine) }?;
+        // SAFETY: `export_uuid` is a valid C string provided by the caller.
+        let uuid = unsafe { c_str_to_str(export_uuid) }?;
+        match eng.reconcile_export(uuid) {
+            Ok(()) => Ok(COW_OK),
+            Err(e) => Err(handle_cow_error(&e)),
+        }
+    }));
+    match result {
+        Ok(Ok(code)) => code,
+        Ok(Err(code)) => code,
+        Err(_) => {
+            set_last_error("panic during cubecow_reconcile_export");
+            COW_ERR_PANIC
+        }
+    }
+}
+
 /// Additive checkpoint record API. Inputs/outputs are bounded native JSON.
 #[no_mangle]
 pub extern "C" fn cubecow_checkpoint_record(

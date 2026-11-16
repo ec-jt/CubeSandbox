@@ -41,6 +41,34 @@ type workerEngine struct {
 	// abandonErr is returned by AbandonUnpublishedExport when set.
 	abandonErr error
 	abandoned  []string
+	// reconcileOK: ReconcileExport settles the stuck export to DONE (its
+	// manifest had landed); otherwise it returns reconcileErr.
+	reconcileOK  bool
+	reconcileErr error
+	reconciled   []string
+}
+
+func (e *workerEngine) ReconcileExport(uuid string) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if !e.reconcileOK {
+		if e.reconcileErr != nil {
+			return e.reconcileErr
+		}
+		return errors.New("Operation not supported")
+	}
+	for name, info := range e.volumeInfos {
+		if info.ExportUUID == uuid && info.ExportStatus == cow.ExportStatusInProgress {
+			e.reconciled = append(e.reconciled, uuid)
+			info.ExportStatus = cow.ExportStatusDone
+			delete(e.stuck, name)
+			if e.active == name {
+				e.active = ""
+			}
+			return nil
+		}
+	}
+	return errors.New("not publication_pending")
 }
 
 func (e *workerEngine) AbandonUnpublishedExport(uuid string) error {
@@ -379,6 +407,40 @@ func TestExportWorkerDoesNotResubmitWhenAbandonRefused(t *testing.T) {
 	// Never submitted memory again (and so never reached metadata).
 	require.Empty(t, e.submits)
 	require.Equal(t, "orphan-"+entry.MemoryVol, e.volumeInfos[entry.MemoryVol].ExportUUID)
+	require.Equal(t, cow.ExportStatusInProgress, e.volumeInfos[entry.MemoryVol].ExportStatus)
+}
+
+// A manifest PUT that landed but timed out client side leaves the export
+// publication_pending with its manifest present: abandon is refused (EEXIST)
+// and reconcile records the publication. The role must finish with the
+// original uuid and never be resubmitted.
+func TestExportWorkerReconcilesWhenAbandonRefused(t *testing.T) {
+	w, e, entry := stuckRole(t)
+	w.cfg.RoleSettleTimeout = 2 * time.Second
+	w.cfg.OrphanAfter = 10 * time.Millisecond
+	e.abandonErr = errors.New("File exists")
+	e.reconcileOK = true
+	require.NoError(t, w.runOne(context.Background(), entry.SnapshotID))
+	require.Empty(t, e.abandoned)
+	require.Equal(t, []string{"orphan-" + entry.MemoryVol}, e.reconciled)
+	// Memory never resubmitted; only metadata was exported afterwards.
+	require.Equal(t, []string{entry.MetadataVol}, e.submits)
+	require.Equal(t, "orphan-"+entry.MemoryVol, e.volumeInfos[entry.MemoryVol].ExportUUID)
+	require.Equal(t, cow.ExportStatusDone, e.volumeInfos[entry.MemoryVol].ExportStatus)
+}
+
+// Reconcile refused as well (e.g. a manifest that is not this export's first
+// publication): nothing changes and the worker keeps waiting, failing closed.
+func TestExportWorkerKeepsWaitingWhenReconcileRefused(t *testing.T) {
+	w, e, entry := stuckRole(t)
+	w.cfg.RoleSettleTimeout = 50 * time.Millisecond
+	w.cfg.OrphanAfter = 10 * time.Millisecond
+	e.abandonErr = errors.New("File exists")
+	e.reconcileErr = errors.New("Cross-device link")
+	require.Error(t, w.runOne(context.Background(), entry.SnapshotID))
+	require.Empty(t, e.abandoned)
+	require.Empty(t, e.reconciled)
+	require.Empty(t, e.submits)
 	require.Equal(t, cow.ExportStatusInProgress, e.volumeInfos[entry.MemoryVol].ExportStatus)
 }
 

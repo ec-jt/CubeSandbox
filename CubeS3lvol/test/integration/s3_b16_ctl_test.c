@@ -398,6 +398,69 @@ test_abandon(void)
 	      export_abandon_ctl_verdict(&f) == -EBUSY);
 }
 
+/* ==========================================================================
+ * [5] reconcile route: which manifest proves a first publication
+ * ========================================================================== */
+
+static struct export_reconcile_manifest_facts
+mf(uint32_t version, bool ref, bool has_base, int base_check)
+{
+	struct export_reconcile_manifest_facts f;
+
+	memset(&f, 0, sizeof(f));
+	f.version = version;
+	f.layout_ref = ref;
+	f.layout_dense = !ref;
+	f.has_base = has_base;
+	f.base_check = base_check;
+	return f;
+}
+
+static void
+test_reconcile_route(void)
+{
+	struct export_reconcile_manifest_facts f;
+
+	printf("\n[5] rcow_reconcile_export route\n");
+
+	f = mf(4, false, false, 0);
+	check("v4 dense: admission route",
+	      export_reconcile_ctl_route(&f) == EXPORT_RECONCILE_DENSE_ADMISSION);
+	f = mf(4, true, false, 0);
+	check("v4 ref: refused", export_reconcile_ctl_route(&f) == -ENOTSUP);
+
+	f = mf(3, true, false, 0);
+	check("v3 ref: manifest route", export_reconcile_ctl_route(&f) == EXPORT_RECONCILE_REF);
+	f = mf(3, false, false, 0);
+	check("v3 dense: refused", export_reconcile_ctl_route(&f) == -ENOTSUP);
+	f = mf(3, true, true, 0);
+	check("v3 with a base: malformed", export_reconcile_ctl_route(&f) == -EINVAL);
+
+	/* The live case: v5 template delta whose manifest PUT landed but timed out. */
+	f = mf(5, true, true, 0);
+	check("v5 delta over the local base: manifest route",
+	      export_reconcile_ctl_route(&f) == EXPORT_RECONCILE_REF);
+	f = mf(5, true, true, -EXDEV);
+	check("v5 delta over another base: refused -EXDEV",
+	      export_reconcile_ctl_route(&f) == -EXDEV);
+	f = mf(5, true, true, -ENOENT);
+	check("v5 delta with no local base: refused -ENOENT",
+	      export_reconcile_ctl_route(&f) == -ENOENT);
+	f = mf(5, true, false, 0);
+	check("v5 without a base: malformed", export_reconcile_ctl_route(&f) == -EINVAL);
+	f = mf(5, false, true, 0);
+	check("v5 dense: refused", export_reconcile_ctl_route(&f) == -ENOTSUP);
+
+	f = mf(3, true, false, 0);
+	f.generation = 1;
+	check("rewritten history (generation 1): refused",
+	      export_reconcile_ctl_route(&f) == -ENOTSUP);
+	f = mf(2, true, false, 0);
+	check("v2 ref: refused", export_reconcile_ctl_route(&f) == -ENOTSUP);
+	f = mf(6, true, true, 0);
+	check("unknown future version: refused", export_reconcile_ctl_route(&f) == -ENOTSUP);
+}
+
 int
 main(void)
 {
@@ -406,6 +469,7 @@ main(void)
 	test_drain();
 	test_reservation();
 	test_abandon();
+	test_reconcile_route();
 	printf("\n=== %d passed, %d failed ===\n", g_pass, g_fail);
 	return g_fail == 0 ? 0 : 1;
 }

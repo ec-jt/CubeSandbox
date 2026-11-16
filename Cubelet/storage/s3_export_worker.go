@@ -555,6 +555,28 @@ type cowExportAbandoner interface {
 	AbandonUnpublishedExport(exportUUID string) error
 }
 
+// cowExportReconciler records a publication whose manifest reached S3 but
+// whose completion was lost (the PUT landed, the response timed out). s3lvol
+// accepts it only when the manifest it reads back proves this export's own
+// first publication, so asking is always safe.
+type cowExportReconciler interface {
+	ReconcileExport(exportUUID string) error
+}
+
+// reconcileOrphan is tried when abandon is refused: a refusal usually means
+// the manifest exists, which is exactly the case reconcile can prove.
+func (w *s3ExportWorker) reconcileOrphan(m *S3Cow, id, uuid string) error {
+	rc, ok := m.engine.(cowExportReconciler)
+	if !ok || rc == nil {
+		return errors.New("cubecow engine does not support reconcile_export")
+	}
+	if !w.enter(id) {
+		return errExportCancelled
+	}
+	defer w.leave()
+	return rc.ReconcileExport(uuid)
+}
+
 // abandonOrphan asks the native layer to drop an export that reads INPROGRESS
 // with no completion. It succeeds only when s3lvol proves nothing of it was
 // published; any refusal or error leaves everything as it was.
@@ -620,8 +642,19 @@ func (w *s3ExportWorker) waitSettled(ctx context.Context, m *S3Cow, id string, r
 							*abandons, w.cfg.MaxAbandons)
 						return errExportAbandoned
 					}
-					CubeLog.Warnf("async s3 export %s: abandon of %s uuid=%s refused: %v; still waiting",
+					CubeLog.Warnf("async s3 export %s: abandon of %s uuid=%s refused: %v; trying reconcile",
 						id, ref.Name, uuid, aerr)
+					rerr := w.reconcileOrphan(m, id, uuid)
+					if errors.Is(rerr, errExportCancelled) {
+						return rerr
+					}
+					if rerr == nil {
+						CubeLog.Warnf("async s3 export %s: %s %s uuid=%s reconciled from its published "+
+							"manifest; waiting for DONE", id, ref.Role, ref.Name, uuid)
+					} else {
+						CubeLog.Warnf("async s3 export %s: reconcile of %s uuid=%s refused: %v; still waiting",
+							id, ref.Name, uuid, rerr)
+					}
 				}
 			}
 			if !v.exists {

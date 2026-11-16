@@ -6873,9 +6873,19 @@ s3lvol_export_release_for_delete(struct s3lvol_lvstore *lvs,
 }
 
 /* Explicit reconciliation of a first publication only. A v4 manifest plus its
- * existing OPEN admission proves the fresh dense path; v2/v3 or rewritten REF
- * history cannot establish that proof and must retain the reservation. No GET
- * failure, including 404, authorizes republishing or deleting anything. */
+ * existing OPEN admission proves the fresh dense path. A first-publication REF
+ * manifest (v3, or a v5 template delta over the verified base under this very
+ * snapshot) proves itself: the REF reservation was saved before the manifest
+ * PUT and pins the source exactly as the published entry does, so recording
+ * the publication changes no obligation. This is the case of a manifest PUT
+ * that landed but whose response was lost (client timeout). Rewritten history
+ * still cannot be reconciled. No GET failure, including 404, authorizes
+ * republishing or deleting anything. */
+_Static_assert(S3_EXPORT_VERSION == EXPORT_RECONCILE_V_REF, "reconcile ref version");
+_Static_assert(S3_EXPORT_ADMISSION_VERSION == EXPORT_RECONCILE_V_ADMISSION,
+	       "reconcile admission version");
+_Static_assert(S3_EXPORT_DELTA_VERSION == EXPORT_RECONCILE_V_DELTA,
+	       "reconcile delta version");
 struct reconcile_ctx {
 	struct admission_work work;
 	struct s3lvol_export *exp;
@@ -6883,6 +6893,8 @@ struct reconcile_ctx {
 	struct ea_doc admission;
 	struct s3_export_source expected;
 	char uuid[SPDK_UUID_STRING_LEN];
+	/* Verified template base under the snapshot here, "" when none. */
+	char local_base[SPDK_UUID_STRING_LEN];
 	char key[S3_EXPORT_KEY_MAX];
 	uint64_t size;
 	uint64_t size_bytes;
@@ -6974,9 +6986,23 @@ static void reconcile_manifest_got(void *arg, uint64_t bytes, int status)
 	if (!rc) rc = s3_export_manifest_parse(r->body, bytes, &r->m);
 	if (rc) { reconcile_done(r, rc); return; }
 	m = r->m;
-	if (m->version != S3_EXPORT_ADMISSION_VERSION ||
-	    m->layout != S3_EXPORT_LAYOUT_DENSE || m->generation != 0) {
-		reconcile_done(r, -ENOTSUP); return;
+	struct export_reconcile_manifest_facts facts = {
+		.version = m->version,
+		.layout_ref = m->layout == S3_EXPORT_LAYOUT_REF,
+		.layout_dense = m->layout == S3_EXPORT_LAYOUT_DENSE,
+		.generation = m->generation,
+		.has_base = m->base_uuid[0] != '\0',
+	};
+	if (facts.has_base) {
+		facts.base_check = s3_export_delta_base_check(m, r->local_base);
+	}
+	int route = export_reconcile_ctl_route(&facts);
+	if (route < 0) {
+		SPDK_NOTICELOG("Reconcile of export %s refused: manifest v%u layout %d "
+			       "generation %u base '%s' (local base '%s'): %s\n", r->uuid,
+			       m->version, (int)m->layout, m->generation, m->base_uuid,
+			       r->local_base, spdk_strerror(-route));
+		reconcile_done(r, route); return;
 	}
 	if (strcmp(m->uuid_str, r->uuid) ||
 	    strcmp(m->src.snapshot_uuid, r->expected.snapshot_uuid) ||
@@ -6990,7 +7016,20 @@ static void reconcile_manifest_got(void *arg, uint64_t bytes, int status)
 	    m->size_bytes != r->size_bytes || m->cluster_size != r->cluster_size ||
 	    m->chunk_size != r->cluster_size || m->block_size != S3LVOL_BLOCK_SIZE ||
 	    m->expires_at != 0) {
-		reconcile_done(r, -EINVAL); return;
+	 reconcile_done(r, -EINVAL); return;
+	}
+	if (route == EXPORT_RECONCILE_REF) {
+	 struct s3lvol_export_entry e;
+
+	 s3lvol_export_get(r->exp, &e);
+	 if (!e.publication_pending) { reconcile_done(r, 0); return; }
+	 SPDK_NOTICELOG("Reconciling export %s from its v%u ref manifest%s%s "
+	         "(%" PRIu64 " present chunk(s))\n", r->uuid, m->version,
+	         facts.has_base ? " over base " : "",
+	         facts.has_base ? m->base_uuid : "", m->present_chunks);
+	 rc = s3lvol_export_publication_save(r->exp, m, reconcile_done, r);
+	 if (rc) reconcile_done(r, rc);
+	 return;
 	}
 	snprintf(r->key, sizeof(r->key), "exports/admission/%s", r->uuid);
 	rc = s3_head(s3lvol_lvstore_get_client(r->work.lvs), r->key, &r->size,
@@ -7043,6 +7082,10 @@ s3lvol_export_reconcile(struct s3lvol_lvstore *lvs, const char *uuid,
 	if (!r) return -ENOMEM;
 	r->work.lvs = lvs; r->exp = exp; r->cb = cb; r->arg = arg;
 	snprintf(r->uuid, sizeof(r->uuid), "%s", uuid);
+	if (s3lvol_template_base_below(lvs, snapshot, r->local_base,
+				       sizeof(r->local_base)) != 0) {
+		r->local_base[0] = '\0';
+	}
 	rc = export_fill_src_for(lvs, snapshot, &r->expected);
 	if (rc) { free(r); return rc; }
 	r->size_bytes = spdk_blob_get_num_io_units(snapshot->blob) * S3LVOL_BLOCK_SIZE;

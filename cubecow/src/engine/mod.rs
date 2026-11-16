@@ -132,6 +132,15 @@ pub trait Engine: Send + Sync {
         ))
     }
 
+    /// Record a publication whose manifest reached S3 but whose completion was
+    /// lost (publication_pending with the manifest present). The backend
+    /// accepts only a first publication it can prove from the manifest.
+    fn reconcile_export(&self, _export_uuid: &str) -> CubecowResult<()> {
+        Err(CubecowError::PreconditionFailed(
+            "reconcile_export is not implemented by this backend".to_string(),
+        ))
+    }
+
     /// Import a writable volume from an `export_uuid` produced by a remote node.
     fn import_lvol(&self, _lvol_name: &str, _export_uuid: &str) -> CubecowResult<Volume> {
         Err(CubecowError::PreconditionFailed(

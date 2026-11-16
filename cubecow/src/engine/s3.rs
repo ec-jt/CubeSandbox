@@ -1194,6 +1194,23 @@ impl Engine for S3Engine {
         Ok(())
     }
 
+    fn reconcile_export(&self, export_uuid: &str) -> CubecowResult<()> {
+        if export_uuid.is_empty() {
+            return Err(CubecowError::InvalidArg(
+                "export_uuid must not be empty".to_string(),
+            ));
+        }
+        // The native side refuses unless the manifest it reads back is this
+        // export's own first publication (ref v3/v5 over the local base, or
+        // v4 dense with its OPEN admission document).
+        self.rpc.call_raw(
+            "rcow_reconcile_export",
+            &serde_json::json!({ "export_uuid": export_uuid }),
+        )?;
+        info!(%export_uuid, "s3 export publication reconciled");
+        Ok(())
+    }
+
     fn import_lvol(&self, lvol_name: &str, export_uuid: &str) -> CubecowResult<Volume> {
         Self::validate_name(lvol_name, "volume")?;
         if export_uuid.is_empty() {

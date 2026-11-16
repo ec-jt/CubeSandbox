@@ -185,4 +185,67 @@ export_abandon_ctl_verdict(const struct export_abandon_facts *f)
 	return 0;
 }
 
+/* ==========================================================================
+ * 4. Which proof reconciles a publication_pending entry
+ * ========================================================================== */
+
+/* What rcow_reconcile_export read from exports/<uuid>.json. */
+struct export_reconcile_manifest_facts {
+	uint32_t version;
+	bool     layout_ref;       /* S3_EXPORT_LAYOUT_REF */
+	bool     layout_dense;     /* S3_EXPORT_LAYOUT_DENSE */
+	uint32_t generation;
+	bool     has_base;         /* a template-delta base uuid is recorded */
+	/* Only for has_base: s3_export_delta_base_check() of the manifest against
+	 * the verified template base under the exported snapshot here (0 match,
+	 * -ENOENT none, -EXDEV another base). */
+	int      base_check;
+};
+
+enum export_reconcile_route {
+	/* v4 dense: needs its OPEN admission document as well. */
+	EXPORT_RECONCILE_DENSE_ADMISSION = 1,
+	/* v3 ref, or v5 ref delta over this node's base: the manifest alone is
+	 * the proof. A ref export never writes an admission document, and its
+	 * reservation already pins the source exactly as the published entry
+	 * does, so recording the publication changes no obligation. */
+	EXPORT_RECONCILE_REF = 2,
+};
+
+/* Version numbers, duplicated here so the header stays free of s3_export.h;
+ * the xfer glue static-asserts they match. */
+#define EXPORT_RECONCILE_V_REF       3u
+#define EXPORT_RECONCILE_V_ADMISSION 4u
+#define EXPORT_RECONCILE_V_DELTA     5u
+
+/* >0 an export_reconcile_route; <0 refuse with that error. Only a first
+ * publication (generation 0) is reconcilable: rewritten history is not. */
+static inline int
+export_reconcile_ctl_route(const struct export_reconcile_manifest_facts *f)
+{
+	if (f->generation != 0) {
+		return -ENOTSUP;
+	}
+	if (f->version == EXPORT_RECONCILE_V_ADMISSION) {
+		return f->layout_dense && !f->has_base ?
+		       EXPORT_RECONCILE_DENSE_ADMISSION : -ENOTSUP;
+	}
+	if (!f->layout_ref) {
+		return -ENOTSUP;
+	}
+	if (f->version == EXPORT_RECONCILE_V_REF) {
+		return f->has_base ? -EINVAL : EXPORT_RECONCILE_REF;
+	}
+	if (f->version == EXPORT_RECONCILE_V_DELTA) {
+		if (!f->has_base) {
+			return -EINVAL;
+		}
+		if (f->base_check != 0) {
+			return f->base_check < 0 ? f->base_check : -EXDEV;
+		}
+		return EXPORT_RECONCILE_REF;
+	}
+	return -ENOTSUP;
+}
+
 #endif /* S3LVOL_EXPORT_B16_CTL_H */

@@ -92,6 +92,10 @@ func (e *Engine) AbandonUnpublishedExport(string) error {
 	return fmt.Errorf(nativeBuildHint)
 }
 
+func (e *Engine) ReconcileExport(string) error {
+	return fmt.Errorf(nativeBuildHint)
+}
+
 func (e *Engine) ImportLvol(string, string) (string, error) {
 	return "", fmt.Errorf(nativeBuildHint)
 }

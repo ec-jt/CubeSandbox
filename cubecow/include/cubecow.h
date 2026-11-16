@@ -305,6 +305,14 @@ int32_t cubecow_abandon_unpublished_export(
     CubecowEngineHandle engine,
     const char* export_uuid);
 
+/**
+ * Record a publication whose manifest reached S3 but whose completion was
+ * lost. Refused unless the manifest proves a first publication.
+ */
+int32_t cubecow_reconcile_export(
+    CubecowEngineHandle engine,
+    const char *export_uuid);
+
 /*
  * Instantiate a writable volume from an export_uuid produced by a
  * remote node's cubecow_export_snapshot().
