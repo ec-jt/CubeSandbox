@@ -187,7 +187,7 @@ func (l *local) provablyNeverStarted(ctx context.Context, sb *cubeboxstore.CubeB
 	if sb.Endpoint.Pid != 0 {
 		return false, fmt.Sprintf("record carries endpoint pid %d", sb.Endpoint.Pid)
 	}
-	if reason, ok := l.noRuntimeArtifacts(ctx, sb, false); !ok {
+	if reason, ok := l.noRuntimeArtifacts(ctx, sb, false, true); !ok {
 		return false, reason
 	}
 	return true, "pid 0, never started, no containerd container, task or shim"
@@ -195,8 +195,11 @@ func (l *local) provablyNeverStarted(ctx context.Context, sb *cubeboxstore.CubeB
 
 // noRuntimeArtifacts asks containerd and the host for any trace of a runtime
 // for the sandbox and its containers. withProcess adds the host process scan.
-// It returns ok=false with the reason on any trace or query error.
-func (l *local) noRuntimeArtifacts(ctx context.Context, sb *cubeboxstore.CubeBox, withProcess bool) (string, bool) {
+// withContainer includes containerd container metadata; an exited record
+// keeps that metadata until Destroy deletes it, and metadata alone (no task,
+// no shim, no process) is not a runtime. It returns ok=false with the reason
+// on any trace or query error.
+func (l *local) noRuntimeArtifacts(ctx context.Context, sb *cubeboxstore.CubeBox, withProcess, withContainer bool) (string, bool) {
 	ns := sb.Namespace
 	if ns == "" {
 		ns = namespaces.Default
@@ -207,11 +210,14 @@ func (l *local) noRuntimeArtifacts(ctx context.Context, sb *cubeboxstore.CubeBox
 		what string
 		fn   func(context.Context, string) (bool, error)
 	}
-	checks := []check{
-		{"containerd container", probe.ContainerExists},
-		{"containerd task", probe.TaskExists},
-		{"shim", probe.ShimExists},
+	var checks []check
+	if withContainer {
+		checks = append(checks, check{"containerd container", probe.ContainerExists})
 	}
+	checks = append(checks,
+		check{"containerd task", probe.TaskExists},
+		check{"shim", probe.ShimExists},
+	)
 	if withProcess {
 		checks = append(checks, check{"host process", probe.ProcessExists})
 	}
@@ -237,8 +243,9 @@ func (l *local) noRuntimeArtifacts(ctx context.Context, sb *cubeboxstore.CubeBox
 //   - no snapshot publication hold, not paused or pausing;
 //   - the sandbox status is EXITED (FinishedAt set) and no status carries a pid;
 //   - no runtime start attempted in this process that is unresolved;
-//   - containerd has no container, task or shim and no shim bundle directory
-//     exists for the sandbox or any of its containers;
+//   - containerd has no task or shim and no shim bundle directory exists for
+//     the sandbox or any of its containers (container metadata may remain:
+//     Destroy deletes it);
 //   - no live host process names the sandbox or container ids.
 func (l *local) provablyExited(ctx context.Context, sb *cubeboxstore.CubeBox) (bool, string) {
 	if sb == nil {
@@ -277,10 +284,10 @@ func (l *local) provablyExited(ctx context.Context, sb *cubeboxstore.CubeBox) (b
 	if sb.Endpoint.Pid != 0 {
 		return false, fmt.Sprintf("record carries endpoint pid %d", sb.Endpoint.Pid)
 	}
-	if reason, ok := l.noRuntimeArtifacts(ctx, sb, true); !ok {
+	if reason, ok := l.noRuntimeArtifacts(ctx, sb, true, false); !ok {
 		return false, reason
 	}
-	return true, "exited, pid 0, no containerd container, task, shim or host process"
+	return true, "exited, pid 0, no containerd task, shim or host process"
 }
 
 // recordRollbackReleasesStorage applies the Create rollback policy to a

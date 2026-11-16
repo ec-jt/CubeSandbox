@@ -61,9 +61,11 @@ func TestProvablyExited(t *testing.T) {
 		"task exists": {func(sb *cubeboxstore.CubeBox, p *fakeRuntimeProbe) {
 			p.tasks = map[string]bool{sb.ID: true}
 		}, false},
-		"containerd container exists": {func(sb *cubeboxstore.CubeBox, p *fakeRuntimeProbe) {
+		// Container metadata alone is what an exited record keeps until
+		// Destroy deletes it; it is not a runtime.
+		"containerd container metadata only": {func(sb *cubeboxstore.CubeBox, p *fakeRuntimeProbe) {
 			p.containers = map[string]bool{sb.ID: true}
-		}, false},
+		}, true},
 		"host process names the id": {func(sb *cubeboxstore.CubeBox, p *fakeRuntimeProbe) {
 			p.procs = map[string]bool{sb.ID: true}
 		}, false},
