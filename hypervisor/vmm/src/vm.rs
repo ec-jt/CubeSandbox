@@ -2577,6 +2577,11 @@ impl Vm {
     }
 }
 
+/// How many times `Vm::pause` re-pauses a guest caught with a disarmed TSC
+/// deadline before giving up (restore re-arms it as a fallback).
+#[cfg(all(feature = "kvm", target_arch = "x86_64"))]
+const PAUSE_TIMER_QUIESCE_ATTEMPTS: u32 = 20;
+
 impl Pausable for Vm {
     fn pause(&mut self) -> std::result::Result<(), MigratableError> {
         event!("vm", "pausing");
@@ -2607,6 +2612,46 @@ impl Pausable for Vm {
         })?;
 
         self.cpu_manager.lock().unwrap().pause()?;
+
+        // A guest stopped between its local timer firing and the handler
+        // writing the next TSC deadline has a disarmed clock event device.
+        // A snapshot of that state restores into a guest whose timers never
+        // fire (RCU stalls, a dead agent). Let it run a moment and stop it
+        // again until every vCPU has an armed deadline.
+        #[cfg(all(feature = "kvm", target_arch = "x86_64"))]
+        {
+            let mut retried = false;
+            for attempt in 1..=PAUSE_TIMER_QUIESCE_ATTEMPTS {
+                let disarmed = self.cpu_manager.lock().unwrap().vcpus_with_disarmed_timer();
+                if disarmed.is_empty() {
+                    break;
+                }
+                if attempt == PAUSE_TIMER_QUIESCE_ATTEMPTS {
+                    warn!(
+                        "vCPUs {:?} still have a disarmed TSC deadline after {} pause attempts; \
+                         restore will re-arm it",
+                        disarmed, attempt
+                    );
+                    break;
+                }
+                info!(
+                    "vCPUs {:?} paused with a disarmed TSC deadline (attempt {}); resuming briefly",
+                    disarmed, attempt
+                );
+                self.cpu_manager.lock().unwrap().resume()?;
+                std::thread::sleep(std::time::Duration::from_millis(2));
+                self.cpu_manager.lock().unwrap().pause()?;
+                retried = true;
+            }
+            if retried {
+                let mut clock = self.vm.get_clock().map_err(|e| {
+                    MigratableError::Pause(anyhow!("Could not get VM clock: {}", e))
+                })?;
+                clock.reset_flags();
+                self.saved_clock = Some(clock);
+            }
+        }
+
         self.device_manager.lock().unwrap().pause()?;
 
         *state = new_state;

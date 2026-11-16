@@ -388,6 +388,104 @@ pub struct MsrEntry {
     pub data: u64,
 }
 
+/// Local APIC LVT timer register offset in the KVM LAPIC page.
+pub const APIC_LVTT_OFFSET: usize = 0x320;
+const APIC_LVT_MASKED: u32 = 1 << 16;
+const APIC_LVT_TIMER_MODE_MASK: u32 = 0b11 << 17;
+const APIC_LVT_TIMER_TSC_DEADLINE: u32 = 0b10 << 17;
+
+/// True when the vCPU's local timer is in TSC-deadline mode, unmasked, and
+/// IA32_TSC_DEADLINE is 0.
+///
+/// A guest only clears the deadline for a moment: the MSR reads 0 between
+/// the timer firing and the interrupt handler writing the next deadline. A
+/// snapshot taken in that window restores a vCPU whose clock event device
+/// never fires again (RCU stalls, a dead guest agent), because the restored
+/// IRR bit alone does not make the guest program a new deadline.
+pub fn tsc_deadline_disarmed(lapic: &LapicState, msrs: &[MsrEntry]) -> bool {
+    let lvtt = lapic.get_klapic_reg(APIC_LVTT_OFFSET);
+    if lvtt & APIC_LVT_MASKED != 0 || lvtt & APIC_LVT_TIMER_MODE_MASK != APIC_LVT_TIMER_TSC_DEADLINE
+    {
+        return false;
+    }
+    msrs.iter()
+        .any(|m| m.index == msr_index::MSR_IA32_TSC_DEADLINE && m.data == 0)
+}
+
+/// Re-arm a disarmed TSC deadline (see `tsc_deadline_disarmed`) so that the
+/// timer expires as soon as the restored vCPU runs. A deadline in the past
+/// makes KVM fire the local timer immediately; the guest handler then
+/// programs its real next deadline. A spurious local-timer interrupt is
+/// harmless to Linux. Returns true when the MSR list was changed.
+pub fn rearm_disarmed_tsc_deadline(lapic: &LapicState, msrs: &mut [MsrEntry]) -> bool {
+    if !tsc_deadline_disarmed(lapic, msrs) {
+        return false;
+    }
+    for m in msrs.iter_mut() {
+        if m.index == msr_index::MSR_IA32_TSC_DEADLINE {
+            m.data = 1;
+        }
+    }
+    true
+}
+
+#[cfg(test)]
+mod timer_state_tests {
+    use super::*;
+
+    fn lapic_with_lvtt(v: u32) -> LapicState {
+        let mut l = LapicState::default();
+        l.set_klapic_reg(APIC_LVTT_OFFSET, v);
+        l
+    }
+
+    fn msrs(deadline: u64) -> Vec<MsrEntry> {
+        vec![
+            MsrEntry { index: msr_index::MSR_IA32_TSC, data: 12345 },
+            MsrEntry { index: msr_index::MSR_IA32_TSC_DEADLINE, data: deadline },
+        ]
+    }
+
+    // 0x400ec is the LVTT value Linux uses: vector 0xec, TSC-deadline mode.
+    const LINUX_LVTT: u32 = 0x400ec;
+
+    #[test]
+    fn disarmed_deadline_is_detected_and_rearmed() {
+        let l = lapic_with_lvtt(LINUX_LVTT);
+        let mut m = msrs(0);
+        assert!(tsc_deadline_disarmed(&l, &m));
+        assert!(rearm_disarmed_tsc_deadline(&l, &mut m));
+        assert_eq!(m[1].data, 1);
+        assert_eq!(m[0].data, 12345, "TSC itself must not change");
+        assert!(!tsc_deadline_disarmed(&l, &m));
+    }
+
+    #[test]
+    fn armed_deadline_is_left_alone() {
+        let l = lapic_with_lvtt(LINUX_LVTT);
+        let mut m = msrs(5_999_919_820);
+        assert!(!rearm_disarmed_tsc_deadline(&l, &mut m));
+        assert_eq!(m[1].data, 5_999_919_820);
+    }
+
+    #[test]
+    fn masked_or_other_modes_are_left_alone() {
+        for lvtt in [LINUX_LVTT | APIC_LVT_MASKED, 0xec, 0x200ec] {
+            let l = lapic_with_lvtt(lvtt);
+            let mut m = msrs(0);
+            assert!(!rearm_disarmed_tsc_deadline(&l, &mut m), "lvtt {lvtt:#x}");
+            assert_eq!(m[1].data, 0);
+        }
+    }
+
+    #[test]
+    fn missing_deadline_msr_is_left_alone() {
+        let l = lapic_with_lvtt(LINUX_LVTT);
+        let mut m = vec![MsrEntry { index: msr_index::MSR_IA32_TSC, data: 1 }];
+        assert!(!rearm_disarmed_tsc_deadline(&l, &mut m));
+    }
+}
+
 #[serde_with::serde_as]
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct XsaveState {

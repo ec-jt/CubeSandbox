@@ -2124,7 +2124,13 @@ impl cpu::Vcpu for KvmVcpu {
     /// vcpu.set_state(&state).unwrap();
     /// ```
     fn set_state(&self, state: &CpuState) -> cpu::Result<()> {
-        let state: VcpuKvmState = state.clone().into();
+        let mut state: VcpuKvmState = state.clone().into();
+        // A snapshot taken between the local timer firing and the guest
+        // handler writing the next deadline restores a vCPU whose clock event
+        // device never fires again. Re-arm it so the timer expires at once.
+        if crate::arch::x86::rearm_disarmed_tsc_deadline(&state.lapic_state, &mut state.msrs) {
+            warn!("Restored vCPU had a disarmed TSC deadline timer; re-armed it to fire immediately");
+        }
         self.set_cpuid2(&state.cpuid)?;
         self.set_mp_state(state.mp_state.into())?;
         self.set_regs(&state.regs.into())?;

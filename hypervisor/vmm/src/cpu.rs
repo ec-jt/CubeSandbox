@@ -2102,6 +2102,37 @@ impl Aml for CpuManager {
     }
 }
 
+impl CpuManager {
+    /// IDs of paused vCPUs whose TSC-deadline timer is disarmed (the guest
+    /// was stopped between the timer firing and its handler programming the
+    /// next deadline). A snapshot taken now restores without a working
+    /// clock event device. Errors reading state count as "not disarmed":
+    /// this check only decides whether to retry the pause.
+    #[cfg(all(feature = "kvm", target_arch = "x86_64"))]
+    pub fn vcpus_with_disarmed_timer(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        for vcpu in self.vcpus.iter() {
+            let vcpu = vcpu.lock().unwrap();
+            let lapic = match vcpu.vcpu.get_lapic() {
+                Ok(l) => l,
+                Err(_) => continue,
+            };
+            let mut msrs = vec![MsrEntry {
+                index: msr_index::MSR_IA32_TSC_DEADLINE,
+                data: 0,
+            }];
+            match vcpu.vcpu.get_msrs(&mut msrs) {
+                Ok(1) => {}
+                _ => continue,
+            }
+            if hypervisor::arch::x86::tsc_deadline_disarmed(&lapic, &msrs) {
+                out.push(vcpu.id);
+            }
+        }
+        out
+    }
+}
+
 impl Pausable for CpuManager {
     fn pause(&mut self) -> std::result::Result<(), MigratableError> {
         // Tell the vCPUs to pause themselves next time they exit
