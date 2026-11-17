@@ -54,7 +54,11 @@ type RemoteUUIDs struct {
 	// s3lvol, which refuses version 5 without its base.
 	RootfsBase string `json:"rootfs_base,omitempty"`
 	MemoryBase string `json:"memory_base,omitempty"`
-	TemplateID string `json:"template_id,omitempty"`
+	// MetadataBase: a sandbox cloned from distributed bases also clones its
+	// metadata disk from the template's metadata base, so its metadata
+	// export may be a delta over that base too.
+	MetadataBase string `json:"metadata_base,omitempty"`
+	TemplateID   string `json:"template_id,omitempty"`
 }
 
 func (u *RemoteUUIDs) Empty() bool {

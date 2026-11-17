@@ -8,6 +8,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -71,7 +72,7 @@ func useFakeS3lvol(t *testing.T) *fakeS3lvol {
 			if p["release_safe"] != true {
 				return errors.New("template bases must be exported release_safe")
 			}
-			reply = rpcStringValue{BoolValue: true, StringValue: "11111111-2222-3333-4444-55555555" + str("snapshot_name")[len(str("snapshot_name"))-4:]}
+			reply = rpcStringValue{BoolValue: true, StringValue: fmt.Sprintf("11111111-2222-3333-4444-%012d", len(f.exports))}
 		case "rcow_get_snapshot_status":
 			reply = map[string]string{"export_status": "DONE"}
 		case "rcow_get_exports":
@@ -195,21 +196,22 @@ func TestPublishTemplateBases(t *testing.T) {
 	f := useFakeS3lvol(t)
 	engine := &fakeCowEngine{volumeInfos: map[string]*cubecow.Volume{
 		cowTemplateMemoryName("tpl-x") + "-snap": {Name: "m"},
+		S3MetadataSnapshotName("tpl-x"):          {Name: "md"},
 	}}
 	useTestCowStorageAt(t, engine)
 
 	b, err := PublishTemplateBases(context.Background(), "tpl-x")
 	require.NoError(t, err)
-	require.Equal(t, []string{cowTemplateRootfsName("tpl-x"), cowTemplateMemoryName("tpl-x") + "-snap"}, f.exports)
+	require.Len(t, f.exports, 3)
 	require.NotEmpty(t, b.Rootfs)
 	require.NotEmpty(t, b.Memory)
 	require.NotEqual(t, b.Rootfs, b.Memory)
-	require.Len(t, f.marks, 2)
+	require.Len(t, f.marks, 3)
 
 	// Publishing again reuses the marks rather than exporting twice.
 	_, err = PublishTemplateBases(context.Background(), "tpl-x")
 	require.NoError(t, err)
-	require.Len(t, f.exports, 2)
+	require.Len(t, f.exports, 3)
 }
 
 // A publish whose export already exists (an earlier attempt failed after the
@@ -320,17 +322,149 @@ func TestRemoteUUIDsCarryBasesBackwardCompatibly(t *testing.T) {
 	require.False(t, strings.Contains((&cow.RemoteUUIDs{Rootfs: "r"}).JSON(), "base"), "omitted when empty")
 }
 
+const (
+	testMemBase  = "7e2f3b01-2c3d-4e4f-9051-6b7c8d9e0f12"
+	testMetaBase = "8f304c12-3d4e-4f50-a162-7c8d9e0f1023"
+)
+
+func withTemplateMemory(t *testing.T, has bool) {
+	t.Helper()
+	prev := templateHasLocalMemory
+	templateHasLocalMemory = func(context.Context, map[string]string) bool { return has }
+	t.Cleanup(func() { templateHasLocalMemory = prev })
+}
+
 func TestTemplateBaseSnapshotForIsGated(t *testing.T) {
 	f := useFakeS3lvol(t)
+	withTemplateMemory(t, false)
 	f.bases[testBase] = templateBaseEntry{BaseUUID: testBase, Snapshot: "base-snap", Valid: true}
-	ann := map[string]string{templateBaseAnnotationRootfs: testBase}
+	f.bases[testMetaBase] = templateBaseEntry{BaseUUID: testMetaBase, Snapshot: "meta-snap", Valid: true}
+	ann := map[string]string{templateBaseAnnotationRootfs: testBase, templateBaseAnnotationMetadata: testMetaBase}
 
 	t.Setenv(envTemplateS3Distribution, "")
-	require.Empty(t, templateBaseSnapshotFor(context.Background(), ann, TemplateBaseRoleRootfs))
+	require.Empty(t, templateBaseSnapshotFor(context.Background(), ann, "", TemplateBaseRoleRootfs))
 	t.Setenv(envTemplateS3Distribution, "true")
-	require.Equal(t, "base-snap", templateBaseSnapshotFor(context.Background(), ann, TemplateBaseRoleRootfs))
-	require.Empty(t, templateBaseSnapshotFor(context.Background(), ann, TemplateBaseRoleMemory))
+	require.Equal(t, "base-snap", templateBaseSnapshotFor(context.Background(), ann, "", TemplateBaseRoleRootfs))
+	require.Equal(t, "meta-snap", templateBaseSnapshotFor(context.Background(), ann, "", TemplateBaseRoleMetadata))
+	require.Empty(t, templateBaseSnapshotFor(context.Background(), ann, "", TemplateBaseRoleMemory))
 	// A base not on this node yet: fall back to the template's own snapshot.
 	ann[templateBaseAnnotationRootfs] = "aaaaaaaa-1b2c-4d3e-8f40-5a6b7c8d9e01"
-	require.Empty(t, templateBaseSnapshotFor(context.Background(), ann, TemplateBaseRoleRootfs))
+	require.Empty(t, templateBaseSnapshotFor(context.Background(), ann, "", TemplateBaseRoleRootfs))
+	require.Empty(t, templateBaseSnapshotFor(context.Background(), ann, "", TemplateBaseRoleMetadata),
+		"a missing rootfs base drops the metadata base too")
+}
+
+// Live 2026-11-17 (tpl-afe6, app2): the memory base was cloned while the
+// vmstate came from the node's own build. Every role must come from the bases
+// together, or none of them.
+func TestTemplateBaseSetNeverMixesBuilds(t *testing.T) {
+	t.Setenv(envTemplateS3Distribution, "true")
+	f := useFakeS3lvol(t)
+	withTemplateMemory(t, true)
+	f.bases[testBase] = templateBaseEntry{BaseUUID: testBase, Snapshot: "root-base", Valid: true}
+	f.bases[testMemBase] = templateBaseEntry{BaseUUID: testMemBase, Snapshot: "mem-base", Valid: true}
+	f.bases[testMetaBase] = templateBaseEntry{BaseUUID: testMetaBase, Snapshot: "meta-base", Valid: true}
+	full := map[string]string{
+		templateBaseAnnotationRootfs:   testBase,
+		templateBaseAnnotationMemory:   testMemBase,
+		templateBaseAnnotationMetadata: testMetaBase,
+	}
+	ctx := context.Background()
+
+	set := resolveTemplateBaseSet(ctx, full)
+	require.Equal(t, templateBaseSet{Rootfs: "root-base", Memory: "mem-base", Metadata: "meta-base"}, set)
+
+	// Old Master: memory base named, no metadata base. Must not clone memory.
+	old := map[string]string{templateBaseAnnotationRootfs: testBase, templateBaseAnnotationMemory: testMemBase}
+	require.True(t, resolveTemplateBaseSet(ctx, old).empty())
+
+	// The template has memory but no memory base is named: local build only.
+	noMem := map[string]string{templateBaseAnnotationRootfs: testBase, templateBaseAnnotationMetadata: testMetaBase}
+	require.True(t, resolveTemplateBaseSet(ctx, noMem).empty())
+
+	// Metadata base not installed here yet: nothing from the bases.
+	delete(f.bases, testMetaBase)
+	require.True(t, resolveTemplateBaseSet(ctx, full).empty())
+
+	// Memory base invalid (anchor written to): nothing from the bases.
+	f.bases[testMetaBase] = templateBaseEntry{BaseUUID: testMetaBase, Snapshot: "meta-base", Valid: true}
+	f.bases[testMemBase] = templateBaseEntry{BaseUUID: testMemBase, Snapshot: "mem-base", Valid: false}
+	require.True(t, resolveTemplateBaseSet(ctx, full).empty())
+}
+
+// The rootfs, memory and metadata steps of one create must see one decision,
+// even when a base install lands between them.
+func TestTemplateBaseSetIsDecidedOncePerSandbox(t *testing.T) {
+	t.Setenv(envTemplateS3Distribution, "true")
+	f := useFakeS3lvol(t)
+	withTemplateMemory(t, true)
+	full := map[string]string{
+		templateBaseAnnotationRootfs:   testBase,
+		templateBaseAnnotationMemory:   testMemBase,
+		templateBaseAnnotationMetadata: testMetaBase,
+	}
+	ctx := context.Background()
+	sb := "sb-decided-once"
+	t.Cleanup(func() { forgetTemplateBaseSet(sb) })
+	f.bases[testBase] = templateBaseEntry{BaseUUID: testBase, Snapshot: "root-base", Valid: true}
+	f.bases[testMemBase] = templateBaseEntry{BaseUUID: testMemBase, Snapshot: "mem-base", Valid: true}
+
+	// Metadata base missing at the rootfs step: the local build is chosen.
+	require.Empty(t, templateBaseSnapshotFor(ctx, full, sb, TemplateBaseRoleRootfs))
+	// The install completes before the memory and metadata steps run.
+	f.bases[testMetaBase] = templateBaseEntry{BaseUUID: testMetaBase, Snapshot: "meta-base", Valid: true}
+	require.Empty(t, templateBaseSnapshotFor(ctx, full, sb, TemplateBaseRoleMemory))
+	require.Empty(t, TemplateBaseMetadataFor(ctx, full, sb))
+
+	// A new sandbox sees the complete set.
+	sb2 := "sb-decided-once-2"
+	t.Cleanup(func() { forgetTemplateBaseSet(sb2) })
+	require.Equal(t, "mem-base", templateBaseSnapshotFor(ctx, full, sb2, TemplateBaseRoleMemory))
+	require.Equal(t, "meta-base", TemplateBaseMetadataFor(ctx, full, sb2))
+	require.Equal(t, "root-base", templateBaseSnapshotFor(ctx, full, sb2, TemplateBaseRoleRootfs))
+}
+
+// The builder publishes the metadata disk with the memory image; a memory
+// image without a sealed metadata snapshot is refused rather than published
+// as a set that would make importers mix builds.
+func TestPublishTemplateBasesIncludesMetadata(t *testing.T) {
+	f := useFakeS3lvol(t)
+	engine := &fakeCowEngine{volumeInfos: map[string]*cubecow.Volume{
+		cowTemplateMemoryName("tpl-x") + "-snap": {Name: "m"},
+		S3MetadataSnapshotName("tpl-x"):          {Name: "md"},
+	}}
+	useTestCowStorageAt(t, engine)
+	b, err := PublishTemplateBases(context.Background(), "tpl-x")
+	require.NoError(t, err)
+	require.Equal(t, []string{cowTemplateRootfsName("tpl-x"), cowTemplateMemoryName("tpl-x") + "-snap",
+		S3MetadataSnapshotName("tpl-x")}, f.exports)
+	require.NotEmpty(t, b.Metadata)
+	require.Len(t, f.marks, 3)
+
+	f2 := useFakeS3lvol(t)
+	useTestCowStorageAt(t, &fakeCowEngine{volumeInfos: map[string]*cubecow.Volume{
+		cowTemplateMemoryName("tpl-y") + "-snap": {Name: "m"},
+	}})
+	_, err = PublishTemplateBases(context.Background(), "tpl-y")
+	require.ErrorContains(t, err, "no sealed metadata snapshot")
+	_ = f2
+}
+
+func TestInstallTemplateBaseMetadataRole(t *testing.T) {
+	useFakeS3lvol(t)
+	engine := &fakeCowEngine{}
+	useTestCowStorageAt(t, engine)
+	_, _, err := HandleTemplateBaseRequest(context.Background(), map[string]string{
+		TemplateBaseOpAnnotation: "install", TemplateBaseTemplateAnnotation: "tpl-x",
+		TemplateBaseRoleAnnotation: TemplateBaseRoleMetadata, TemplateBaseUUIDAnnotation: testMetaBase})
+	require.NoError(t, err)
+	want := TemplateBaseSnapshotName("tpl-x", testMetaBase, TemplateBaseRoleMetadata)
+	require.Equal(t, [][2]string{{want + "-anchor", want}}, engine.createSnapshots)
+	require.True(t, isInstalledBaseName(want))
+}
+
+// A delta metadata export names its base, and the importer installs it first.
+func TestRemoteUUIDsCarryMetadataBase(t *testing.T) {
+	u := cow.ParseRemoteUUIDs(`{"rootfs":"r","metadata":"x","metadata_base":"b3"}`)
+	require.Equal(t, "b3", u.MetadataBase)
 }

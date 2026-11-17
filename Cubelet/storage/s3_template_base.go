@@ -41,20 +41,28 @@ import (
 	"net"
 	"os"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/tencentcloud/CubeSandbox/Cubelet/pkg/constants"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/pkg/cubecow"
+	"github.com/tencentcloud/CubeSandbox/Cubelet/storage/cow"
 	CubeLog "github.com/tencentcloud/CubeSandbox/pkgs/CubeLog"
 )
 
 const (
 	envTemplateS3Distribution = "CUBE_TEMPLATE_S3_DISTRIBUTION"
 
-	// TemplateBaseRoleRootfs and TemplateBaseRoleMemory name the two bases a
-	// template has.
-	TemplateBaseRoleRootfs = "rootfs"
-	TemplateBaseRoleMemory = "memory"
+	// TemplateBaseRoleRootfs, TemplateBaseRoleMemory and
+	// TemplateBaseRoleMetadata name the bases a template has. The metadata
+	// base is the template's sealed metadata disk, which carries the VM state
+	// (snapshot/state.json, config.json) the memory image belongs to: a node
+	// that restores the builder's memory must also restore the builder's
+	// metadata, or it resumes one build's RAM under another build's vmstate.
+	TemplateBaseRoleRootfs   = "rootfs"
+	TemplateBaseRoleMemory   = "memory"
+	TemplateBaseRoleMetadata = "metadata"
 
 	templateBaseRPCTimeout     = 30 * time.Second
 	templateBaseExportDeadline = 15 * time.Minute
@@ -79,6 +87,7 @@ type TemplateBases struct {
 	TemplateID string `json:"template_id"`
 	Rootfs     string `json:"rootfs,omitempty"`
 	Memory     string `json:"memory,omitempty"`
+	Metadata   string `json:"metadata,omitempty"`
 }
 
 func shortBase(baseUUID string) string {
@@ -107,10 +116,21 @@ func TemplateBaseAnchorName(templateID, baseUUID, role string) string {
 
 // templateBaseSourceName is the snapshot a builder publishes for role.
 func templateBaseSourceName(templateID, role string) string {
-	if role == TemplateBaseRoleMemory {
+	switch role {
+	case TemplateBaseRoleMemory:
 		return cowTemplateMemoryName(templateID) + "-snap"
+	case TemplateBaseRoleMetadata:
+		return S3MetadataSnapshotName(templateID)
 	}
 	return cowTemplateRootfsName(templateID)
+}
+
+func validTemplateBaseRole(role string) bool {
+	switch role {
+	case TemplateBaseRoleRootfs, TemplateBaseRoleMemory, TemplateBaseRoleMetadata:
+		return true
+	}
+	return false
 }
 
 // ---------------------------------------------------------------------------
@@ -417,6 +437,20 @@ func PublishTemplateBases(ctx context.Context, templateID string) (*TemplateBase
 			return nil, err
 		}
 	}
+	// The metadata disk is the vmstate of this very build. Without it a
+	// non-builder node would pair the builder's memory with its own vmstate.
+	metaSnap := templateBaseSourceName(templateID, TemplateBaseRoleMetadata)
+	present, perr = cowObjectPresent(store.GetVolumeInfo(ctx, metaSnap))
+	if perr != nil {
+		return nil, perr
+	}
+	if present {
+		if out.Metadata, err = publishOne(ctx, templateID, TemplateBaseRoleMetadata); err != nil {
+			return nil, err
+		}
+	} else if out.Memory != "" {
+		return nil, fmt.Errorf("template %s has a memory image but no sealed metadata snapshot %s to publish with it", templateID, metaSnap)
+	}
 	return out, nil
 }
 
@@ -544,7 +578,7 @@ func isInstalledBaseName(name string) bool {
 	if !strings.HasPrefix(name, "tpl-") {
 		return false
 	}
-	for _, role := range []string{TemplateBaseRoleRootfs, TemplateBaseRoleMemory} {
+	for _, role := range []string{TemplateBaseRoleRootfs, TemplateBaseRoleMemory, TemplateBaseRoleMetadata} {
 		rest, ok := strings.CutSuffix(name, "-"+role)
 		if !ok {
 			continue
@@ -573,30 +607,162 @@ func ensureDeltaBase(ctx context.Context, templateID, role, baseUUID string) err
 	return nil
 }
 
-// templateBaseSnapshotFor answers the local base snapshot to clone a new
-// sandbox of templateID from, or "" to use the template's own snapshot.
-// Only when distribution is on and Master named a base.
-func templateBaseSnapshotFor(ctx context.Context, ann map[string]string, role string) string {
+// templateBaseSet is the set of local base snapshots one template cold start
+// clones from. Either every role the template has comes from the bases (one
+// build: the publisher's), or none does and the sandbox uses the node's own
+// build for all of them. Mixing is never allowed: memory and vmstate from two
+// builds resume a VM whose RAM does not match its device state (live
+// 2026-11-17: virtio "invalid available ring index", shim never answered).
+type templateBaseSet struct {
+	Rootfs   string
+	Memory   string
+	Metadata string
+}
+
+func (s templateBaseSet) empty() bool {
+	return s.Rootfs == "" && s.Memory == "" && s.Metadata == ""
+}
+
+func (s templateBaseSet) role(role string) string {
+	switch role {
+	case TemplateBaseRoleRootfs:
+		return s.Rootfs
+	case TemplateBaseRoleMemory:
+		return s.Memory
+	case TemplateBaseRoleMetadata:
+		return s.Metadata
+	}
+	return ""
+}
+
+// templateHasLocalMemory reports whether the template the request names has a
+// memory image in this node's catalog. Unknown is answered true: the caller
+// then insists on a memory base, which only ever falls back to the local
+// build, never mixes. Tests override.
+var templateHasLocalMemory = func(ctx context.Context, ann map[string]string) bool {
+	id := strings.TrimSpace(ann[constants.MasterAnnotationAppSnapshotTemplateID])
+	if id == "" {
+		return true
+	}
+	entry, err := GetLocalSnapshotFor(ctx, cow.BackendS3, id)
+	if err != nil || entry == nil {
+		return true
+	}
+	return strings.TrimSpace(entry.MemoryVol) != ""
+}
+
+// resolveTemplateBaseSet decides the set from scratch.
+func resolveTemplateBaseSet(ctx context.Context, ann map[string]string) templateBaseSet {
 	if !TemplateS3DistributionEnabled() || len(ann) == 0 {
-		return ""
+		return templateBaseSet{}
 	}
-	key := templateBaseAnnotationRootfs
-	if role == TemplateBaseRoleMemory {
-		key = templateBaseAnnotationMemory
+	want := map[string]string{
+		TemplateBaseRoleRootfs:   strings.TrimSpace(ann[templateBaseAnnotationRootfs]),
+		TemplateBaseRoleMemory:   strings.TrimSpace(ann[templateBaseAnnotationMemory]),
+		TemplateBaseRoleMetadata: strings.TrimSpace(ann[templateBaseAnnotationMetadata]),
 	}
-	uuid := strings.TrimSpace(ann[key])
-	if uuid == "" {
-		return ""
+	if want[TemplateBaseRoleRootfs] == "" {
+		return templateBaseSet{}
 	}
-	snap, err := LookupTemplateBase(ctx, uuid)
-	if err != nil {
-		CubeLog.Warnf("template base %s (%s): lookup failed, using the template snapshot: %v", uuid, role, err)
-		return ""
+	if want[TemplateBaseRoleMetadata] == "" {
+		CubeLog.Warnf("template base %s: no metadata base named; using this node's own build for every disk",
+			want[TemplateBaseRoleRootfs])
+		return templateBaseSet{}
 	}
-	if snap == "" {
-		CubeLog.Warnf("template base %s (%s) is not on this node yet; using the template snapshot", uuid, role)
+	if want[TemplateBaseRoleMemory] == "" && templateHasLocalMemory(ctx, ann) {
+		CubeLog.Warnf("template base %s: the template has a memory image but no memory base is named; using this node's own build for every disk",
+			want[TemplateBaseRoleRootfs])
+		return templateBaseSet{}
 	}
-	return snap
+	var out templateBaseSet
+	for _, role := range []string{TemplateBaseRoleRootfs, TemplateBaseRoleMemory, TemplateBaseRoleMetadata} {
+		uuid := want[role]
+		if uuid == "" {
+			continue
+		}
+		snap, err := LookupTemplateBase(ctx, uuid)
+		if err != nil {
+			CubeLog.Warnf("template base %s (%s): lookup failed; using this node's own build for every disk: %v", uuid, role, err)
+			return templateBaseSet{}
+		}
+		if snap == "" {
+			CubeLog.Warnf("template base %s (%s) is not on this node yet; using this node's own build for every disk", uuid, role)
+			return templateBaseSet{}
+		}
+		switch role {
+		case TemplateBaseRoleRootfs:
+			out.Rootfs = snap
+		case TemplateBaseRoleMemory:
+			out.Memory = snap
+		case TemplateBaseRoleMetadata:
+			out.Metadata = snap
+		}
+	}
+	return out
+}
+
+// The rootfs, memory and metadata steps of one create run at different
+// times, and a base install can complete in between. The decision is taken
+// once per sandbox and remembered, so all three steps see the same answer.
+const templateBaseSetTTL = 30 * time.Minute
+
+type templateBaseSetEntry struct {
+	set templateBaseSet
+	at  time.Time
+}
+
+var (
+	templateBaseSetMu    sync.Mutex
+	templateBaseSetCache = map[string]templateBaseSetEntry{}
+)
+
+func templateBaseSetFor(ctx context.Context, ann map[string]string, sandboxID string) templateBaseSet {
+	sandboxID = strings.TrimSpace(sandboxID)
+	if sandboxID == "" {
+		return resolveTemplateBaseSet(ctx, ann)
+	}
+	now := time.Now()
+	templateBaseSetMu.Lock()
+	for id, e := range templateBaseSetCache {
+		if now.Sub(e.at) > templateBaseSetTTL {
+			delete(templateBaseSetCache, id)
+		}
+	}
+	if e, ok := templateBaseSetCache[sandboxID]; ok {
+		templateBaseSetMu.Unlock()
+		return e.set
+	}
+	templateBaseSetMu.Unlock()
+
+	set := resolveTemplateBaseSet(ctx, ann)
+
+	templateBaseSetMu.Lock()
+	defer templateBaseSetMu.Unlock()
+	if e, ok := templateBaseSetCache[sandboxID]; ok {
+		return e.set // a concurrent step decided first; keep its answer
+	}
+	templateBaseSetCache[sandboxID] = templateBaseSetEntry{set: set, at: now}
+	return set
+}
+
+// forgetTemplateBaseSet drops the remembered decision (tests, destroy).
+func forgetTemplateBaseSet(sandboxID string) {
+	templateBaseSetMu.Lock()
+	delete(templateBaseSetCache, strings.TrimSpace(sandboxID))
+	templateBaseSetMu.Unlock()
+}
+
+// templateBaseSnapshotFor answers the local base snapshot to clone role of a
+// new sandbox from, or "" to use the template's own snapshot. It is "" for
+// every role unless every role the template has is available as a base.
+func templateBaseSnapshotFor(ctx context.Context, ann map[string]string, sandboxID, role string) string {
+	return templateBaseSetFor(ctx, ann, sandboxID).role(role)
+}
+
+// TemplateBaseMetadataFor is the metadata base a template cold start of
+// sandboxID must clone its metadata disk from, or "" for the local build.
+func TemplateBaseMetadataFor(ctx context.Context, ann map[string]string, sandboxID string) string {
+	return templateBaseSnapshotFor(ctx, ann, sandboxID, TemplateBaseRoleMetadata)
 }
 
 // ---------------------------------------------------------------------------
@@ -637,7 +803,7 @@ func HandleTemplateBaseRequest(ctx context.Context, ann map[string]string) (bool
 		}
 		return reply(b)
 	case "install":
-		if role != TemplateBaseRoleRootfs && role != TemplateBaseRoleMemory {
+		if !validTemplateBaseRole(role) {
 			return true, "", fmt.Errorf("invalid template base role %q", role)
 		}
 		snap, err := InstallTemplateBase(ctx, templateID, role, uuid)
@@ -659,6 +825,7 @@ func HandleTemplateBaseRequest(ctx context.Context, ann map[string]string) (bool
 
 // Create annotations Master sets when CUBE_TEMPLATE_S3_DISTRIBUTION is on.
 const (
-	templateBaseAnnotationRootfs = "cube.master.template.base.rootfs"
-	templateBaseAnnotationMemory = "cube.master.template.base.memory"
+	templateBaseAnnotationRootfs   = "cube.master.template.base.rootfs"
+	templateBaseAnnotationMemory   = "cube.master.template.base.memory"
+	templateBaseAnnotationMetadata = "cube.master.template.base.metadata"
 )

@@ -397,6 +397,47 @@ func CloneS3MetadataFromParent(ctx context.Context, backend, parentID, childID, 
 	return persistDerivedLocked(childID, vol.VolumeName, mountPath)
 }
 
+// CloneS3MetadataFromSnapshot is CloneS3MetadataFromParent for a source named
+// directly: a template base's metadata snapshot, which does not follow the
+// s3-meta-<id> naming. The source must exist; there is no fallback to the
+// node-local base, because an empty metadata disk is not a usable restore.
+func CloneS3MetadataFromSnapshot(ctx context.Context, backend, sourceSnapshot, childID, mountPath string) error {
+	if !isS3CatalogBackend(backend) {
+		return nil
+	}
+	source := strings.TrimSpace(sourceSnapshot)
+	childID = strings.TrimSpace(childID)
+	mountPath = strings.TrimSpace(mountPath)
+	if source == "" || childID == "" || mountPath == "" {
+		return fmt.Errorf("s3 metadata source, child id and mount path are required")
+	}
+	if IsS3MetadataBaseName(source) {
+		return fmt.Errorf("refusing to clone package metadata from the node-local base %s", source)
+	}
+	store, err := requireS3Cow()
+	if err != nil {
+		return err
+	}
+	s3MetadataMu.Lock()
+	defer s3MetadataMu.Unlock()
+	info, infoErr := store.GetVolumeInfo(ctx, source)
+	exists, err := cowObjectPresent(info, infoErr)
+	if err != nil {
+		return fmt.Errorf("lookup s3 metadata source %s: %w", source, err)
+	}
+	if !exists {
+		return fmt.Errorf("s3 metadata source %s is not on this node", source)
+	}
+	vol, err := store.deriveMetadataSnapshotLocked(ctx, childID, source)
+	if err != nil {
+		return err
+	}
+	if err := mountS3MetadataLocked(childID, vol.FilePath, mountPath); err != nil {
+		return err
+	}
+	return persistDerivedLocked(childID, vol.VolumeName, mountPath)
+}
+
 // MountS3MetadataAt mounts the package metadata disk at mountPath.
 // IO always goes through a RW volume (s3-meta-<id>). If only the sealed
 // snap remains, it is cloned to that volume first — never activate／mount

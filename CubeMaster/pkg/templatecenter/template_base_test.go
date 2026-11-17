@@ -48,6 +48,9 @@ func (f *fakeCubelets) call(_ context.Context, ip string, ann map[string]string)
 		if f.publish.Memory != "" {
 			f.held[ip][f.publish.Memory] = true
 		}
+		if f.publish.Metadata != "" {
+			f.held[ip][f.publish.Metadata] = true
+		}
 		raw, _ := json.Marshal(f.publish)
 		return string(raw), nil
 	case "install":
@@ -98,8 +101,10 @@ func useFakeCubelets(t *testing.T, nodes []*node.Node) *fakeCubelets {
 const (
 	baseR1 = "11111111-0000-4000-8000-000000000001"
 	baseM1 = "11111111-0000-4000-8000-000000000002"
+	baseD1 = "11111111-0000-4000-8000-000000000003"
 	baseR2 = "22222222-0000-4000-8000-000000000001"
 	baseM2 = "22222222-0000-4000-8000-000000000002"
+	baseD2 = "22222222-0000-4000-8000-000000000003"
 )
 
 func seedBuilt(t *testing.T, db *gorm.DB, templateID, artifactID string, nodes ...*node.Node) templateBaseDefinition {
@@ -126,7 +131,7 @@ func TestTemplateBaseReconcilerPublishesAndInstalls(t *testing.T) {
 	db := newTemplateBaseTestDB(t)
 	a, b, c := testNode("node-a", "10.0.0.1"), testNode("node-b", "10.0.0.2"), testNode("node-c", "10.0.0.3")
 	f := useFakeCubelets(t, []*node.Node{a, b, c})
-	f.publish = publishedBases{TemplateID: "tpl-1", Rootfs: baseR1, Memory: baseM1}
+	f.publish = publishedBases{TemplateID: "tpl-1", Rootfs: baseR1, Memory: baseM1, Metadata: baseD1}
 	f.installLies["10.0.0.3"] = true // install says ok, lookup says absent
 	def := seedBuilt(t, db, "tpl-1", "art-1", a)
 
@@ -152,8 +157,50 @@ func TestTemplateBaseReconcilerPublishesAndInstalls(t *testing.T) {
 	}
 	require.Equal(t, []string{"node-a", "node-b", "node-c"}, readyReplicaNodes(t, db, baseR1))
 
+	require.Equal(t, []string{"node-a", "node-b", "node-c"}, readyReplicaNodes(t, db, baseD1))
 	ann := TemplateBaseCreateAnnotations(context.Background(), "tpl-1")
-	require.Equal(t, map[string]string{TemplateBaseRootfsCreateAnnotation: baseR1, TemplateBaseMemoryCreateAnnotation: baseM1}, ann)
+	require.Equal(t, map[string]string{TemplateBaseRootfsCreateAnnotation: baseR1,
+		TemplateBaseMemoryCreateAnnotation: baseM1, TemplateBaseMetadataCreateAnnotation: baseD1}, ann)
+}
+
+// A publish that returns memory without metadata would let importers pair
+// one build's memory with another build's vmstate: it is not recorded.
+func TestTemplateBasePublishRefusesMemoryWithoutMetadata(t *testing.T) {
+	db := newTemplateBaseTestDB(t)
+	a := testNode("node-a", "10.0.0.1")
+	f := useFakeCubelets(t, []*node.Node{a})
+	f.publish = publishedBases{Rootfs: baseR1, Memory: baseM1}
+	def := seedBuilt(t, db, "tpl-1", "art-1", a)
+	require.ErrorContains(t, publishTemplateBase(context.Background(), def), "without its metadata base")
+	var n int64
+	require.NoError(t, db.Model(&models.TemplateBase{}).Count(&n).Error)
+	require.Zero(t, n)
+}
+
+// A set published before the metadata role existed (rootfs + memory READY)
+// is republished on the same builder; until then no annotation names the
+// memory base, so no Cubelet clones it.
+func TestTemplateBaseLegacySetIsCompletedOnTheSameBuilder(t *testing.T) {
+	db := newTemplateBaseTestDB(t)
+	a, b := testNode("node-a", "10.0.0.1"), testNode("node-b", "10.0.0.2")
+	f := useFakeCubelets(t, []*node.Node{a, b})
+	ctx := context.Background()
+	def := seedBuilt(t, db, "tpl-1", "art-1", a, b)
+	for role, id := range map[string]string{TemplateBaseRoleRootfs: baseR1, TemplateBaseRoleMemory: baseM1} {
+		require.NoError(t, db.Create(&models.TemplateBase{TemplateID: "tpl-1", Role: role, BaseUUID: id, ArtifactID: "art-1",
+			BuilderNodeID: "node-b", BuilderNodeIP: "10.0.0.2", Status: TemplateBaseStatusReady}).Error)
+	}
+	require.Nil(t, TemplateBaseCreateAnnotations(ctx, "tpl-1"), "memory without metadata is never named")
+
+	f.publish = publishedBases{Rootfs: baseR1, Memory: baseM1, Metadata: baseD1}
+	require.NoError(t, publishTemplateBase(ctx, def))
+	require.Equal(t, []string{"publish@10.0.0.2"}, f.calls, "republished on the original builder, not the first replica")
+	require.Equal(t, map[string]string{TemplateBaseRootfsCreateAnnotation: baseR1,
+		TemplateBaseMemoryCreateAnnotation: baseM1, TemplateBaseMetadataCreateAnnotation: baseD1},
+		TemplateBaseCreateAnnotations(ctx, "tpl-1"))
+	f.calls = nil
+	require.NoError(t, publishTemplateBase(ctx, def))
+	require.Empty(t, f.calls, "complete set: nothing to do")
 }
 
 func TestTemplateBaseNothingWhenFlagOffOrNotBuilt(t *testing.T) {
@@ -180,7 +227,7 @@ func TestTemplateBaseGCBlockedByReferences(t *testing.T) {
 	t.Setenv(envTemplateBaseGCGrace, "0s")
 	ctx := context.Background()
 
-	f.publish = publishedBases{Rootfs: baseR1, Memory: baseM1}
+	f.publish = publishedBases{Rootfs: baseR1, Memory: baseM1, Metadata: baseD1}
 	def := seedBuilt(t, db, "tpl-1", "art-1", a)
 	require.NoError(t, publishTemplateBase(ctx, def))
 	require.NoError(t, installTemplateBases(ctx, def))
@@ -192,12 +239,13 @@ func TestTemplateBaseGCBlockedByReferences(t *testing.T) {
 	// Rebuild.
 	require.NoError(t, db.Model(&models.TemplateReplica{}).Where("template_id = ?", "tpl-1").Update("artifact_id", "art-2").Error)
 	def.RootfsArtifactID = "art-2"
-	f.publish = publishedBases{Rootfs: baseR2, Memory: baseM2}
+	f.publish = publishedBases{Rootfs: baseR2, Memory: baseM2, Metadata: baseD2}
 	require.NoError(t, publishTemplateBase(ctx, def))
 	var old models.TemplateBase
 	require.NoError(t, db.Where("base_uuid = ?", baseR1).First(&old).Error)
 	require.Equal(t, TemplateBaseStatusRetired, old.Status)
-	require.Equal(t, map[string]string{TemplateBaseRootfsCreateAnnotation: baseR2, TemplateBaseMemoryCreateAnnotation: baseM2},
+	require.Equal(t, map[string]string{TemplateBaseRootfsCreateAnnotation: baseR2, TemplateBaseMemoryCreateAnnotation: baseM2,
+		TemplateBaseMetadataCreateAnnotation: baseD2},
 		TemplateBaseCreateAnnotations(ctx, "tpl-1"), "new sandboxes use the new base")
 
 	require.NoError(t, installTemplateBases(ctx, def))
@@ -246,7 +294,7 @@ func TestDeletedTemplateBasesAreRetiredAndCollected(t *testing.T) {
 	t.Setenv(envTemplateBaseGCGrace, "0s")
 	ctx := context.Background()
 
-	f.publish = publishedBases{Rootfs: baseR1, Memory: baseM1}
+	f.publish = publishedBases{Rootfs: baseR1, Memory: baseM1, Metadata: baseD1}
 	def := seedBuilt(t, db, "tpl-del", "art-1", a)
 	require.NoError(t, publishTemplateBase(ctx, def))
 	require.NoError(t, installTemplateBases(ctx, def))
@@ -259,7 +307,7 @@ func TestDeletedTemplateBasesAreRetiredAndCollected(t *testing.T) {
 	require.NoError(t, retireTemplateBasesOf(ctx, "tpl-del"))
 	var n int64
 	require.NoError(t, db.Model(&models.TemplateBase{}).Where("template_id = ? AND status = ?", "tpl-del", TemplateBaseStatusRetired).Count(&n).Error)
-	require.EqualValues(t, 2, n)
+	require.EqualValues(t, 3, n)
 	require.Empty(t, TemplateBaseCreateAnnotations(ctx, "tpl-del"))
 
 	templateBaseNow = func() time.Time { return time.Now().Add(time.Minute) }

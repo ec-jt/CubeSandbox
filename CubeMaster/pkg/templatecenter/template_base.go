@@ -61,6 +61,10 @@ const (
 
 	TemplateBaseRoleRootfs = "rootfs"
 	TemplateBaseRoleMemory = "memory"
+	// TemplateBaseRoleMetadata is the builder's sealed metadata disk: the
+	// vmstate its memory image belongs to. A node that clones the memory
+	// base must clone this one too, never pair it with its own vmstate.
+	TemplateBaseRoleMetadata = "metadata"
 
 	TemplateBaseStatusReady   = "READY"
 	TemplateBaseStatusRetired = "RETIRED"
@@ -73,8 +77,9 @@ const (
 	templateBaseTemplateAnnotation     = "cube.master.template.base.template_id"
 	templateBaseRoleAnnotation         = "cube.master.template.base.role"
 	templateBaseUUIDAnnotation         = "cube.master.template.base.uuid"
-	TemplateBaseRootfsCreateAnnotation = "cube.master.template.base.rootfs"
-	TemplateBaseMemoryCreateAnnotation = "cube.master.template.base.memory"
+	TemplateBaseRootfsCreateAnnotation   = "cube.master.template.base.rootfs"
+	TemplateBaseMemoryCreateAnnotation   = "cube.master.template.base.memory"
+	TemplateBaseMetadataCreateAnnotation = "cube.master.template.base.metadata"
 
 	defaultTemplateBaseGCGrace = 24 * time.Hour
 )
@@ -100,6 +105,7 @@ type publishedBases struct {
 	TemplateID string `json:"template_id"`
 	Rootfs     string `json:"rootfs,omitempty"`
 	Memory     string `json:"memory,omitempty"`
+	Metadata   string `json:"metadata,omitempty"`
 }
 
 type baseLookupReply struct {
@@ -188,6 +194,24 @@ func templateBasesOf(ctx context.Context, templateID string, status string) ([]m
 	return rows, err
 }
 
+// publishedSetComplete reports whether the READY bases of the current
+// artifact form a complete set: a rootfs base, and when there is a memory
+// base, the metadata base of the same build. A set published before the
+// metadata role existed is incomplete and gets published again (Cubelet's
+// publish is idempotent per role, so only the metadata base is new).
+func publishedSetComplete(ready []models.TemplateBase, artifactID string) bool {
+	roles := map[string]bool{}
+	for _, b := range ready {
+		if b.ArtifactID == artifactID {
+			roles[b.Role] = true
+		}
+	}
+	if !roles[TemplateBaseRoleRootfs] {
+		return false
+	}
+	return !roles[TemplateBaseRoleMemory] || roles[TemplateBaseRoleMetadata]
+}
+
 // publishTemplateBase publishes the template's current build when no READY
 // base exists for it. The publishing node is the first node (by id) holding
 // a READY, clean replica of the CURRENT artifact.
@@ -196,9 +220,16 @@ func publishTemplateBase(ctx context.Context, def templateBaseDefinition) error 
 	if err != nil {
 		return err
 	}
+	if publishedSetComplete(ready, def.RootfsArtifactID) {
+		return nil
+	}
+	// Republish on the node that published the existing partial set: the
+	// bases of one template must all come from one build.
+	prevBuilder := ""
 	for _, b := range ready {
-		if b.ArtifactID == def.RootfsArtifactID {
-			return nil
+		if b.ArtifactID == def.RootfsArtifactID && b.BuilderNodeID != "" {
+			prevBuilder = b.BuilderNodeID
+			break
 		}
 	}
 	replicas, err := templateBaseReplicas(ctx, def.TemplateID)
@@ -214,11 +245,14 @@ func publishTemplateBase(ctx context.Context, def templateBaseDefinition) error 
 		if def.RootfsArtifactID != "" && r.ArtifactID != "" && r.ArtifactID != def.RootfsArtifactID {
 			continue
 		}
+		if prevBuilder != "" && r.NodeID != prevBuilder {
+			continue
+		}
 		builder = &replicas[i]
 		break
 	}
 	if builder == nil {
-		return nil // nothing built yet; the next tick retries
+		return nil // nothing built yet (or the publisher is gone); the next tick retries
 	}
 	msg, err := templateBaseCall(ctx, builder.NodeIP, map[string]string{
 		templateBaseOpAnnotation:       "publish",
@@ -234,9 +268,12 @@ func publishTemplateBase(ctx context.Context, def templateBaseDefinition) error 
 	if strings.TrimSpace(pub.Rootfs) == "" {
 		return fmt.Errorf("publish on %s returned no rootfs base", builder.NodeIP)
 	}
+	if strings.TrimSpace(pub.Memory) != "" && strings.TrimSpace(pub.Metadata) == "" {
+		return fmt.Errorf("publish on %s returned a memory base without its metadata base; not recording a set that would mix builds", builder.NodeIP)
+	}
 	return store.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		now := templateBaseNow()
-		for role, id := range map[string]string{TemplateBaseRoleRootfs: pub.Rootfs, TemplateBaseRoleMemory: pub.Memory} {
+		for role, id := range map[string]string{TemplateBaseRoleRootfs: pub.Rootfs, TemplateBaseRoleMemory: pub.Memory, TemplateBaseRoleMetadata: pub.Metadata} {
 			if id = strings.TrimSpace(id); id == "" {
 				continue
 			}
@@ -260,6 +297,9 @@ func publishTemplateBase(ctx context.Context, def templateBaseDefinition) error 
 		keep := []string{pub.Rootfs}
 		if pub.Memory != "" {
 			keep = append(keep, pub.Memory)
+		}
+		if pub.Metadata != "" {
+			keep = append(keep, pub.Metadata)
 		}
 		return tx.Model(&models.TemplateBase{}).
 			Where("template_id = ? AND status = ? AND base_uuid NOT IN ?", def.TemplateID, TemplateBaseStatusReady, keep).
@@ -451,7 +491,14 @@ func TemplateBaseCreateAnnotations(ctx context.Context, templateID string) map[s
 			out[TemplateBaseRootfsCreateAnnotation] = b.BaseUUID
 		case TemplateBaseRoleMemory:
 			out[TemplateBaseMemoryCreateAnnotation] = b.BaseUUID
+		case TemplateBaseRoleMetadata:
+			out[TemplateBaseMetadataCreateAnnotation] = b.BaseUUID
 		}
+	}
+	// Never name a memory base without the metadata base of the same build:
+	// Cubelet would refuse the set anyway, but an older Cubelet would not.
+	if out[TemplateBaseMemoryCreateAnnotation] != "" && out[TemplateBaseMetadataCreateAnnotation] == "" {
+		return nil
 	}
 	if len(out) == 0 {
 		return nil

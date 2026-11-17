@@ -684,11 +684,22 @@ func mountRestoreMetadata(ctx context.Context, flowOpts *workflow.CreateContext,
 	if sandboxID == "" && flowOpts.ReqInfo != nil {
 		sandboxID = strings.TrimSpace(flowOpts.ReqInfo.GetAnnotations()[constants.MasterAnnotationDesiredSandboxID])
 	}
+	realSandboxID := sandboxID
 	if sandboxID == "" {
 		if flowOpts.IsPauseResume() {
 			return "", fmt.Errorf("pause resume requires sandbox id to clone metadata off the package")
 		}
 		sandboxID = packageID
+	}
+	// CUBE_TEMPLATE_S3_DISTRIBUTION: a template cold start that clones its
+	// memory off the distributed base must read the vmstate of that same
+	// build, so its metadata disk comes from the metadata base too. The
+	// storage layer decides once per sandbox: all bases or none.
+	if !flowOpts.IsPauseResume() && flowOpts.ReqInfo != nil &&
+		strings.TrimSpace(flowOpts.ReqInfo.GetAnnotations()[constants.MasterAnnotationRuntimeSnapshotID]) == "" {
+		if src := storage.TemplateBaseMetadataFor(ctx, flowOpts.ReqInfo.GetAnnotations(), realSandboxID); src != "" {
+			return mountPath, storage.CloneS3MetadataFromSnapshot(ctx, backend, src, sandboxID, mountPath)
+		}
 	}
 	// Pause resume and create-from-snapshot both clone into a sandbox-owned
 	// volume. XFS CloneS3MetadataFromParent is a no-op (plain package dir).

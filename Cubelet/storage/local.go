@@ -1041,7 +1041,7 @@ func (l *local) prefetchRestoreMemoryVolURL(ctx context.Context, opts *workflow.
 	// off the distributed base when this node holds it, so the sandbox's
 	// pause export is a delta over a snapshot every node has.
 	if pauseOwner == "" && strings.TrimSpace(annotations[constants.MasterAnnotationRuntimeSnapshotID]) == "" {
-		if snap := templateBaseSnapshotFor(ctx, annotations, TemplateBaseRoleMemory); snap != "" {
+		if snap := templateBaseSnapshotFor(ctx, annotations, opts.GetSandboxID(), TemplateBaseRoleMemory); snap != "" {
 			if sb := strings.TrimSpace(opts.GetSandboxID()); sb != "" {
 				store, serr := l.storeForBackend(backend)
 				if serr != nil {
@@ -1427,7 +1427,7 @@ func (l *local) allocateSnapshotRootfs(ctx context.Context, opts *workflow.Creat
 	// every node holds. Only for a template cold start: a pause resume or a
 	// snapshot restore clones its own package.
 	if strings.TrimSpace(opts.ReqInfo.GetAnnotations()[constants.MasterAnnotationRuntimeSnapshotID]) == "" {
-		if snap := templateBaseSnapshotFor(ctx, opts.ReqInfo.GetAnnotations(), TemplateBaseRoleRootfs); snap != "" {
+		if snap := templateBaseSnapshotFor(ctx, opts.ReqInfo.GetAnnotations(), sandboxID, TemplateBaseRoleRootfs); snap != "" {
 			return store.RollbackDeriveNewGen(ctx, sandboxID, snap, 0, desiredSizeBytes)
 		}
 	}

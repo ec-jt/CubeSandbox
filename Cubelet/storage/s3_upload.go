@@ -82,6 +82,7 @@ func (m *S3Cow) Upload(ctx context.Context, snapshotID string) (*cow.RemoteUUIDs
 			uuids.MemoryBase = exportedBaseOf(settleCtx, ref.Name)
 		case "metadata":
 			uuids.Metadata = uuid
+			uuids.MetadataBase = exportedBaseOf(settleCtx, ref.Name)
 		}
 		if i < len(exportable)-1 {
 			if err := m.waitExportSettled(settleCtx, ref.Name, uuid); err != nil {

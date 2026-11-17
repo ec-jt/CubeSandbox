@@ -123,6 +123,9 @@ func (s *SandboxImport) EnsureMetadata(ctx context.Context) (string, error) {
 		// have no other carrier.
 		return "", fmt.Errorf("cross-node restore of sandbox %s carries no metadata export", s.SandboxID)
 	}
+	if err := ensureDeltaBase(ctx, s.UUIDs.TemplateID, TemplateBaseRoleMetadata, s.UUIDs.MetadataBase); err != nil {
+		return "", fmt.Errorf("cross-node restore of sandbox %s: metadata: %w", s.SandboxID, err)
+	}
 	if _, err := s.importOne(ctx, S3MetadataVolumeName(s.SandboxID), "metadata", uuid); err != nil {
 		return "", err
 	}
