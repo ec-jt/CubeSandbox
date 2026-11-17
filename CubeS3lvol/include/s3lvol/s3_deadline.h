@@ -116,4 +116,11 @@ void s3_gate_abandon(struct s3_gate *g);
 
 bool s3_gate_is_abandoned(struct s3_gate *g);
 
+/** Client side, on a failed GET: how many bytes from the start of the range
+ * were written into the buffer before the failure. CRT delivers body parts in
+ * order, so they are a contiguous prefix and stay valid: a retry may ask for
+ * the rest only. 0 when nothing arrived (or on success). */
+void s3_gate_set_partial(struct s3_gate *g, uint64_t bytes);
+uint64_t s3_gate_partial(struct s3_gate *g);
+
 #endif /* S3LVOL_DEADLINE_H */

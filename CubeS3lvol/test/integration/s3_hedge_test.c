@@ -77,6 +77,7 @@ check_u64(const char *what, uint64_t got, uint64_t want)
 struct fake_req {
 	bool          put;
 	char          key[S3_EXPORT_KEY_MAX];
+	uint64_t      offset;
 	uint64_t      len;
 	void         *buf;
 	struct s3_gate *gate;
@@ -95,6 +96,10 @@ static uint32_t g_late_writes;   /* writes attempted after abandon: must stay 0 
 /* Per-key failure budget for [7]/[8]: fail this many times, then succeed. */
 static char     g_flaky_key[S3_EXPORT_KEY_MAX];
 static uint32_t g_flaky_left;
+/* When a flaky GET fails, how many bytes of its range it delivers first,
+ * like a CRT stream that aborts partway (crt=2073). */
+static uint64_t g_flaky_partial;
+static uint64_t g_last_get_offset, g_last_get_len;
 
 static void
 fake_acquire(void *t)
@@ -163,9 +168,11 @@ s3_get_range_gated(struct s3_client *client, const char *key, uint64_t offset,
 	struct fake_req *r;
 
 	(void)client;
-	(void)offset;
 	r = fake_new(key, gate, cb_arg);
+	r->offset = offset;
 	r->len = len;
+	g_last_get_offset = offset;
+	g_last_get_len = len;
 	r->buf = buf;
 	r->get_cb = cb;
 	return 0;
@@ -243,11 +250,23 @@ fake_finish(struct fake_req *r, int status)
 	    g_flaky_left > 0) {
 		g_flaky_left--;
 		status = -EIO;
+		if (!r->put && g_flaky_partial > 0 && s3_gate_write_begin(r->gate)) {
+			uint64_t n = g_flaky_partial < r->len ? g_flaky_partial : r->len;
+
+			/* Exactly what the real client does on an aborted body: the
+			 * prefix is in the buffer, its length is on the gate, and the
+			 * callback still reports 0. */
+			for (i = 0; i < n; i++) {
+				((uint8_t *)r->buf)[i] = obj_byte(r->key, r->offset + i);
+			}
+			s3_gate_write_end(r->gate);
+			s3_gate_set_partial(r->gate, n);
+		}
 	}
 	if (status == 0 && !r->put) {
 		if (s3_gate_write_begin(r->gate)) {
 			for (i = 0; i < r->len; i++) {
-				((uint8_t *)r->buf)[i] = obj_byte(r->key, i);
+				((uint8_t *)r->buf)[i] = obj_byte(r->key, r->offset + i);
 			}
 			s3_gate_write_end(r->gate);
 			got = r->len;
@@ -300,6 +319,7 @@ reset_fake(void)
 	g_late_writes = 0;
 	g_flaky_key[0] = '\0';
 	g_flaky_left = 0;
+	g_flaky_partial = 0;
 }
 
 /* ==========================================================================
@@ -534,6 +554,41 @@ test_hedge(void)
 		check_u64("counters: the duplicate won", ctr.won, 1);
 	}
 
+	printf("\n[6b] a failed GET reports the prefix it delivered\n");
+	hedge_env("0", "30", "4");
+	reset_fake();
+	memset(&seen, 0, sizeof(seen));
+	memset(buf, 0xEE, CHUNK_SIZE);
+	snprintf(g_flaky_key, sizeof(g_flaky_key), "%s", key);
+	g_flaky_left = 1;
+	g_flaky_partial = CHUNK_SIZE / 4;
+	s3_get_range_hedged(cl, key, 0, CHUNK_SIZE, buf, NULL, get_cb, &seen);
+	fake_complete_all();
+	check_true("the failure is delivered", seen.calls == 1 && seen.status == -EIO);
+	check_u64("with the prefix length", seen.bytes, CHUNK_SIZE / 4);
+	check_true("and the prefix is the object's bytes",
+		   buf_is_object(buf, key, CHUNK_SIZE / 4));
+	reset_fake();
+
+	printf("\n[6c] a hedge failing too: the longer prefix wins\n");
+	hedge_env("1", "30", "4");
+	reset_fake();
+	memset(&seen, 0, sizeof(seen));
+	memset(buf, 0xEE, CHUNK_SIZE);
+	s3_get_range_hedged(cl, key, 0, CHUNK_SIZE, buf, NULL, get_cb, &seen);
+	poll_until(pending_at_least, (void *)2, 2000);
+	snprintf(g_flaky_key, sizeof(g_flaky_key), "%s", key);
+	g_flaky_left = 2;
+	g_flaky_partial = CHUNK_SIZE / 8;
+	fake_finish(fake_nth(0), 0);   /* primary: 1/8 then fails */
+	g_flaky_partial = CHUNK_SIZE / 2;
+	fake_finish(fake_nth(0), 0);   /* duplicate: 1/2 then fails */
+	check_true("one failure delivered", seen.calls == 1 && seen.status == -EIO);
+	check_u64("carrying the duplicate's longer prefix", seen.bytes, CHUNK_SIZE / 2);
+	check_true("copied into the caller's buffer",
+		   buf_is_object(buf, key, CHUNK_SIZE / 2));
+	reset_fake();
+
 	printf("\n    hedging disabled: a plain request\n");
 	hedge_env("0", "30", "4");
 	reset_fake();
@@ -615,6 +670,50 @@ pf_settled(void *arg)
 	       (pg.fetched == a->n || pg.status != 0);
 }
 
+/* Read one whole chunk through the device (it is served from the slot the
+ * prefetch filled). */
+struct read_arg {
+	bool done;
+	int  status;
+	struct spdk_bs_dev_cb_args args;
+};
+
+static void
+read_arg_done(struct spdk_io_channel *ch, void *arg, int status)
+{
+	struct read_arg *r = arg;
+
+	(void)ch;
+	r->done = true;
+	r->status = status;
+}
+
+static bool
+read_arg_settled(void *arg)
+{
+	return ((struct read_arg *)arg)->done;
+}
+
+static int
+read_chunk(struct spdk_bs_dev *dev, uint64_t chunk, uint8_t *out, struct read_arg *r)
+{
+	struct spdk_io_channel *ch = dev->create_channel(dev);
+	uint32_t bl = dev->blocklen;
+
+	memset(r, 0, sizeof(*r));
+	if (!ch) {
+		return -ENOMEM;
+	}
+	r->args.cb_fn = read_arg_done;
+	r->args.cb_arg = r;
+	r->args.channel = ch;
+	dev->read(dev, ch, out, chunk * CHUNK_SIZE / bl, CHUNK_SIZE / bl, &r->args);
+	poll_until(read_arg_settled, r, 5000);
+	dev->destroy_channel(dev, ch);
+	poll_some(10);
+	return r->done ? r->status : -ETIMEDOUT;
+}
+
 static void
 test_retry(struct s3_export_manifest *m)
 {
@@ -679,6 +778,45 @@ test_retry(struct s3_export_manifest *m)
 	check_u64("the failure reached the callback once", seen.failed, 1);
 	check_true("the chunks in flight alongside it were not aborted",
 		   seen.ok >= 3 && pg.fetched == seen.ok);
+	s3_export_prefetcher_destroy(pf);
+	dev->destroy(dev);
+	poll_some(50);
+
+	printf("\n[8b] ranged retry: a GET that aborts partway keeps its bytes\n");
+	dev = NULL;
+	rc = s3_export_bs_dev_create((struct s3_client *)0x1, m, &dev);
+	reset_fake();
+	memset(&seen, 0, sizeof(seen));
+	s3_chunk_data_key(SRC_PREFIX, &g_uuids[2], g_flaky_key, sizeof(g_flaky_key));
+	g_flaky_left = 2;
+	g_flaky_partial = CHUNK_SIZE / 4;
+	rc = s3_export_prefetcher_create(dev, &chunks[2], 1, 1, pf_cb, &seen, &pf);
+	s3_export_prefetcher_pump(pf);
+	done.p = pf;
+	done.n = 1;
+	check_true("settles", poll_until(pf_settled, &done, 5000));
+	s3_export_prefetcher_get_progress(pf, &pg);
+	check_true("the chunk is fetched", pg.fetched == 1 && pg.status == 0);
+	check_u64("three GETs: two partial, one for the rest", g_reqs, 3);
+	check_u64("the last asks only for the missing tail", g_last_get_len,
+		  CHUNK_SIZE - 2 * (CHUNK_SIZE / 4));
+	check_u64("starting where the second one stopped", g_last_get_offset,
+		  2 * (CHUNK_SIZE / 4));
+	check_u64("progressing attempts do not use the retry budget", pg.retries, 0);
+	s3_export_bs_dev_get_stats(dev, &st);
+	check_u64("two ranged resumes counted", st.ranged_resumes, 2);
+	check_u64("keeping half the chunk", st.resumed_bytes, CHUNK_SIZE / 2);
+	{
+		/* Read the whole chunk back through the device: every byte must
+		 * be the object's, the kept prefix as much as the fetched tail. */
+		struct read_arg ra;
+		uint8_t *out = calloc(1, CHUNK_SIZE);
+
+		check_true("read the chunk back", read_chunk(dev, 2, out, &ra) == 0);
+		check_true("every byte is the object's",
+			   buf_is_object(out, g_flaky_key, CHUNK_SIZE));
+		free(out);
+	}
 	s3_export_prefetcher_destroy(pf);
 	dev->destroy(dev);
 	poll_some(50);

@@ -1750,6 +1750,10 @@ s3_get_finished(struct aws_s3_meta_request *meta_request,
 		req->status = crt_error_to_errno(result->error_code,
 						result->response_status);
 		s3_stats_record_error(req->client, result->response_status);
+		/* The bytes that did arrive are an in-order prefix of the range
+		 * (see s3_get_body_callback): hand their count to a gated caller
+		 * so a retry can ask for the rest instead of starting over. */
+		s3_gate_set_partial(req->gate, req->bytes_read);
 		req->bytes_read = 0;
 	} else {
 		req->status = 0;

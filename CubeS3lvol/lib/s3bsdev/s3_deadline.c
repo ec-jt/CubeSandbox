@@ -356,6 +356,7 @@ struct s3_gate {
 	pthread_mutex_t               lock;
 	bool                          abandoned;
 	bool                          finished;
+	uint64_t                      partial;
 	void                         *target;
 	const struct s3_deadline_ops *ops;
 };
@@ -497,4 +498,29 @@ s3_gate_is_abandoned(struct s3_gate *g)
 	a = g->abandoned;
 	pthread_mutex_unlock(&g->lock);
 	return a;
+}
+
+void
+s3_gate_set_partial(struct s3_gate *g, uint64_t bytes)
+{
+	if (!g) {
+		return;
+	}
+	pthread_mutex_lock(&g->lock);
+	g->partial = bytes;
+	pthread_mutex_unlock(&g->lock);
+}
+
+uint64_t
+s3_gate_partial(struct s3_gate *g)
+{
+	uint64_t n;
+
+	if (!g) {
+		return 0;
+	}
+	pthread_mutex_lock(&g->lock);
+	n = g->partial;
+	pthread_mutex_unlock(&g->lock);
+	return n;
 }

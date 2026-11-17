@@ -400,6 +400,33 @@ hedge_timer_fire(void *arg)
 	return SPDK_POLLER_BUSY;
 }
 
+/* A GET that failed for good: the longest in-order prefix either attempt left
+ * behind, made to sit in the caller's buffer. Both attempts are finished here
+ * (a failure is only delivered then), so neither can still write. The bytes
+ * are valid because the key names an immutable object. 0 for PUT. */
+static uint64_t
+hedge_get_prefix(struct hedge_ctx *h)
+{
+	uint64_t p0 = 0, p1 = 0;
+
+	if (h->put) {
+		return 0;
+	}
+	if (h->a[0].sent && !s3_gate_is_abandoned(h->a[0].gate)) {
+		p0 = s3_gate_partial(h->a[0].gate);
+	}
+	if (h->a[1].sent && h->hbuf && !s3_gate_is_abandoned(h->a[1].gate)) {
+		p1 = s3_gate_partial(h->a[1].gate);
+	}
+	p0 = p0 > h->len ? h->len : p0;
+	p1 = p1 > h->len ? h->len : p1;
+	if (p1 > p0) {
+		memcpy(h->buf, h->hbuf, p1);
+		return p1;
+	}
+	return p0;
+}
+
 /* Common completion. \p bytes only for GET. Runs on the submitting thread. */
 static void
 hedge_attempt_done(struct hedge_attempt *a, uint64_t bytes, int status)
@@ -452,7 +479,7 @@ hedge_attempt_done(struct hedge_attempt *a, uint64_t bytes, int status)
 			if (!(other->sent && !other->done)) {
 				deliver = true;
 				out_status = h->first_err ? h->first_err : status;
-				out_bytes = 0;
+				out_bytes = hedge_get_prefix(h);
 			}
 		}
 	}
@@ -492,6 +519,18 @@ static void
 hedge_put_done(void *cb_arg, int status)
 {
 	hedge_attempt_done(cb_arg, 0, status);
+}
+
+static bool
+hedge_enabled(void)
+{
+	bool on;
+
+	hedge_ensure_loaded();
+	pthread_mutex_lock(&g_hedge_lock);
+	on = g_hedge_enabled;
+	pthread_mutex_unlock(&g_hedge_lock);
+	return on;
 }
 
 static bool
@@ -547,7 +586,7 @@ hedge_start(struct hedge_ctx *h)
 		hedge_free(h);
 		return rc;
 	}
-	if (!h->delivered) {
+	if (!h->delivered && hedge_enabled()) {
 		h->timer = SPDK_POLLER_REGISTER(hedge_timer_fire, h, delay_ms * 1000);
 		if (!h->timer) {
 			/* No timer: the request simply runs unhedged. */
@@ -572,7 +611,10 @@ s3_get_range_hedged(struct s3_client *client, const char *key,
 	if (!client || !key || !buf || !cb) {
 		return -EINVAL;
 	}
-	if (len == 0 || !hedge_usable()) {
+	/* With hedging off the context still runs (no timer, no duplicate):
+	 * it is what reports the prefix of a failed GET for a ranged retry.
+	 * Only off an SPDK thread is it a plain GET. */
+	if (len == 0 || spdk_get_thread() == NULL) {
 		return s3_get_range(client, key, offset, len, buf, cb, cb_arg);
 	}
 	h = hedge_new(false, client, key, counters, cb_arg);

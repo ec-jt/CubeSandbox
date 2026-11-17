@@ -102,6 +102,12 @@ struct s3_hedge_counters {
  *
  * Falls back to a plain GET when hedging is disabled or the caller is not on
  * an SPDK thread (there is no poller to time the hedge).
+ *
+ * One difference from s3_get_range(): on failure \p bytes_read is not always
+ * 0. It is the length of the longest in-order prefix of [offset, offset+len)
+ * that either attempt wrote before it failed, and that prefix is in \p buf.
+ * A caller may keep it and ask only for the rest (ranged retry). The plain
+ * fallback path reports 0.
  */
 int s3_get_range_hedged(struct s3_client *client, const char *key,
 			uint64_t offset, uint64_t len, void *buf,

@@ -1046,6 +1046,8 @@ struct s3_export_bs_dev_stats {
 	uint64_t fetch_retries;       /* retries of failed fetches */
 	uint64_t hedges_issued;       /* hedged duplicate GETs sent */
 	uint64_t hedges_won;          /* of which completed first */
+	uint64_t ranged_resumes;      /* retries that kept a failed GET's prefix */
+	uint64_t resumed_bytes;       /* bytes those retries did not fetch again */
 };
 
 /** True when \p bs_dev was built by s3_export_bs_dev_create(). */
