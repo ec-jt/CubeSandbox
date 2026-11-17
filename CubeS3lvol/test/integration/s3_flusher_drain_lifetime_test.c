@@ -122,9 +122,12 @@ void spdk_log_register_flag(const char *name, struct spdk_log_flag *flag)
 	(void)name; (void)flag;
 }
 
+const char *spdk_strerror(int errnum) { return strerror(errnum); }
+
 /* ---------------------------------------------------------------- fake WAL */
 
 static struct {
+	bool backpressured;
 	uint64_t next_seq;
 	uint64_t truncated;
 	int syncs;
@@ -134,7 +137,7 @@ static struct {
 
 #define FAKE_WAL ((struct s3_wal *)&g_wal)
 
-bool s3_wal_is_backpressured(const struct s3_wal *wal) { (void)wal; return false; }
+bool s3_wal_is_backpressured(const struct s3_wal *wal) { return wal && g_wal.backpressured; }
 uint64_t s3_wal_get_next_seq(const struct s3_wal *wal) { (void)wal; return g_wal.next_seq; }
 void s3_wal_truncate_to_seq(struct s3_wal *wal, uint64_t s) { (void)wal; g_wal.truncated = s; }
 
@@ -544,6 +547,55 @@ test_success_unchanged(void)
 	s3_overlay_destroy(ov);
 }
 
+/* F: a WAL that opens backpressured with an empty overlay must still be
+ * truncated. Truncation used to happen only on an upload completion, and with
+ * nothing dirty (and every write refused) no upload ever runs, so the lvstore
+ * stayed read-blocked forever after replay (app1, 2026-11-17). */
+static void
+test_backpressured_idle_truncates(void)
+{
+	struct s3_overlay *ov;
+	struct s3_flusher *fl;
+	int syncs;
+
+	printf("[F] backpressured WAL with an empty overlay is truncated when idle\n");
+	reset_fakes();
+	g_wal.next_seq = 100;
+	g_wal.backpressured = true;
+	ov = mk_overlay();
+	fl = mk_flusher(ov, FAKE_WAL);
+
+	tick();
+	CHECK(g_up.n == 0);                       /* nothing to upload */
+	CHECK(g_wal.truncated == 99);             /* whole log is in S3 */
+	CHECK(g_wal.syncs == 1);                  /* and the new tail persisted */
+	wal_complete_sync(0);
+
+	/* Caught up: further idle ticks neither truncate nor sync again. */
+	syncs = g_wal.syncs;
+	tick();
+	tick();
+	CHECK(g_wal.syncs == syncs);
+
+	/* Not backpressured: an idle tick leaves the WAL alone (no extra super
+	 * writes on a quiet lvstore). */
+	g_wal.backpressured = false;
+	g_wal.next_seq = 200;
+	tick();
+	CHECK(g_wal.truncated == 99 && g_wal.syncs == syncs);
+
+	{
+		struct probe r = {0};
+
+		s3_flusher_retire(fl, probe_cb, &r);
+		tick();
+		CHECK(r.calls == 1 && r.status == 0);
+	}
+	s3_flusher_destroy(fl);
+	s3_overlay_destroy(ov);
+	CHECK(g_pollers_live == 0);
+}
+
 int
 main(void)
 {
@@ -553,6 +605,7 @@ main(void)
 	test_retire_waits_super_sync();
 	test_api_edges();
 	test_success_unchanged();
+	test_backpressured_idle_truncates();
 
 	printf("s3_flusher_drain_lifetime_test: %d checks, %d failed\n",
 	       g_pass + g_fail, g_fail);

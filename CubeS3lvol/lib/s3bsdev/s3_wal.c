@@ -1407,6 +1407,13 @@ struct wal_replay_ctx {
 	uint64_t            scanned_bytes;
 	uint64_t            max_seq;
 
+	/* seq of the last entry scanned (applied or skipped). The ring is
+	 * appended in seq order, so a valid entry whose seq is not above this
+	 * one was written on an earlier lap: it is the end of the log. */
+	uint64_t            last_seq;
+	uint64_t            stale_stop_pos;
+	uint64_t            stale_stop_seq;
+
 	/* Entries of the batch currently being collected. */
 	struct s3_wal_entry_hdr *batch_hdrs;
 	void                **batch_payloads;
@@ -1450,6 +1457,14 @@ wal_replay_done(struct wal_replay_ctx *rctx, int status)
 
 	wal->stats.replayed_entries += rctx->applied;
 	wal->stats.dropped_batches  += rctx->dropped;
+
+	if (rctx->stale_stop_seq != 0) {
+		SPDK_NOTICELOG("WAL replay stopped at %" PRIu64 ": entry seq %" PRIu64
+			       " is not above the previous seq %" PRIu64
+			       " (left over from an earlier lap of the ring)\n",
+			       rctx->stale_stop_pos, rctx->stale_stop_seq,
+			       rctx->last_seq);
+	}
 
 	SPDK_NOTICELOG("WAL replay done: %" PRIu64 " entries applied, %" PRIu64
 		       " skipped (<= ckpt seq), %" PRIu64 " batches dropped, "
@@ -1558,6 +1573,33 @@ wal_replay_segment_read(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg
 				       "(seq %" PRIu64 ")\n", hdr->seq);
 			rctx->stop = true;
 			break;
+		}
+
+		/* End of the log, part two: a well formed entry from an earlier
+		 * lap. Once the ring has wrapped, every byte past the real head
+		 * still holds valid entries from the previous lap -- correct
+		 * magic, correct CRCs -- and their seq is at or below ckpt_seq,
+		 * so the filter below would quietly "skip" them and the scan
+		 * would run a full lap. head then ends up one lap ahead of the
+		 * truth, used reads as ~the whole ring, the WAL enters
+		 * backpressure it can never leave (there is nothing in the
+		 * overlay to flush, so nothing truncates), and every write is
+		 * parked forever. Data entries are written in strictly increasing
+		 * seq (seq_next carries across opens and the epoch only grows),
+		 * so the first one whose seq does not go up marks the end.
+		 *
+		 * END sentinels are left out of the comparison: one takes its
+		 * seq when the segment is closed, after the ops already queued
+		 * behind it took theirs, so the next segment legitimately starts
+		 * below it. */
+		if (hdr->type != S3_WAL_END) {
+		 if (rctx->last_seq != 0 && hdr->seq <= rctx->last_seq) {
+		 	rctx->stale_stop_pos = rctx->scan_pos;
+		 	rctx->stale_stop_seq = hdr->seq;
+		 	rctx->stop = true;
+		 	break;
+		 }
+		 rctx->last_seq = hdr->seq;
 		}
 
 		if (hdr->type == S3_WAL_END) {

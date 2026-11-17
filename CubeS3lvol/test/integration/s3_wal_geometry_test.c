@@ -114,11 +114,33 @@ int main(int argc, char **argv)
 	/* Mark consumed prefix, then require exactly one new payload on replay. */
 	assert(sync_super(w.wal, s3_wal_get_next_seq(w.wal) - 1) == 0);
 	fill_payload(payload, 999, 4096); assert(sync_append_write(w.wal, 999, payload) == 0);
+	uint64_t used_before = s3_wal_get_used_bytes(w.wal);
+	uint64_t next_before = s3_wal_get_next_seq(w.wal);
 	assert(sync_close(w.wal) == 0); memset(&w, 0, sizeof(w));
 	s3_wal_open(dev, wal_open_cb, &w); assert(poll_until(&w.done) && w.wal);
 	struct replay_state replay = {0}; check("multi-lap replay", sync_replay(w.wal, &replay), 0);
 	check_true("only uncheckpointed payload replayed", replay.writes == 1 &&
 		replay.payload_ok == 1 && replay.payload_bad == 0, NULL);
+	/* The ring has wrapped, so everything past the real head is a valid
+	 * entry from the previous lap. Replay must stop there: scanning on put
+	 * head a lap ahead, used ~= the whole ring, and the WAL into a
+	 * backpressure nothing could release (the app1 2026-11-17 outage). */
+	{
+		char d[160];
+		uint64_t used_after = s3_wal_get_used_bytes(w.wal);
+
+		snprintf(d, sizeof(d), "used %" PRIu64 " -> %" PRIu64, used_before, used_after);
+		check_true("wrapped replay keeps head at the real end", used_after == used_before, d);
+		check_true("wrapped replay is not backpressured", !s3_wal_is_backpressured(w.wal), NULL);
+		snprintf(d, sizeof(d), "next seq %" PRIu64 " -> %" PRIu64, next_before,
+			 s3_wal_get_next_seq(w.wal));
+		/* epoch changes on open; the local counter must carry over. */
+		check_true("seq counter carried across the wrapped replay",
+			   (s3_wal_get_next_seq(w.wal) & 0xFFFFFFFFFFFFULL) ==
+			   (next_before & 0xFFFFFFFFFFFFULL), d);
+		fill_payload(payload, 1001, 4096);
+		check("append after wrapped replay", sync_append_write(w.wal, 1001, payload), 0);
+	}
 	assert(sync_close(w.wal) == 0); spdk_dma_free(payload); s3_local_dev_close(dev);
 	memset(&c, 0, sizeof(c)); bdev_aio_delete(AIO_BDEV_NAME, async_int_cb, &c);
 	assert(poll_until(&c.done)); framework_stop();

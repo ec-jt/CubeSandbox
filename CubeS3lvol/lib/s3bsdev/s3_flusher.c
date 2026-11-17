@@ -487,6 +487,16 @@ flusher_poll(void *arg)
 
 	if (f->in_flight == 0 && f->backing_off == 0 &&
 	    !s3_overlay_has_dirty(f->overlay)) {
+		/* Truncation normally rides on an upload completion. A WAL that
+		 * opens already backpressured with nothing to flush (every
+		 * replayed entry was at or below the persisted safe seq) would
+		 * otherwise never truncate: no upload ever completes, writes are
+		 * refused, so no upload is ever started either. With the overlay
+		 * empty the whole log is in S3, which is exactly what
+		 * flusher_advance_wal() computes; it is a no-op once caught up. */
+		if (!f->stopping && s3_wal_is_backpressured(f->wal)) {
+			flusher_advance_wal(f);
+		}
 		flusher_check_drain(f);
 		return SPDK_POLLER_IDLE;
 	}
