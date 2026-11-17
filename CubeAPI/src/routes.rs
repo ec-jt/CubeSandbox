@@ -32,9 +32,26 @@ const PORT_ROUTE_TIMEOUT: Duration = Duration::from_secs(40);
 #[path = "port_tests.rs"]
 mod port_tests;
 
-/// Pause / Resume / Connect share Master↔Cubelet Pause budget
-/// (`pauseCubeletRPCTimeout` = 120s).
-const PAUSE_RESUME_ROUTE_TIMEOUT: Duration = Duration::from_secs(120);
+/// Pause / Resume / Connect budget. A cross-node resume imports the paused
+/// disks from S3 before the VM restores (Cubelet waits up to
+/// `import_prefetch_timeout`, 300 s by default, per disk), so the route must
+/// outlive that wait or the caller sees 408 while the resume still finishes.
+/// A same-node resume returns in well under a second and is not affected.
+/// Override with `CUBE_API_PAUSE_RESUME_TIMEOUT_SECS`.
+const DEFAULT_PAUSE_RESUME_ROUTE_TIMEOUT: Duration = Duration::from_secs(360);
+const PAUSE_RESUME_TIMEOUT_ENV: &str = "CUBE_API_PAUSE_RESUME_TIMEOUT_SECS";
+
+/// Parse the pause/resume route budget; invalid or zero values keep the default.
+fn pause_resume_route_timeout_from(raw: Option<&str>) -> Duration {
+    match raw.map(str::trim).and_then(|s| s.parse::<u64>().ok()) {
+        Some(secs) if secs > 0 => Duration::from_secs(secs),
+        _ => DEFAULT_PAUSE_RESUME_ROUTE_TIMEOUT,
+    }
+}
+
+fn pause_resume_route_timeout() -> Duration {
+    pause_resume_route_timeout_from(std::env::var(PAUSE_RESUME_TIMEOUT_ENV).ok().as_deref())
+}
 
 /// Timeout budget for routes that front a *synchronous* CubeMaster operation
 /// which can legitimately take well beyond the default 30 s — currently
@@ -60,7 +77,7 @@ pub fn build_router(state: AppState) -> Router {
     );
     let pause_resume_router = apply_http_layers(
         Router::new().merge(build_e2b_pause_resume_router(&state, auth_configured)),
-        PAUSE_RESUME_ROUTE_TIMEOUT,
+        pause_resume_route_timeout(),
     );
     let snapshot_long_router = apply_http_layers(
         Router::new().merge(build_e2b_snapshot_long_router(&state, auth_configured)),
@@ -137,8 +154,8 @@ fn build_sandbox_routes(state: &AppState, auth_configured: bool) -> Router<AppSt
     with_auth_and_rate_limit(routes, state, auth_configured)
 }
 
-/// Pause / Resume / Connect use the 120s lifecycle budget; keep them off the
-/// default 30s TimeoutLayer.
+/// Pause / Resume / Connect use the long lifecycle budget (360 s default,
+/// cross-node resume); keep them off the default 30s TimeoutLayer.
 fn build_e2b_pause_resume_router(state: &AppState, auth_configured: bool) -> Router<AppState> {
     let routes = Router::new()
         .route(
@@ -578,5 +595,19 @@ mod tests {
             resp.status_code(),
             resp.text(),
         );
+    }
+
+    #[test]
+    fn pause_resume_timeout_covers_cross_node_import() {
+        use super::{pause_resume_route_timeout_from, DEFAULT_PAUSE_RESUME_ROUTE_TIMEOUT};
+        use std::time::Duration;
+        // Cubelet waits up to 300 s for one imported disk; the route must not
+        // 408 before that wait can finish.
+        assert!(DEFAULT_PAUSE_RESUME_ROUTE_TIMEOUT >= Duration::from_secs(300));
+        assert_eq!(pause_resume_route_timeout_from(None), DEFAULT_PAUSE_RESUME_ROUTE_TIMEOUT);
+        assert_eq!(pause_resume_route_timeout_from(Some("600")), Duration::from_secs(600));
+        assert_eq!(pause_resume_route_timeout_from(Some(" 90 ")), Duration::from_secs(90));
+        assert_eq!(pause_resume_route_timeout_from(Some("0")), DEFAULT_PAUSE_RESUME_ROUTE_TIMEOUT);
+        assert_eq!(pause_resume_route_timeout_from(Some("x")), DEFAULT_PAUSE_RESUME_ROUTE_TIMEOUT);
     }
 }

@@ -172,3 +172,22 @@ func TestLockTokenIncludesDebugPrefix(t *testing.T) {
 		t.Fatalf("token=%q want pause:<uuid>", tok)
 	}
 }
+
+func TestResumeTTLCoversCrossNodeImport(t *testing.T) {
+	// Cubelet waits up to 300 s for one imported disk before restore.
+	if DefaultResumeTTL < 300*time.Second || ResumeTTL < 300*time.Second {
+		t.Fatalf("resume TTL default=%v effective=%v; want >= 300s", DefaultResumeTTL, ResumeTTL)
+	}
+	if got := resumeTTLFrom(""); got != DefaultResumeTTL {
+		t.Fatalf("empty override = %v", got)
+	}
+	if got := resumeTTLFrom("900"); got != 900*time.Second {
+		t.Fatalf("override 900 = %v", got)
+	}
+	if got := resumeTTLFrom("30"); got != DefaultResumeTTL {
+		t.Fatalf("override below LifecycleTTL = %v, want default", got)
+	}
+	if got := resumeTTLFrom("bad"); got != DefaultResumeTTL {
+		t.Fatalf("bad override = %v", got)
+	}
+}

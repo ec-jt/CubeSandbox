@@ -24,6 +24,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -37,13 +39,11 @@ const (
 	// DefaultTTL covers short lifecycle ops. Unlock is always via defer in
 	// WithLock; TTL is only a crash/leak safety net.
 	DefaultTTL = 60 * time.Second
-	// LifecycleTTL covers Resume/Delete under the unified 120s budget.
+	// LifecycleTTL covers Delete (and evict) under the unified 120s budget.
 	LifecycleTTL = 120 * time.Second
 	// PauseTTL covers Cubelet Update(pause): PauseToSnapshot + in-process
 	// keep_tombstone Destroy under pauseCubeletRPCTimeout (120s), plus Master Complete.
 	PauseTTL = 180 * time.Second
-	// ResumeTTL is an alias of LifecycleTTL for resume callers.
-	ResumeTTL = LifecycleTTL
 	// DeleteTTL is an alias of LifecycleTTL for delete callers.
 	DeleteTTL = LifecycleTTL
 	// DefaultRetryInterval is the poll gap while waiting for the lock.
@@ -53,6 +53,30 @@ const (
 	// (this holder's token). Returns 1 if deleted, 0 if ownership was lost.
 	unlockScript = `if redis.call("GET", KEYS[1]) == ARGV[1] then return redis.call("DEL", KEYS[1]) else return 0 end`
 )
+
+// DefaultResumeTTL covers a cross-node resume: Cubelet imports the paused
+// disks from S3 and waits up to import_prefetch_timeout (300 s) before the
+// VM restores, so the lock must outlive that wait plus restore and Master
+// bookkeeping. A lock that expires mid-resume would let a second resume or a
+// delete interleave with the running Create. Same-node resumes release the
+// lock in well under a second, so a long TTL costs nothing there.
+const DefaultResumeTTL = 420 * time.Second
+
+// ResumeTTLEnv overrides DefaultResumeTTL in whole seconds.
+const ResumeTTLEnv = "CUBE_MASTER_RESUME_LOCK_TTL_SECS"
+
+// ResumeTTL is the lock TTL for resume callers (see DefaultResumeTTL).
+var ResumeTTL = resumeTTLFrom(os.Getenv(ResumeTTLEnv))
+
+// resumeTTLFrom parses a whole-second override; invalid or values below
+// LifecycleTTL keep the default.
+func resumeTTLFrom(raw string) time.Duration {
+	secs, err := strconv.Atoi(strings.TrimSpace(raw))
+	if err != nil || time.Duration(secs)*time.Second < LifecycleTTL {
+		return DefaultResumeTTL
+	}
+	return time.Duration(secs) * time.Second
+}
 
 var (
 	// ErrLockNotAcquired is returned when the wait budget expires before the lock is held.
