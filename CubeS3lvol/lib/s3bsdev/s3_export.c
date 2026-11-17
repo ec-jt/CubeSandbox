@@ -39,6 +39,7 @@
 #include "s3lvol/s3_export.h"
 #include "s3lvol/s3_hedge.h"
 #include "s3lvol/s3_chunk_map.h"
+#include "export_chunk_retry.h"
 
 SPDK_LOG_REGISTER_COMPONENT(s3lvol_export)
 
@@ -2059,6 +2060,7 @@ struct s3_export_slot {
 	void                 *buf;
 	struct iovec          iov;
 	uint64_t              chunk_index;
+	uint32_t              put_attempts;
 	char                  key[S3_EXPORT_KEY_MAX];
 };
 
@@ -2092,6 +2094,7 @@ struct s3_export_ctx {
 
 	uint64_t                   zero_chunks;
 	uint64_t                   put_chunks;
+	uint64_t                   put_retries;
 
 	struct s3_export_manifest *m;
 	char                      *manifest_json;
@@ -2173,9 +2176,10 @@ export_manifest_uploaded(void *cb_arg, int status)
 		ctx->status = status;
 	} else {
 		SPDK_NOTICELOG("Export %s complete: %" PRIu64 " chunk object(s), "
-			       "%" PRIu64 " sparse, %" PRIu64 " bytes logical\n",
+			       "%" PRIu64 " sparse, %" PRIu64 " bytes logical, %" PRIu64
+			       " chunk PUT retr(ies)\n",
 			       ctx->uuid_str, ctx->put_chunks, ctx->zero_chunks,
-			       ctx->m->size_bytes);
+			       ctx->m->size_bytes, ctx->put_retries);
 	}
 
 	export_report(ctx);
@@ -2232,11 +2236,42 @@ export_slot_release(struct s3_export_slot *slot)
 	ctx->inflight--;
 }
 
+static void export_chunk_uploaded(void *cb_arg, int status);
+
+/* Submit (or resubmit) the PUT of a slot whose key and iov are set. */
+static int
+export_chunk_put(struct s3_export_slot *slot)
+{
+	slot->put_attempts++;
+	/* Hedged: an export chunk key is written once per export uuid and never
+	 * with other bytes (a re-export is a new uuid), and slot->buf is only
+	 * released from export_chunk_uploaded(). The manifest PUT below is NOT
+	 * hedged: a manifest is rewritten in place when its generation is bumped,
+	 * and a delayed duplicate could roll it back. The same property makes a
+	 * retry of a failed chunk PUT safe (export_chunk_retry.h). */
+	return s3_put_hedged(slot->ctx->client, slot->key, &slot->iov, 1, NULL,
+			     export_chunk_uploaded, slot);
+}
+
 static void
 export_chunk_uploaded(void *cb_arg, int status)
 {
 	struct s3_export_slot *slot = cb_arg;
 	struct s3_export_ctx *ctx = slot->ctx;
+
+	if (export_chunk_should_retry(status, slot->put_attempts, ctx->status != 0)) {
+		int rc;
+
+		SPDK_WARNLOG("Export %s chunk %" PRIu64 " PUT attempt %u failed: %s; "
+			     "retrying\n", ctx->uuid_str, slot->chunk_index,
+			     slot->put_attempts, spdk_strerror(-status));
+		ctx->put_retries++;
+		rc = export_chunk_put(slot);
+		if (rc == 0) {
+			return;
+		}
+		status = rc;
+	}
 
 	if (status != 0) {
 		SPDK_ERRLOG("Failed to upload export chunk %" PRIu64 " ('%s'): %s\n",
@@ -2288,14 +2323,9 @@ export_chunk_read(void *cb_arg, int bserrno)
 			    slot->key, sizeof(slot->key));
 	slot->iov.iov_base = slot->buf;
 	slot->iov.iov_len = ctx->chunk_size;
+	slot->put_attempts = 0;
 
-	/* Hedged: an export chunk key is written once per export uuid and never
-	 * with other bytes (a re-export is a new uuid), and slot->buf is only
-	 * released from export_chunk_uploaded(). The manifest PUT below is NOT
-	 * hedged: a manifest is rewritten in place when its generation is bumped,
-	 * and a delayed duplicate could roll it back. */
-	rc = s3_put_hedged(ctx->client, slot->key, &slot->iov, 1, NULL,
-			   export_chunk_uploaded, slot);
+	rc = export_chunk_put(slot);
 	if (rc != 0) {
 		SPDK_ERRLOG("Failed to submit export chunk %" PRIu64 ": %s\n",
 			    slot->chunk_index, spdk_strerror(-rc));

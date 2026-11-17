@@ -75,7 +75,7 @@ APPS = s3_client_test s3_spawner_test s3_thread_bounce_test s3_bs_dev_test \
        s3_statefile_test s3_local_dev_test s3_checkpoint_test s3_export_swap_test s3_export_prefetch_test \
        s3_copy_xml_test s3_pending_persist_test s3_recovery_test \
        s3_put_etag_test s3_put_etag_request_test s3_b16_ctl_test s3_hedge_test \
-       s3_warm_select_test
+       s3_warm_select_test s3_export_chunk_retry_test
 
 # (a) minimal library set for the stubbed path
 STUB_SRCS      = spdk_thread_stub.c
@@ -265,6 +265,9 @@ s3_flush_test: s3_flush_test.c $(S3BSDEV_DIR)/libs3bsdev.a
 s3_warm_select_test: s3_warm_select_test.c $(MODULE_DIR)/lvol_warm_select.h
 	$(CC) $(COMMON_CFLAGS) -I$(MODULE_DIR) s3_warm_select_test.c -o $@
 
+s3_export_chunk_retry_test: s3_export_chunk_retry_test.c $(S3BSDEV_DIR)/export_chunk_retry.h
+	$(CC) $(COMMON_CFLAGS) -I$(S3BSDEV_DIR) s3_export_chunk_retry_test.c -o $@
+
 s3_b16_ctl_test: s3_b16_ctl_test.c $(S3BSDEV_DIR)/s3_deadline.c $(MODULE_DIR)/export_b16_ctl.h
 	$(CC) $(COMMON_CFLAGS) -I$(MODULE_DIR) s3_b16_ctl_test.c \
 	    $(S3BSDEV_DIR)/s3_deadline.c -lpthread -o $@
@@ -368,7 +371,7 @@ check: s3_spawner_test s3_thread_bounce_test s3_journal_test s3_wal_test s3_wal_
        s3_flush_test s3_export_test s3_statefile_test s3_local_dev_test \
        s3_checkpoint_test s3_export_swap_test s3_export_prefetch_test s3_copy_xml_test \
        s3_pending_persist_test s3_recovery_test s3_put_etag_test s3_put_etag_request_test \
-       s3_b16_ctl_test s3_hedge_test s3_warm_select_test
+       s3_b16_ctl_test s3_hedge_test s3_warm_select_test s3_export_chunk_retry_test
 	./s3_spawner_test
 	./s3_thread_bounce_test
 	./s3_journal_test
@@ -385,6 +388,7 @@ check: s3_spawner_test s3_thread_bounce_test s3_journal_test s3_wal_test s3_wal_
 	./s3_hedge_test
 	./s3_copy_xml_test
 	./s3_warm_select_test
+	./s3_export_chunk_retry_test
 	./s3_put_etag_test
 	./s3_put_etag_request_test
 	./s3_pending_persist_test
