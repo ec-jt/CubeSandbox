@@ -168,10 +168,12 @@ fake_complete_all(void)
 		if (c < 0) {
 			status = -ENOENT;
 		} else {
-			uint64_t slot_off = g->offset % CHUNK_SIZE;
-
+			/* A range may span several slots of the pack. */
 			for (i = 0; i < g->len; i++) {
-				((uint8_t *)g->buf)[i] = obj_byte(c, slot_off + i);
+				uint64_t p = g->offset + i;
+				int cc = pack_slot_chunk(g->key, p);
+
+				((uint8_t *)g->buf)[i] = cc < 0 ? 0 : obj_byte(cc, p % CHUNK_SIZE);
 			}
 			got = g->len;
 		}
@@ -496,7 +498,7 @@ main(void)
 	free(bad);
 	bad = NULL;
 
-	printf("\n[4] partial reads go to the pack at the slot offset\n");
+	printf("\n[4] partial reads are served from one GET of the whole pack\n");
 	g_m = p;
 	rc = s3_export_bs_dev_create((struct s3_client *)0x1, p, &dev);
 	check_true("export device", rc == 0 && dev != NULL);
@@ -510,12 +512,21 @@ main(void)
 	poll_some(10);
 	check_u64("one GET", g_gets, 1);
 	check_u64("of a pack, never the ref object", g_pack_gets, 1);
-	check_u64("at the slot offset", g_last_off, (uint64_t)2 * CHUNK_SIZE);
-	check_u64("for the whole slot", g_last_len, CHUNK_SIZE);
+	check_u64("from the start of the pack", g_last_off, 0);
+	check_u64("for the whole pack", g_last_len, (uint64_t)PACK_CHUNKS * CHUNK_SIZE);
 	fake_complete_all();
 	poll_some(10);
 	check_true("read completes", r.done && r.status == 0);
 	check_true("bytes are the chunk's", rd_matches(&r, 9, 2 * BLOCK, 4 * BLOCK));
+	free(r.buf);
+	/* Another chunk of the same pack (own chunk 12: pack 0, slot 3) needs
+	 * no further request. */
+	g_gets = 0;
+	rd_start(dev, ch, &r, (uint64_t)12 * CHUNK_SIZE + BLOCK, 2 * BLOCK);
+	poll_some(10);
+	check_u64("same pack: no new GET", g_gets, 0);
+	check_true("same pack: bytes are the chunk's",
+		   r.done && r.status == 0 && rd_matches(&r, 12, BLOCK, 2 * BLOCK));
 	free(r.buf);
 	/* A base chunk is not this device's to serve: it reads as a hole here
 	 * and costs no request (the delta import clones the base for those). */
@@ -538,6 +549,8 @@ main(void)
 	check_u64("prefetch fetched every own chunk", pg.fetched, n_present);
 	check_u64("prefetch status", (uint64_t)(pg.status == 0), 1);
 	check_u64("prefetch GETs are all pack ranges", g_ref_gets, 0);
+	check_true("prefetch issues one GET per pack, not per chunk",
+		   g_pack_gets <= p->pack_count);
 	s3_export_prefetcher_destroy(pf);
 	pf = NULL;
 

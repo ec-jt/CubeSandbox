@@ -140,7 +140,8 @@ struct export_slot {
 	char                        key[S3_EXPORT_KEY_MAX];
 	uint64_t                    offset;       /* where in the object (packs) */
 	uint32_t                    object_len;   /* bytes the GET asked for */
-	uint8_t                    *buf;          /* chunk_size bytes, kept for reuse */
+	uint8_t                    *buf;          /* buf_len bytes, kept for reuse */
+	uint32_t                    buf_len;
 	uint32_t                    pins;         /* prefetcher references */
 	uint64_t                    gen;          /* bumped on every reuse */
 	uint64_t                    lru;
@@ -342,23 +343,45 @@ export_chunk_key(const struct s3_export_manifest *m, uint64_t chunk_index,
 	* chunk the pack table does not place is -EIO, never a fallback to the ref.
 	*
 	* Returns 0 with key[0] == '\0' when there is nothing to fetch. */
+/* A packed chunk is served out of a slot that holds its whole pack: one GET
+ * per pack, not per chunk, which is the point of packing. Such a slot is keyed
+ * by the pack key under a synthetic index that cannot collide with a chunk. */
+#define EXPORT_PACK_SLOT_INDEX(pack) (UINT64_MAX - (uint64_t)(pack))
+
 static int
 export_chunk_locate(const struct s3_export_manifest *m, uint64_t chunk_index,
-		    char *key, size_t key_len, uint64_t *offset, uint32_t *len)
+		    char *key, size_t key_len, uint64_t *offset, uint32_t *len,
+		    uint64_t *slot_index, uint32_t *in_slot)
 {
 	const struct s3_export_ref *ref;
 
 	*offset = 0;
 	*len = m->chunk_size;
+	*slot_index = chunk_index;
+	*in_slot = 0;
 	key[0] = '\0';
 	if (m->version == S3_EXPORT_PACK_VERSION) {
+		uint64_t off = 0;
+		uint32_t pack, nslots;
+		uint64_t first;
 		int rc = s3_export_manifest_pack_range(m, chunk_index, key, key_len,
-						       offset, len);
+						       &off, NULL);
 
 		if (rc != 0) {
 			key[0] = '\0';
 			return rc == -ENOENT ? 0 : -EIO;
 		}
+		pack = m->pack_loc[chunk_index] >> 8;
+		first = (uint64_t)pack * m->pack_chunks;
+		if (first >= m->present_chunks) {
+			key[0] = '\0';
+			return -EIO;
+		}
+		nslots = (uint32_t)spdk_min((uint64_t)m->pack_chunks,
+					    m->present_chunks - first);
+		*len = nslots * m->chunk_size;
+		*slot_index = EXPORT_PACK_SLOT_INDEX(pack);
+		*in_slot = (uint32_t)off;
 		return 0;
 	}
 	if (m->layout == S3_EXPORT_LAYOUT_REF) {
@@ -727,11 +750,16 @@ export_slot_start_fetch(struct s3_export_dev *dev, struct export_slot *s)
 {
 	int rc;
 
-	if (!s->buf) {
-		s->buf = malloc(dev->m->chunk_size);
+	if (!s->buf || s->buf_len < s->object_len) {
+		uint32_t want = spdk_max(s->object_len, dev->m->chunk_size);
+
+		free(s->buf);
+		s->buf_len = 0;
+		s->buf = malloc(want);
 		if (!s->buf) {
 			return -ENOMEM;
 		}
+		s->buf_len = want;
 	}
 	s->state = EXPORT_SLOT_FETCHING;
 	s->retries = 0;
@@ -1018,9 +1046,21 @@ export_read_internal(struct spdk_bs_dev *bs_dev, struct spdk_io_channel *channel
 		cio->expected = get_len;
 		cio->offset_in_chunk = offset_in_chunk;
 		cio->dst = buf;
-		if (export_chunk_locate(io->m, chunk_index, cio->key, sizeof(cio->key),
-					&cio->object_off, &cio->object_len) != 0 ||
-		    cio->key[0] == '\0') {
+		{
+			uint64_t slot_index;
+			uint32_t in_slot;
+
+			if (export_chunk_locate(io->m, chunk_index, cio->key,
+						sizeof(cio->key), &cio->object_off,
+						&cio->object_len, &slot_index,
+						&in_slot) != 0) {
+				cio->key[0] = '\0';
+			}
+			/* A pack slot: the read's bytes start at the chunk's slot. */
+			cio->chunk_index = slot_index;
+			cio->offset_in_chunk += in_slot;
+		}
+		if (cio->key[0] == '\0') {
 			SPDK_ERRLOG("export %s: chunk %" PRIu64 " is present but has no "
 				    "readable location\n", io->m->uuid_str, chunk_index);
 			free(cio);
@@ -2020,6 +2060,8 @@ pf_launch_one(struct s3_export_prefetcher *p, uint64_t i)
 	char key[S3_EXPORT_KEY_MAX];
 	uint32_t object_len = m->chunk_size;
 	uint64_t object_off = 0;
+	uint64_t slot_index;
+	uint32_t in_slot;
 	struct export_slot *s;
 	struct export_pf_wait *w;
 	int rc;
@@ -2030,7 +2072,11 @@ pf_launch_one(struct s3_export_prefetcher *p, uint64_t i)
 		return 0;
 	}
 	rc = export_chunk_locate(m, chunk_index, key, sizeof(key), &object_off,
-				 &object_len);
+				 &object_len, &slot_index, &in_slot);
+	(void)in_slot;
+	/* Pack slots are found and pinned by pack; the callback still reports
+	 * the chunk. */
+	chunk_index = slot_index;
 	if (rc != 0) {
 		return rc;
 	}
