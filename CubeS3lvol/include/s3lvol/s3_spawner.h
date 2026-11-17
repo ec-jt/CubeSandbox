@@ -118,4 +118,19 @@ int s3_spawner_pthread_create_async(void *(*start_routine)(void *), void *arg,
  */
 bool s3_spawner_is_started(void);
 
+/**
+ * Parse a Linux cpu list ("0", "2-3", "0,4-5") into \p out.
+ * \return 0 on success, -EINVAL on a malformed or empty list.
+ */
+int s3_spawner_parse_cpulist(const char *list, cpu_set_t *out);
+
+/**
+ * The cores this process may use, independent of the calling thread's own
+ * affinity: online cores intersected with the process's cgroup v2
+ * cpuset.cpus.effective (when readable). Use this instead of
+ * sched_getaffinity(0) on a DPDK-pinned reactor, which returns one core.
+ * \return 0 on success, negative errno on failure.
+ */
+int s3_spawner_usable_cpus(cpu_set_t *out);
+
 #endif /* S3LVOL_SPAWNER_H */

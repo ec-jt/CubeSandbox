@@ -343,6 +343,35 @@ main(void)
 	check_true("repeated start returns 0", rc == 0, NULL);
 	s3_spawner_stop();
 
+	printf("\n[10] cpu list parsing (S3LVOL_BG_CPUS)\n");
+	{
+		cpu_set_t s;
+		check_true("\"2\" parses to {2}",
+			   s3_spawner_parse_cpulist("2", &s) == 0 &&
+			   CPU_COUNT(&s) == 1 && CPU_ISSET(2, &s), NULL);
+		check_true("\"0,4-6\\n\" parses to {0,4,5,6}",
+			   s3_spawner_parse_cpulist("0,4-6\n", &s) == 0 &&
+			   CPU_COUNT(&s) == 4 && CPU_ISSET(0, &s) && CPU_ISSET(6, &s), NULL);
+		check_true("\"\" is rejected", s3_spawner_parse_cpulist("", &s) != 0, NULL);
+		check_true("\"x\" is rejected", s3_spawner_parse_cpulist("x", &s) != 0, NULL);
+		check_true("\"3-1\" is rejected", s3_spawner_parse_cpulist("3-1", &s) != 0, NULL);
+		check_true("\"1;2\" is rejected", s3_spawner_parse_cpulist("1;2", &s) != 0, NULL);
+	}
+
+	printf("\n[11] usable cpus ignore the calling thread's pin\n");
+	{
+		/* The main thread is still pinned to one core here, exactly
+		 * like a reactor at module init. sched_getaffinity(0) would
+		 * return one core; the usable set must not. */
+		cpu_set_t u;
+		char detail[64];
+		int urc = s3_spawner_usable_cpus(&u);
+		snprintf(detail, sizeof(detail), "usable = %d cores (process %d)",
+			 CPU_COUNT(&u), total_cpus);
+		check_true("usable set is wider than the pinned thread",
+			   urc == 0 && CPU_COUNT(&u) >= total_cpus, detail);
+	}
+
 	/* Restore the main thread's affinity, to avoid affecting anything
 	 * that follows (though this process is about to exit anyway) */
 	pthread_setaffinity_np(pthread_self(), sizeof(original), &original);

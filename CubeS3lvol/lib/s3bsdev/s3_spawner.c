@@ -365,3 +365,106 @@ s3_spawner_pthread_create_async(void *(*start_routine)(void *), void *arg,
 
 	return 0;
 }
+
+int
+s3_spawner_parse_cpulist(const char *list, cpu_set_t *out)
+{
+	const char *p = list;
+
+	if (!list || !out) {
+		return -EINVAL;
+	}
+	CPU_ZERO(out);
+	while (*p) {
+		char *end;
+		long lo, hi;
+
+		while (*p == ' ' || *p == '\n') {
+			p++;
+		}
+		if (!*p) {
+			break;
+		}
+		errno = 0;
+		lo = strtol(p, &end, 10);
+		if (end == p || errno || lo < 0 || lo >= CPU_SETSIZE) {
+			return -EINVAL;
+		}
+		hi = lo;
+		p = end;
+		if (*p == '-') {
+			p++;
+			errno = 0;
+			hi = strtol(p, &end, 10);
+			if (end == p || errno || hi < lo || hi >= CPU_SETSIZE) {
+				return -EINVAL;
+			}
+			p = end;
+		}
+		for (long c = lo; c <= hi; c++) {
+			CPU_SET((int)c, out);
+		}
+		while (*p == ' ' || *p == '\n') {
+			p++;
+		}
+		if (*p == ',') {
+			p++;
+		} else if (*p) {
+			return -EINVAL;
+		}
+	}
+	return CPU_COUNT(out) > 0 ? 0 : -EINVAL;
+}
+
+/* Read the first line of a file into buf; 0 on success. */
+static int
+read_line(const char *path, char *buf, size_t len)
+{
+	FILE *f = fopen(path, "r");
+	size_t n;
+
+	if (!f) {
+		return -errno;
+	}
+	if (!fgets(buf, (int)len, f)) {
+		fclose(f);
+		return -EIO;
+	}
+	fclose(f);
+	n = strlen(buf);
+	while (n && (buf[n - 1] == '\n' || buf[n - 1] == ' ')) {
+		buf[--n] = '\0';
+	}
+	return 0;
+}
+
+int
+s3_spawner_usable_cpus(cpu_set_t *out)
+{
+	char line[4096], path[4096 + 64];
+	cpu_set_t cg;
+
+	if (!out) {
+		return -EINVAL;
+	}
+	if (read_line("/sys/devices/system/cpu/online", line, sizeof(line)) != 0 ||
+	    s3_spawner_parse_cpulist(line, out) != 0) {
+		/* No sysfs: fall back to the calling thread's affinity. */
+		CPU_ZERO(out);
+		if (sched_getaffinity(0, sizeof(*out), out) != 0) {
+			return -errno;
+		}
+		return 0;
+	}
+	/* cgroup v2: "0::/<path>" in /proc/self/cgroup. */
+	if (read_line("/proc/self/cgroup", line, sizeof(line)) == 0 &&
+	    strncmp(line, "0::", 3) == 0) {
+		snprintf(path, sizeof(path), "/sys/fs/cgroup%s/cpuset.cpus.effective",
+			 line + 3);
+		if (read_line(path, line, sizeof(line)) == 0 &&
+		    s3_spawner_parse_cpulist(line, &cg) == 0) {
+			CPU_AND(out, out, &cg);
+		}
+	}
+	return CPU_COUNT(out) > 0 ? 0 : -ENOENT;
+}

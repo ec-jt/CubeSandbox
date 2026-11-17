@@ -36,38 +36,52 @@
 
 static bool g_s3lvol_initialized = false;
 
-/* Compute "the set of cores allowed for background threads" =
- * this process's usable cores - reactor cores.
+/* Compute "the set of cores allowed for background threads".
  *
- * Usable cores come from sched_getaffinity(), not
- * sysconf(_SC_NPROCESSORS_CONF): the former reflects the limits actually
- * imposed by cgroup / taskset, which is what is correct inside a container.
+ * 1. S3LVOL_BG_CPUS (a cpu list, e.g. "2" or "2-3") names the cores
+ *    explicitly. Use it to give the CRT event loops a dedicated core so a
+ *    busy reactor cannot starve S3 requests.
+ * 2. Otherwise: the cores this process may use - reactor cores.
  *
- * Reactor cores are enumerated with SPDK_ENV_FOREACH_CORE() -- asking the env
- * layer for the lcores actually enabled is more reliable than parsing the core
- * mask string.
+ * The usable set is NOT sched_getaffinity(0): module init runs on the main
+ * reactor, which DPDK has already pinned to its lcore, so that call returns
+ * one core. With a 2-reactor mask the complement was empty, and the fallback
+ * then put every CRT thread on reactor_0's core (seen live: AwsEventLoop on
+ * CPU 0 next to a 96% busy reactor_0). s3_spawner_usable_cpus() reads the
+ * online cores intersected with this process's cgroup cpuset instead.
  *
- * Note no fixed cores are ever excluded. The reference implementation
- * (in-house bdev_erofs) has a block that unconditionally skips cores 0-3;
- * that is specific to a primary/standby dual-process deployment, where the
- * peer's reactors are invisible to this process and must be reserved blindly.
- * s3lvol has no such deployment model; the complement is enough.
+ * Reactor cores are enumerated with SPDK_ENV_FOREACH_CORE() and are always
+ * removed, also from an explicit list.
  */
 static int
 s3lvol_build_spawner_cpuset(cpu_set_t *out)
 {
-	cpu_set_t online;
+	cpu_set_t online, want;
+	const char *env;
 	uint32_t core;
+	int rc;
 
 	CPU_ZERO(out);
-	CPU_ZERO(&online);
-
-	if (sched_getaffinity(0, sizeof(online), &online) != 0) {
-		SPDK_ERRLOG("sched_getaffinity failed: %s\n", strerror(errno));
-		return -errno;
+	rc = s3_spawner_usable_cpus(&online);
+	if (rc != 0) {
+		SPDK_ERRLOG("cannot read the usable cpu set: %d\n", rc);
+		return rc;
 	}
 
 	memcpy(out, &online, sizeof(online));
+	env = getenv("S3LVOL_BG_CPUS");
+	if (env && *env) {
+		if (s3_spawner_parse_cpulist(env, &want) != 0) {
+			SPDK_ERRLOG("S3LVOL_BG_CPUS=%s is not a cpu list; ignored\n", env);
+		} else {
+			CPU_AND(out, out, &want);
+			if (CPU_COUNT(out) == 0) {
+				SPDK_WARNLOG("S3LVOL_BG_CPUS=%s has no usable core; "
+					     "using every non-reactor core\n", env);
+				memcpy(out, &online, sizeof(online));
+			}
+		}
+	}
 
 	/* carve out the reactor cores */
 	SPDK_ENV_FOREACH_CORE(core) {
