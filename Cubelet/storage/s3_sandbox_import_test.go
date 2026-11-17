@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 
@@ -202,6 +203,28 @@ func TestSandboxImportOriginStopsBeforeActivation(t *testing.T) {
 			require.Same(t, info, engine.volumeInfos[name])
 		})
 	}
+}
+
+// A resume submits the rootfs, memory and metadata imports back to back;
+// s3lvol admits one manifest fetch per lvstore and answers the others EBUSY.
+// That is "not now": the import is retried, and a definite refusal is not.
+func TestSandboxImportRetriesBusy(t *testing.T) {
+	prevB, prevBudget := importBusyBackoff, importBusyBudget
+	importBusyBackoff, importBusyBudget = time.Millisecond, time.Second
+	t.Cleanup(func() { importBusyBackoff, importBusyBudget = prevB, prevBudget })
+
+	busy := errors.New("s3lvol rpc: Device or resource busy")
+	engine := &fakeCowEngine{importErrQueue: []error{busy, busy}}
+	useTestCowStorageAt(t, engine)
+	_, dev, err := CrossNodeSandboxImport(crossNodeAnnotations()).Rootfs(context.Background(), 0)
+	require.NoError(t, err)
+	require.NotEmpty(t, dev)
+	require.Len(t, engine.importedLvols, 3, "two busy refusals, then the import")
+
+	// Never-transient refusals still fail at once.
+	require.False(t, isTransientImportError(errors.New("s3lvol rpc: File exists")))
+	require.True(t, isTransientImportError(errors.New("s3lvol rpc: Device or resource busy")))
+	require.True(t, isTransientImportError(errors.New("read rcow_import_lvol: Resource temporarily unavailable")))
 }
 
 func TestSandboxImportAlreadyExistsIsNotEvidence(t *testing.T) {

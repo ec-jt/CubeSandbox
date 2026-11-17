@@ -10,6 +10,9 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"time"
+
+	"github.com/containerd/log"
 
 	"github.com/tencentcloud/CubeSandbox/Cubelet/pkg/constants"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/pkg/cubecow"
@@ -205,19 +208,9 @@ func (s *SandboxImport) importOne(ctx context.Context, name, role, uuid string) 
 	if !ok || importer == nil {
 		return "", fmt.Errorf("cubecow engine cannot import %s %s", role, name)
 	}
-	info, lookupErr := store.GetVolumeInfo(ctx, name)
-	present, err := cowObjectPresent(info, lookupErr)
+	info, err := importWithRetry(ctx, store, importer, name, role, uuid)
 	if err != nil {
-		return "", fmt.Errorf("lookup %s %s: %w", role, name, err)
-	}
-	if !present {
-		if _, err := importer.ImportLvol(name, uuid); err != nil && !isCowSemantic(err, cubecow.SemAlreadyExists) {
-			return "", fmt.Errorf("import %s %s (remote_uuid=%s): %w", role, name, uuid, err)
-		}
-		info, err = store.GetVolumeInfo(ctx, name)
-		if err != nil {
-			return "", fmt.Errorf("read native origin for %s %s: %w", role, name, err)
-		}
+		return "", err
 	}
 	if err := requireImportedOrigin(info, name, uuid); err != nil {
 		return "", fmt.Errorf("refuse imported %s %s: %w", role, name, err)
@@ -312,6 +305,69 @@ func ReleaseCrossNodeSandboxImports(ctx context.Context, sandboxID string) error
 		}
 	}
 	return errs
+}
+
+// importBusyBudget bounds how long a cross-node import keeps retrying an
+// import that s3lvol refused as busy or that timed out on the RPC socket.
+var (
+	importBusyBudget  = 3 * time.Minute
+	importBusyBackoff = 2 * time.Second
+)
+
+// isTransientImportError is an import refusal that says "not now", never
+// "not this": s3lvol admits one manifest fetch per lvstore at a time and
+// answers EBUSY to the others, and cubecow's RPC read gives up (EAGAIN) on an
+// import whose manifest GET is slow while s3lvol carries on with it.
+// Live 2026-11-17: a resume issued the rootfs, memory and metadata imports
+// back to back; the memory manifest GET took 19.9 s, the RPC read timed out,
+// and the other two were refused busy. The import itself completed.
+func isTransientImportError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "resource busy") ||
+		strings.Contains(msg, "temporarily unavailable") ||
+		strings.Contains(msg, "timed out") ||
+		strings.Contains(msg, "i/o timeout")
+}
+
+// importWithRetry imports name from uuid, or adopts an import that already
+// landed (an earlier attempt whose RPC timed out). Transient refusals are
+// retried within importBusyBudget; each retry first looks the object up, so
+// an import that completed in the background is never submitted twice. The
+// caller still proves the origin before using what this returns.
+func importWithRetry(ctx context.Context, store *S3Cow, importer cowVolumeImporter,
+	name, role, uuid string) (*cubecow.Volume, error) {
+	deadline := time.Now().Add(importBusyBudget)
+	for attempt := 1; ; attempt++ {
+		info, lookupErr := store.GetVolumeInfo(ctx, name)
+		present, err := cowObjectPresent(info, lookupErr)
+		if err != nil {
+			return nil, fmt.Errorf("lookup %s %s: %w", role, name, err)
+		}
+		if present {
+			return info, nil
+		}
+		_, ierr := importer.ImportLvol(name, uuid)
+		if ierr == nil || isCowSemantic(ierr, cubecow.SemAlreadyExists) {
+			info, err = store.GetVolumeInfo(ctx, name)
+			if err != nil {
+				return nil, fmt.Errorf("read native origin for %s %s: %w", role, name, err)
+			}
+			return info, nil
+		}
+		if !isTransientImportError(ierr) || time.Now().After(deadline) {
+			return nil, fmt.Errorf("import %s %s (remote_uuid=%s): %w", role, name, uuid, ierr)
+		}
+		log.G(ctx).Warnf("import %s %s (remote_uuid=%s) attempt %d: %v; retrying",
+			role, name, uuid, attempt, ierr)
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(importBusyBackoff):
+		}
+	}
 }
 
 func requireImportedOrigin(info *cubecow.Volume, name, uuid string) error {

@@ -56,6 +56,9 @@ type fakeCowEngine struct {
 	exportErr                   error
 	importedLvols               [][2]string
 	importErr                   error
+	// importErrQueue is consumed one error per ImportLvol call before
+	// importErr is consulted.
+	importErrQueue []error
 }
 
 // ImportLvol makes the fake a cowVolumeImporter: cross-node create imports
@@ -72,6 +75,11 @@ func (f *fakeCowEngine) ImportStatus(name string) (string, error) {
 
 func (f *fakeCowEngine) ImportLvol(name, remoteUUID string) (string, error) {
 	f.importedLvols = append(f.importedLvols, [2]string{name, remoteUUID})
+	if len(f.importErrQueue) > 0 {
+		err := f.importErrQueue[0]
+		f.importErrQueue = f.importErrQueue[1:]
+		return "", err
+	}
 	if f.importErr != nil {
 		return "", f.importErr
 	}
