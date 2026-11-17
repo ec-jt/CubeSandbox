@@ -80,6 +80,12 @@ struct s3lvol_export {
 	uint64_t        expires_at;
 	uint32_t                generation;
 
+	/* Pack objects this export owns (version 6), 0 for none. The packs are
+	 * keyed by this export's uuid, so this entry is their only reference:
+	 * releasing the export is what deletes them. Persisted so a restart does
+	 * not forget them. */
+	uint32_t                pack_count;
+
 	/* Liveness lease cache. The importer renews
 	 * <this lvstore>/meta/exports/<uuid>.lease in the source bucket; this
 	 * node reads it back so the delete path can tell "an importer is still
@@ -1023,6 +1029,9 @@ s3lvol_export_publication_complete(struct s3lvol_export *exp,
 	exp->publication_pending = false;
 	exp->layout = m->layout;
 	exp->generation = m->generation;
+	if (s3_export_manifest_is_packed(m)) {
+		exp->pack_count = m->pack_count;
+	}
 	/* Only a FIRST publication as dense never exposed source chunk refs.
 	 * Materialisation of a published REF must retain source_obligation. */
 	exp->source_obligation = m->layout == S3_EXPORT_LAYOUT_REF;
@@ -1030,6 +1039,45 @@ s3lvol_export_publication_complete(struct s3lvol_export *exp,
 		s3lvol_export_lease_stop(exp);
 	}
 	/* Upstream leases were started before serializing the completed registry. */
+}
+
+static void
+export_packs_gc_done(void *cb_arg, int status)
+{
+	char *uuid = cb_arg;
+
+	if (status != 0) {
+		SPDK_WARNLOG("export %s: some pack objects could not be deleted (%s); "
+			     "they are orphaned under the export's prefix\n", uuid,
+			     spdk_strerror(-status));
+	}
+	free(uuid);
+}
+
+/* Pack GC. A pack is named by exactly one export (its key carries the export
+ * uuid), so the export's registry entry is the whole reference count: when the
+ * entry goes because the export was released, the packs go with it. Called
+ * only on release paths, never on unload, which must keep everything. */
+void
+s3lvol_export_gc_packs(struct s3lvol_export *exp)
+{
+	char *uuid;
+	int rc;
+
+	if (!exp || exp->pack_count == 0) {
+		return;
+	}
+	uuid = strdup(exp->uuid_str);
+	if (!uuid) {
+		return;
+	}
+	rc = s3_export_packs_delete(s3lvol_lvstore_get_client(exp->lvs),
+				    s3lvol_lvstore_get_name(exp->lvs), exp->uuid_str,
+				    exp->pack_count, export_packs_gc_done, uuid);
+	if (rc != 0) {
+		export_packs_gc_done(uuid, rc);
+	}
+	exp->pack_count = 0;
 }
 
 void
@@ -1103,6 +1151,7 @@ export_reaped(void *cb_arg, int lvolerrno)
 		 * fallback if that path still reported ENOENT. Drop the entry. */
 		exp = s3lvol_export_find(ctx->lvs, ctx->uuid_str);
 		if (exp) {
+			s3lvol_export_gc_packs(exp);
 			s3lvol_export_forget(exp);
 			if (s3lvol_export_registry_save(ctx->lvs, NULL, NULL) != 0) {
 				SPDK_WARNLOG("Dropped dead export %s but could not "
@@ -1311,6 +1360,15 @@ exports_serialize(struct s3lvol_lvstore *lvs, char **out, size_t *out_len,
 		if (exp->lease_aware) {
 			spdk_json_write_named_bool(w, "lease_aware", true);
 		}
+		/* Only when it owns packs; older builds ignore the member. */
+		{
+			uint32_t packs = exp == completing && s3_export_manifest_is_packed(m) ?
+					 m->pack_count : exp->pack_count;
+
+			if (packs > 0) {
+				spdk_json_write_named_uint32(w, "pack_count", packs);
+			}
+		}
 		/* The upstream leases this export renews, written as the keys rather
 		 * than as the prefixes they came from.
 		 *
@@ -1432,6 +1490,7 @@ struct export_entry_json {
 	uint64_t expires_at;
 	uint32_t generation;
 	bool     lease_aware;
+	uint32_t pack_count;
 	struct src_leases_holder src_leases;
 };
 
@@ -1446,6 +1505,7 @@ static const struct spdk_json_object_decoder export_entry_decoders[] = {
 	{"expires_at",  offsetof(struct export_entry_json, expires_at),  spdk_json_decode_uint64, true},
 	{"generation",  offsetof(struct export_entry_json, generation),  spdk_json_decode_uint32, true},
 	{"lease_aware", offsetof(struct export_entry_json, lease_aware), spdk_json_decode_bool, true},
+	{"pack_count",  offsetof(struct export_entry_json, pack_count),  spdk_json_decode_uint32, true},
 	/* Optional: absent for a non-derived export and for anything an older build
 	 * wrote, both of which mean "renews nothing upstream". */
 	{"src_leases",  offsetof(struct export_entry_json, src_leases),  decode_src_leases, true},
@@ -1564,6 +1624,7 @@ exports_parse(struct s3lvol_lvstore *lvs, const void *json, size_t len)
 		exp->expires_at = e->expires_at;
 		exp->generation = e->generation;
 		exp->lease_aware = e->lease_aware;
+		exp->pack_count = e->pack_count;
 		exp->publication_pending = e->publication_pending;
 		exp->source_obligation = e->source_obligation || e->publication_pending ||
 			strcmp(e->layout, S3_EXPORT_LAYOUT_REF_STR) == 0;

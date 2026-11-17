@@ -187,7 +187,7 @@ func TestCheckpointCommitIncompleteAndConflicting(t *testing.T) {
 	require.Error(t, err)
 	require.Equal(t, before, e.records[checkpointKey(*entry.DiskBinding)])
 }
-// Template-delta exports (B21) carry manifest version 5. A checkpoint whose
+// Template-delta exports (B21) carry manifest version 5, packed ones 6. A checkpoint whose
 // rootfs and memory are deltas over a template base must still commit, or
 // Master never marks the pause remote-ready. Unknown newer versions stay
 // refused.
@@ -204,10 +204,20 @@ func TestCheckpointCommitAcceptsTemplateDeltaManifest(t *testing.T) {
 	require.Equal(t, cow.RemoteStateReady, st.State)
 	require.Len(t, e.records, 2)
 
+	// Version 6 (packed delta) commits too.
 	m, e, entry = commitFixture(t)
 	uuid := e.volumeInfos[entry.RootfsVol].ExportUUID
 	v := e.evidence[uuid]
 	v.ManifestVersion = 6
+	e.evidence[uuid] = v
+	st, err = m.UploadStatus(context.Background(), entry.SnapshotID)
+	require.NoError(t, err)
+	require.Equal(t, cow.RemoteStateReady, st.State)
+
+	m, e, entry = commitFixture(t)
+	uuid = e.volumeInfos[entry.RootfsVol].ExportUUID
+	v = e.evidence[uuid]
+	v.ManifestVersion = 7
 	e.evidence[uuid] = v
 	_, err = m.commitCheckpoint(context.Background(), entry.SnapshotID)
 	require.Error(t, err)

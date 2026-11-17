@@ -158,7 +158,9 @@ func (m *S3Cow) checkpointRPC(ctx context.Context, request map[string]string) (s
 // checkpoint may commit. Version 5 is a template-delta export (B21): a ref
 // manifest over a template base that names only the sandbox's own chunks.
 // The reader fails closed when the base is missing, so committing it is safe.
-const checkpointMaxManifestVersion = 5
+// Version 6 is the same delta with its own chunks copied into pack objects
+// (S3LVOL_EXPORT_PACKS); readers that predate it refuse it on the version.
+const checkpointMaxManifestVersion = 6
 
 func validCheckpointExport(e CheckpointExport) bool {
 	return e.ExportUUID != "" && e.SnapshotUUID != "" && e.Snapshot != "" && e.Endpoint != "" && e.Bucket != "" && e.Prefix != "" && e.LvsName != "" && e.SizeBytes > 0 && e.ClusterSize > 0 && e.ChunkSize > 0 && e.BlockSize > 0 && e.ManifestVersion >= 2 && e.ManifestVersion <= checkpointMaxManifestVersion

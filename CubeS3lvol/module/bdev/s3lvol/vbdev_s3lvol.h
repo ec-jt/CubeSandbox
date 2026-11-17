@@ -1659,6 +1659,8 @@ int s3lvol_export_abandon_unpublished(struct s3lvol_lvstore *lvs, const char *uu
 int s3lvol_export_reconcile(struct s3lvol_lvstore *lvs, const char *uuid,
                             spdk_lvol_op_complete cb, void *arg);
 void s3lvol_export_forget(struct s3lvol_export *exp);
+/* Delete the pack objects a released export owns (pack GC). */
+void s3lvol_export_gc_packs(struct s3lvol_export *exp);
 void s3lvol_export_set_materialised(struct s3lvol_export *exp, uint32_t generation);
 void s3lvol_export_set_local_ref(struct s3lvol_export *exp, uint32_t generation);
 

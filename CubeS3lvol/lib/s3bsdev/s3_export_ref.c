@@ -75,9 +75,338 @@
 #include "spdk/util.h"
 #include "spdk/uuid.h"
 
+#include "spdk/env.h"
+
 #include "s3lvol/s3_bs_dev.h"
 #include "s3lvol/s3_chunk_map.h"
 #include "s3lvol/s3_export.h"
+#include "s3lvol/s3_hedge.h"
+#include "export_chunk_retry.h"
+
+/* ==========================================================================
+ * Pack writer (S3LVOL_EXPORT_PACKS, version 6)
+ *
+ * A template delta names its own chunks as live 1 MiB objects, and an importer
+ * fetches each of them with its own GET: on Hetzner that is a few hundred
+ * requests per volume, each one exposed to the slow tail. The pack writer
+ * copies the delta's present chunks, in ascending order, into pack objects of
+ * pack_chunks slots each (16 MiB by default) and publishes the manifest as
+ * version 6 with a table mapping every chunk to (pack, slot). The importer then
+ * reads slots as ranged GETs of a few large objects.
+ *
+ * Order is the contract, as for the dense engine: the manifest is published only
+ * once every pack is durable. If any pack fails for good the packs that landed
+ * are deleted and the plain version 5 manifest is published instead -- it is
+ * still correct, because the refs it names stay alive with the snapshot.
+ *
+ * Bytes come from reading the exported snapshot through blobstore, which is what
+ * an importer of the version 5 manifest would have read anyway: each present
+ * chunk is owned by a layer above the template base, so the read resolves to it.
+ * A slot is always chunk_size bytes; a partially written chunk carries zeroes
+ * past its valid end, and the reader asks only for the valid part.
+ * ========================================================================== */
+
+#define PACK_INFLIGHT_DEFAULT 4
+#define PACK_INFLIGHT_MAX     16
+
+struct pack_writer;
+
+struct pack_job {
+	struct pack_writer *w;
+	uint32_t            pack;
+	uint32_t            nslots;
+	uint32_t            reads_pending;
+	uint32_t            put_attempts;
+	int                 read_status;
+	uint8_t            *buf;
+	struct iovec        iov;
+	char                key[S3_EXPORT_KEY_MAX];
+};
+
+struct pack_writer {
+	struct s3_export_manifest *m;
+	struct s3_client          *client;
+	struct spdk_blob          *blob;
+	struct spdk_io_channel    *channel;
+	s3_export_cb               cb;
+	void                      *cb_arg;
+	uint64_t                  *chunks;      /* present chunks, ascending */
+	uint64_t                   nchunks;
+	uint32_t                   blocks_per_chunk;
+	uint32_t                   next_pack;
+	uint32_t                   inflight;
+	uint32_t                   max_inflight;
+	uint32_t                   done_packs;
+	uint64_t                   put_retries;
+	uint64_t                   start_ms;
+	int                        status;
+	bool                       pumping;
+};
+
+static uint64_t
+pack_now_ms(void)
+{
+	return spdk_get_ticks() * 1000 / spdk_get_ticks_hz();
+}
+
+static uint32_t
+pack_inflight_from_env(void)
+{
+	const char *v = getenv("S3LVOL_EXPORT_PACK_INFLIGHT");
+	unsigned long n;
+	char *end = NULL;
+
+	if (!v || !*v) {
+		return PACK_INFLIGHT_DEFAULT;
+	}
+	n = strtoul(v, &end, 10);
+	if (!end || *end != '\0' || n == 0) {
+		return PACK_INFLIGHT_DEFAULT;
+	}
+	return n > PACK_INFLIGHT_MAX ? PACK_INFLIGHT_MAX : (uint32_t)n;
+}
+
+static void pack_pump(struct pack_writer *w);
+
+static void
+pack_writer_free(struct pack_writer *w)
+{
+	free(w->chunks);
+	free(w);
+}
+
+static void
+pack_publish_fallback_deleted(void *cb_arg, int status)
+{
+	struct pack_writer *w = cb_arg;
+	int rc;
+
+	(void)status;
+	/* The packs are gone (or their delete is logged); publish the plain delta,
+	 * which the live refs keep valid. */
+	s3_export_manifest_clear_packs(w->m);
+	rc = s3_export_manifest_publish(w->client, w->m, w->cb, w->cb_arg);
+	if (rc != 0) {
+		w->cb(w->cb_arg, NULL, rc);
+	}
+	s3_export_manifest_unref(w->m);
+	pack_writer_free(w);
+}
+
+static void
+pack_finish(struct pack_writer *w)
+{
+	int rc;
+
+	if (w->status != 0) {
+		SPDK_WARNLOG("Export %s: packing failed (%s) after %u of %u pack(s); "
+			     "publishing the unpacked delta instead\n", w->m->uuid_str,
+			     spdk_strerror(-w->status), w->done_packs, w->m->pack_count);
+		rc = s3_export_packs_delete(w->client, w->m->src.prefix, w->m->uuid_str,
+					    w->m->pack_count, pack_publish_fallback_deleted, w);
+		if (rc != 0) {
+			pack_publish_fallback_deleted(w, rc);
+		}
+		return;
+	}
+	SPDK_NOTICELOG("Export %s: %" PRIu64 " own chunk(s) packed into %u pack(s) of "
+		       "%u slot(s) in %" PRIu64 " ms (%" PRIu64 " PUT retr(ies))\n",
+		       w->m->uuid_str, w->nchunks, w->m->pack_count, w->m->pack_chunks,
+		       pack_now_ms() - w->start_ms, w->put_retries);
+	rc = s3_export_manifest_publish(w->client, w->m, w->cb, w->cb_arg);
+	if (rc != 0) {
+		w->cb(w->cb_arg, NULL, rc);
+	}
+	s3_export_manifest_unref(w->m);
+	pack_writer_free(w);
+}
+
+static void
+pack_job_end(struct pack_job *j, int status)
+{
+	struct pack_writer *w = j->w;
+
+	if (status != 0 && w->status == 0) {
+		w->status = status;
+	}
+	if (status == 0) {
+		w->done_packs++;
+	}
+	spdk_free(j->buf);
+	free(j);
+	w->inflight--;
+	pack_pump(w);
+}
+
+static void pack_job_uploaded(void *cb_arg, int status);
+
+static int
+pack_job_put(struct pack_job *j)
+{
+	j->put_attempts++;
+	/* Hedged and retried: a pack key is written once per export uuid with
+	 * fixed bytes, and the buffer lives until the job ends. */
+	return s3_put_hedged(j->w->client, j->key, &j->iov, 1, NULL,
+			     pack_job_uploaded, j);
+}
+
+static void
+pack_job_uploaded(void *cb_arg, int status)
+{
+	struct pack_job *j = cb_arg;
+	struct pack_writer *w = j->w;
+
+	if (export_chunk_should_retry(status, j->put_attempts, w->status != 0)) {
+		SPDK_WARNLOG("Export %s pack %u PUT attempt %u failed: %s; retrying\n",
+			     w->m->uuid_str, j->pack, j->put_attempts,
+			     spdk_strerror(-status));
+		w->put_retries++;
+		if (pack_job_put(j) == 0) {
+			return;
+		}
+	}
+	if (status != 0) {
+		SPDK_ERRLOG("Export %s: pack %u ('%s') failed: %s\n", w->m->uuid_str,
+			    j->pack, j->key, spdk_strerror(-status));
+	}
+	pack_job_end(j, status);
+}
+
+static void
+pack_job_read_done(void *cb_arg, int bserrno)
+{
+	struct pack_job *j = cb_arg;
+	int rc;
+
+	if (bserrno != 0 && j->read_status == 0) {
+		j->read_status = bserrno;
+	}
+	if (--j->reads_pending > 0) {
+		return;
+	}
+	if (j->read_status != 0) {
+		SPDK_ERRLOG("Export %s: reading pack %u failed: %s\n", j->w->m->uuid_str,
+			    j->pack, spdk_strerror(-j->read_status));
+		pack_job_end(j, j->read_status);
+		return;
+	}
+	j->iov.iov_base = j->buf;
+	j->iov.iov_len = (size_t)j->nslots * j->w->m->chunk_size;
+	rc = pack_job_put(j);
+	if (rc != 0) {
+		pack_job_end(j, rc);
+	}
+}
+
+static int
+pack_job_start(struct pack_writer *w, uint32_t pack)
+{
+	struct pack_job *j;
+	uint64_t first = (uint64_t)pack * w->m->pack_chunks;
+	uint32_t s;
+
+	j = calloc(1, sizeof(*j));
+	if (!j) {
+		return -ENOMEM;
+	}
+	j->w = w;
+	j->pack = pack;
+	j->nslots = (uint32_t)spdk_min((uint64_t)w->m->pack_chunks, w->nchunks - first);
+	j->buf = spdk_zmalloc((size_t)j->nslots * w->m->chunk_size, S3LVOL_BLOCK_SIZE,
+			      NULL, SPDK_ENV_SOCKET_ID_ANY, SPDK_MALLOC_DMA);
+	if (!j->buf) {
+		free(j);
+		return -ENOMEM;
+	}
+	s3_export_pack_key(w->m->src.prefix, w->m->uuid_str, pack, j->key, sizeof(j->key));
+	w->inflight++;
+	/* One self reference so a read that completes inline cannot end the job
+	 * before every read is submitted. */
+	j->reads_pending = 1;
+	for (s = 0; s < j->nslots; s++) {
+		uint64_t c = w->chunks[first + s];
+
+		j->reads_pending++;
+		spdk_blob_io_read(w->blob, w->channel,
+				  j->buf + (size_t)s * w->m->chunk_size,
+				  c * w->blocks_per_chunk, w->blocks_per_chunk,
+				  pack_job_read_done, j);
+	}
+	pack_job_read_done(j, 0);
+	return 0;
+}
+
+static void
+pack_pump(struct pack_writer *w)
+{
+	if (w->pumping) {
+		return;
+	}
+	w->pumping = true;
+	while (w->status == 0 && w->next_pack < w->m->pack_count &&
+	       w->inflight < w->max_inflight) {
+		int rc = pack_job_start(w, w->next_pack);
+
+		if (rc != 0) {
+			w->status = rc;
+			break;
+		}
+		w->next_pack++;
+	}
+	w->pumping = false;
+	if (w->inflight == 0 &&
+	    (w->status != 0 || w->next_pack == w->m->pack_count)) {
+		pack_finish(w);
+	}
+}
+
+/* Takes its own reference on m. 0 means the callback will run. */
+static int
+pack_writer_run(const struct s3_export_ref_opts *opts, struct s3_export_manifest *m,
+		s3_export_cb cb, void *cb_arg)
+{
+	struct pack_writer *w;
+	uint64_t i, n = 0;
+	int rc;
+
+	w = calloc(1, sizeof(*w));
+	if (!w) {
+		return -ENOMEM;
+	}
+	w->chunks = calloc(m->present_chunks ? m->present_chunks : 1, sizeof(*w->chunks));
+	if (!w->chunks) {
+		free(w);
+		return -ENOMEM;
+	}
+	for (i = 0; i < m->num_chunks; i++) {
+		if (s3_export_manifest_is_present(m, i)) {
+			w->chunks[n++] = i;
+		}
+	}
+	w->nchunks = n;
+	rc = s3_export_manifest_set_packs(m, opts->pack_chunks);
+	if (rc != 0) {
+		pack_writer_free(w);
+		return rc;
+	}
+	s3_export_manifest_seal(m);
+	w->m = m;
+	s3_export_manifest_ref(m);
+	w->client = opts->client;
+	w->blob = opts->pack_blob;
+	w->channel = opts->pack_channel;
+	w->cb = cb;
+	w->cb_arg = cb_arg;
+	w->blocks_per_chunk = m->chunk_size / S3LVOL_BLOCK_SIZE;
+	w->max_inflight = pack_inflight_from_env();
+	w->start_ms = pack_now_ms();
+	SPDK_NOTICELOG("Export %s: packing %" PRIu64 " own chunk(s) into %u pack(s) of "
+		       "%u MiB, %u in flight\n", m->uuid_str, n, m->pack_count,
+		       (uint32_t)(((uint64_t)m->pack_chunks * m->chunk_size) >> 20),
+		       w->max_inflight);
+	pack_pump(w);
+	return 0;
+}
 
 struct ref_walk {
 	struct s3_export_manifest *m;
@@ -412,6 +741,30 @@ s3_export_run_ref(const struct s3_export_ref_opts *opts, s3_export_cb cb, void *
 			       "export %s, across %u prefix(es) in total\n",
 			       opts->uuid_str, inherited, opts->parent->uuid_str,
 			       m->num_srcs);
+	}
+
+	/* Packs: only for a delta with enough own chunks to be worth it, and only
+	 * when the caller supplied a way to read the snapshot. The writer
+	 * publishes when every pack is durable (or falls back to version 5). */
+	if (opts->pack_chunks > 0 && opts->pack_blob && opts->pack_channel &&
+	    s3_export_manifest_is_delta(m)) {
+		s3_export_manifest_seal(m);
+		if (m->present_chunks >= S3_EXPORT_PACK_MIN_CHUNKS) {
+			rc = pack_writer_run(opts, m, cb, cb_arg);
+			if (rc == 0) {
+				s3_export_manifest_unref(m);
+				return 0;
+			}
+			SPDK_WARNLOG("Export %s: could not start packing (%s); publishing "
+				     "the unpacked delta\n", opts->uuid_str,
+				     spdk_strerror(-rc));
+			s3_export_manifest_clear_packs(m);
+		} else {
+			SPDK_NOTICELOG("Export %s: %" PRIu64 " own chunk(s) is below the "
+				       "pack threshold of %u; publishing plain objects\n",
+				       opts->uuid_str, m->present_chunks,
+				       S3_EXPORT_PACK_MIN_CHUNKS);
+		}
 	}
 
 	/* Hands its reference to the callback. */

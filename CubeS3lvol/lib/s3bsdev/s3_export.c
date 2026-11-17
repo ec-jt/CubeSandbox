@@ -291,6 +291,7 @@ s3_export_manifest_unref(struct s3_export_manifest *m)
 	free(m->srcs);
 	free(m->src_idx);
 	free(m->zeroes);
+	free(m->pack_loc);
 	free(m);
 }
 
@@ -328,7 +329,243 @@ s3_export_manifest_set_base(struct s3_export_manifest *m, const char *base_uuid)
 bool
 s3_export_manifest_is_delta(const struct s3_export_manifest *m)
 {
-	return m && m->version == S3_EXPORT_DELTA_VERSION && m->base_uuid[0] != '\0';
+	/* A packed manifest (version 6) is a delta with a pack table on top. */
+	return m && (m->version == S3_EXPORT_DELTA_VERSION ||
+		     m->version == S3_EXPORT_PACK_VERSION) && m->base_uuid[0] != '\0';
+}
+
+/* ==========================================================================
+ * Packs (version 6)
+ * ========================================================================== */
+
+bool
+s3_export_manifest_is_packed(const struct s3_export_manifest *m)
+{
+	return m && m->version == S3_EXPORT_PACK_VERSION && m->pack_loc != NULL &&
+	       m->pack_count > 0 && m->pack_chunks > 0;
+}
+
+void
+s3_export_pack_key(const char *prefix, const char *uuid_str, uint32_t n,
+		   char *out, size_t out_len)
+{
+	/* Under the export's own directory, next to (never colliding with) the
+	 * fixed-width chunk keys a dense export uses. Written once per export uuid
+	 * with fixed bytes, which is what makes hedging and retrying it safe. */
+	snprintf(out, out_len, "%s/exports/%s/pack-%08" PRIx32, prefix, uuid_str, n);
+}
+
+int
+s3_export_manifest_set_packs(struct s3_export_manifest *m, uint32_t pack_chunks)
+{
+	uint32_t *loc;
+	uint64_t i, n = 0;
+
+	if (!s3_export_manifest_is_delta(m) || pack_chunks == 0 || pack_chunks > 255) {
+		return -EINVAL;
+	}
+	loc = calloc(m->num_chunks ? m->num_chunks : 1, sizeof(*loc));
+	if (!loc) {
+		return -ENOMEM;
+	}
+	for (i = 0; i < m->num_chunks; i++) {
+		if (!s3_export_manifest_is_present(m, i)) {
+			loc[i] = S3_EXPORT_PACK_LOC_NONE;
+			continue;
+		}
+		loc[i] = (uint32_t)(((n / pack_chunks) << 8) | (n % pack_chunks));
+		n++;
+	}
+	free(m->pack_loc);
+	m->pack_loc = loc;
+	m->pack_chunks = pack_chunks;
+	m->pack_count = (uint32_t)((n + pack_chunks - 1) / pack_chunks);
+	m->version = S3_EXPORT_PACK_VERSION;
+	return 0;
+}
+
+/* Undo set_packs(): the manifest goes back to a plain version 5 delta whose
+ * chunks read from their refs. Used when the pack upload fails. */
+void
+s3_export_manifest_clear_packs(struct s3_export_manifest *m)
+{
+	if (!m) {
+		return;
+	}
+	free(m->pack_loc);
+	m->pack_loc = NULL;
+	m->pack_chunks = 0;
+	m->pack_count = 0;
+	if (m->version == S3_EXPORT_PACK_VERSION) {
+		m->version = S3_EXPORT_DELTA_VERSION;
+	}
+}
+
+struct packs_delete_ctx {
+	struct s3_client *client;
+	char              prefix[S3_EXPORT_PREFIX_MAX];
+	char              uuid[SPDK_UUID_STRING_LEN];
+	char              key[S3_EXPORT_KEY_MAX];
+	uint32_t          count;
+	uint32_t          next;
+	int               status;
+	void            (*cb)(void *cb_arg, int status);
+	void             *cb_arg;
+};
+
+static void packs_delete_next(struct packs_delete_ctx *d);
+
+static void
+packs_delete_done(void *cb_arg, int status)
+{
+	struct packs_delete_ctx *d = cb_arg;
+
+	/* s3_delete() already counts a 404 as success. */
+	if (status != 0) {
+		SPDK_WARNLOG("export %s: could not delete pack '%s': %s\n", d->uuid,
+			     d->key, spdk_strerror(-status));
+		if (d->status == 0) {
+			d->status = status;
+		}
+	}
+	packs_delete_next(d);
+}
+
+static void
+packs_delete_next(struct packs_delete_ctx *d)
+{
+	int rc;
+
+	while (d->next < d->count) {
+		s3_export_pack_key(d->prefix, d->uuid, d->next++, d->key, sizeof(d->key));
+		rc = s3_delete(d->client, d->key, packs_delete_done, d);
+		if (rc == 0) {
+			return;
+		}
+		if (d->status == 0) {
+			d->status = rc;
+		}
+	}
+	if (d->status == 0) {
+		SPDK_NOTICELOG("export %s: deleted %u pack object(s)\n", d->uuid, d->count);
+	}
+	if (d->cb) {
+		d->cb(d->cb_arg, d->status);
+	}
+	free(d);
+}
+
+int
+s3_export_packs_delete(struct s3_client *client, const char *prefix,
+		       const char *uuid_str, uint32_t count,
+		       void (*cb)(void *cb_arg, int status), void *cb_arg)
+{
+	struct packs_delete_ctx *d;
+
+	if (!client || !prefix || !uuid_str) {
+		return -EINVAL;
+	}
+	d = calloc(1, sizeof(*d));
+	if (!d) {
+		return -ENOMEM;
+	}
+	/* Not referenced: the caller's client (an lvstore's) outlives this. */
+	d->client = client;
+	snprintf(d->prefix, sizeof(d->prefix), "%s", prefix);
+	snprintf(d->uuid, sizeof(d->uuid), "%s", uuid_str);
+	d->count = count;
+	d->cb = cb;
+	d->cb_arg = cb_arg;
+	packs_delete_next(d);
+	return 0;
+}
+
+int
+s3_export_manifest_pack_range(const struct s3_export_manifest *m,
+			      uint64_t chunk_index, char *key, size_t key_len,
+			      uint64_t *offset, uint32_t *len)
+{
+	uint32_t loc, pack, slot;
+
+	if (!m || !key || key_len == 0) {
+		return -EINVAL;
+	}
+	if (!s3_export_manifest_is_present(m, chunk_index)) {
+		return -ENOENT;
+	}
+	if (!s3_export_manifest_is_packed(m)) {
+		return -EINVAL;
+	}
+	loc = m->pack_loc[chunk_index];
+	pack = loc >> 8;
+	slot = loc & 0xffu;
+	if (loc == S3_EXPORT_PACK_LOC_NONE || pack >= m->pack_count ||
+	    slot >= m->pack_chunks) {
+		/* Present with no location: refused, never guessed. */
+		return -EINVAL;
+	}
+	s3_export_pack_key(m->src.prefix, m->uuid_str, pack, key, key_len);
+	if (offset) {
+		*offset = (uint64_t)slot * m->chunk_size;
+	}
+	if (len) {
+		/* A slot always holds chunk_size bytes (zeroes past the chunk's
+		 * valid end), but only the valid part has to be fetched. */
+		*len = m->chunk_size;
+		if (m->refs && m->refs[chunk_index].valid_bytes > 0 &&
+		    m->refs[chunk_index].valid_bytes < m->chunk_size) {
+			*len = m->refs[chunk_index].valid_bytes;
+		}
+	}
+	return 0;
+}
+
+bool
+s3_export_packs_enabled(void)
+{
+	const char *v = getenv("S3LVOL_EXPORT_PACKS");
+
+	return v && (strcmp(v, "1") == 0 || strcasecmp(v, "true") == 0 ||
+		     strcasecmp(v, "yes") == 0);
+}
+
+uint32_t
+s3_export_pack_chunks_from_env(uint32_t chunk_size)
+{
+	const char *v = getenv("S3LVOL_EXPORT_PACK_MIB");
+	unsigned long mib = S3_EXPORT_PACK_MIB_DEFAULT;
+	uint64_t chunks;
+
+	if (v && *v) {
+		char *end = NULL;
+		unsigned long n;
+
+		errno = 0;
+		n = strtoul(v, &end, 10);
+		if (errno == 0 && end && *end == '\0' && n > 0) {
+			mib = n;
+		} else {
+			SPDK_WARNLOG("ignoring S3LVOL_EXPORT_PACK_MIB='%s'; using %u\n", v,
+				     S3_EXPORT_PACK_MIB_DEFAULT);
+		}
+	}
+	if (mib < S3_EXPORT_PACK_MIB_MIN) {
+		mib = S3_EXPORT_PACK_MIB_MIN;
+	}
+	if (mib > S3_EXPORT_PACK_MIB_MAX) {
+		mib = S3_EXPORT_PACK_MIB_MAX;
+	}
+	if (chunk_size == 0) {
+		return 0;
+	}
+	chunks = ((uint64_t)mib << 20) / chunk_size;
+	if (chunks == 0) {
+		chunks = 1;
+	}
+	if (chunks > 255) {
+		chunks = 255;
+	}
+	return (uint32_t)chunks;
 }
 
 bool
@@ -875,7 +1112,7 @@ s3_export_manifest_seal(struct s3_export_manifest *m)
 	/* Version 5: the zero bitmap and the base identity. Both change what an
 	 * absent chunk means, so a flipped bit or a different base must fail the
 	 * crc rather than silently serve base bytes where zeroes were meant. */
-	if (m->version == S3_EXPORT_DELTA_VERSION) {
+	if (m->version >= S3_EXPORT_DELTA_VERSION) {
 		char base[SPDK_UUID_STRING_LEN] = {0};
 
 		if (m->zeroes) {
@@ -890,6 +1127,32 @@ s3_export_manifest_seal(struct s3_export_manifest *m)
 		}
 		memcpy(base, m->base_uuid, sizeof(base));
 		m->crc32c = spdk_crc32c_update(base, sizeof(base), m->crc32c);
+	}
+
+	/* Version 6: the pack geometry and every present chunk's location. A
+		* flipped location reads another chunk's bytes from the right pack with
+		* no error anywhere, so it has to fail the crc. */
+	if (m->version == S3_EXPORT_PACK_VERSION && m->pack_loc) {
+		uint8_t batch[64];
+		size_t n = 0;
+
+		pack_u32(batch, m->pack_chunks);
+		pack_u32(batch + 4, m->pack_count);
+		m->crc32c = spdk_crc32c_update(batch, 8, m->crc32c);
+		for (i = 0; i < m->num_chunks; i++) {
+			if (!bitmap_test(m->present, i)) {
+				continue;
+			}
+			pack_u32(batch + n, m->pack_loc[i]);
+			n += 4;
+			if (n == sizeof(batch)) {
+				m->crc32c = spdk_crc32c_update(batch, n, m->crc32c);
+				n = 0;
+			}
+		}
+		if (n != 0) {
+			m->crc32c = spdk_crc32c_update(batch, n, m->crc32c);
+		}
 	}
 }
 
@@ -1080,6 +1343,7 @@ s3_export_manifest_serialize(struct s3_export_manifest *m, char **out, size_t *o
 	char *partials_b64 = NULL;
 	char *src_idx_b64 = NULL;
 	char *zeroes_b64 = NULL;
+	char *pack_b64 = NULL;
 	uint8_t *packed = NULL;
 	size_t packed_len = 0;
 	size_t nbytes;
@@ -1144,8 +1408,10 @@ s3_export_manifest_serialize(struct s3_export_manifest *m, char **out, size_t *o
 
 		if (m->base_uuid[0] != '\0') {
 			/* A delta stays a delta whatever its source table holds: the
-			 * version is what makes an older reader refuse it. */
-			m->version = S3_EXPORT_DELTA_VERSION;
+			 * version is what makes an older reader refuse it. A packed one
+			 * is version 6, which a version 5 reader refuses in turn. */
+			m->version = m->pack_loc ? S3_EXPORT_PACK_VERSION :
+				     S3_EXPORT_DELTA_VERSION;
 			if (!m->zeroes) {
 				/* set_base() always allocates it. */
 				rc = -EINVAL;
@@ -1158,8 +1424,42 @@ s3_export_manifest_serialize(struct s3_export_manifest *m, char **out, size_t *o
 			}
 		}
 
+		if (m->pack_loc) {
+			/* One little-endian u32 per present chunk, ascending: the
+			 * same packing the ref table uses. Sealed below. */
+			uint64_t i, at = 0;
+			uint64_t present = 0;
+
+			if (m->base_uuid[0] == '\0') {
+				/* Packs exist only on top of a delta. */
+				rc = -EINVAL;
+				goto err;
+			}
+			for (i = 0; i < m->num_chunks; i++) {
+				present += bitmap_test(m->present, i) ? 1 : 0;
+			}
+			packed = malloc(present ? present * 4 : 1);
+			if (!packed) {
+				rc = -ENOMEM;
+				goto err;
+			}
+			for (i = 0; i < m->num_chunks; i++) {
+				if (bitmap_test(m->present, i)) {
+					pack_u32(packed + at, m->pack_loc[i]);
+					at += 4;
+				}
+			}
+			pack_b64 = encode_b64(packed, at);
+			free(packed);
+			packed = NULL;
+			if (!pack_b64) {
+				rc = -ENOMEM;
+				goto err;
+			}
+		}
+
 		if (m->num_srcs > 1) {
-			if (m->version != S3_EXPORT_DELTA_VERSION) {
+			if (m->version < S3_EXPORT_DELTA_VERSION) {
 				m->version = 3;
 			}
 
@@ -1254,10 +1554,16 @@ s3_export_manifest_serialize(struct s3_export_manifest *m, char **out, size_t *o
 			spdk_json_write_named_string(w, "base", m->base_uuid);
 			spdk_json_write_named_string(w, "zeroes", zeroes_b64);
 		}
+		if (pack_b64) {
+			spdk_json_write_named_uint32(w, "pack_chunks", m->pack_chunks);
+			spdk_json_write_named_uint32(w, "pack_count", m->pack_count);
+			spdk_json_write_named_string(w, "pack_loc", pack_b64);
+		}
 	}
 	spdk_json_write_object_end(w);
 
 	rc = spdk_json_write_end(w);
+	free(pack_b64);
 	free(zeroes_b64);
 	free(src_idx_b64);
 	free(partials_b64);
@@ -1274,6 +1580,7 @@ s3_export_manifest_serialize(struct s3_export_manifest *m, char **out, size_t *o
 	*out_len = buf.len;
 	return 0;
 err:
+	free(pack_b64);
 	free(zeroes_b64);
 	free(src_idx_b64);
 	free(partials_b64);
@@ -1367,6 +1674,9 @@ struct manifest_json {
 	char             *src_idx;
 	char             *base;
 	char             *zeroes;
+	uint32_t          pack_chunks;
+	uint32_t          pack_count;
+	char             *pack_loc;
 };
 
 static int
@@ -1414,6 +1724,10 @@ static const struct spdk_json_object_decoder manifest_decoders[] = {
 	 * only, on a version 5 manifest. */
 	{"base",   offsetof(struct manifest_json, base),   spdk_json_decode_string, true},
 	{"zeroes", offsetof(struct manifest_json, zeroes), spdk_json_decode_string, true},
+	/* Version 6. Required together, and only, on a version 6 manifest. */
+	{"pack_chunks", offsetof(struct manifest_json, pack_chunks), spdk_json_decode_uint32, true},
+	{"pack_count",  offsetof(struct manifest_json, pack_count),  spdk_json_decode_uint32, true},
+	{"pack_loc",    offsetof(struct manifest_json, pack_loc),    spdk_json_decode_string, true},
 };
 
 static void
@@ -1428,6 +1742,7 @@ free_manifest_json(struct manifest_json *j)
 	free(j->src_idx);
 	free(j->base);
 	free(j->zeroes);
+	free(j->pack_loc);
 	free(j->src.endpoint);
 	free(j->src.region);
 	free(j->src.bucket);
@@ -1761,10 +2076,21 @@ s3_export_manifest_parse(const void *json, size_t len, struct s3_export_manifest
 	 * future zero-copy layout would name the source's own chunk objects, and
 	 * reading it as if it were dense would produce an lvol full of the wrong
 	 * data rather than an error. */
-	if (j.version < S3_EXPORT_VERSION_MIN || j.version > S3_EXPORT_DELTA_VERSION) {
+	if (j.version < S3_EXPORT_VERSION_MIN || j.version > S3_EXPORT_VERSION_MAX) {
 		SPDK_ERRLOG("export manifest version %u is not supported (want %u..%u)\n",
-			    j.version, S3_EXPORT_VERSION_MIN, S3_EXPORT_DELTA_VERSION);
+			    j.version, S3_EXPORT_VERSION_MIN, S3_EXPORT_VERSION_MAX);
 		rc = -ENOTSUP;
+		goto out;
+	}
+	/* The pack table is all or nothing, and only on version 6. */
+	if ((j.version == S3_EXPORT_PACK_VERSION) !=
+	    (j.pack_loc != NULL && j.pack_chunks != 0 && j.pack_count != 0) ||
+	    (j.version != S3_EXPORT_PACK_VERSION &&
+	     (j.pack_loc || j.pack_chunks || j.pack_count)) ||
+	    j.pack_chunks > 255) {
+		SPDK_ERRLOG("export manifest version %u %s a pack table\n", j.version,
+			    j.pack_loc ? "carries a malformed or unexpected" : "lacks");
+		rc = -EINVAL;
 		goto out;
 	}
 	rc = layout_from_str(j.layout, &layout);
@@ -1779,15 +2105,15 @@ s3_export_manifest_parse(const void *json, size_t len, struct s3_export_manifest
 	/* A delta must say what it is a delta over, and nothing else may: a base
 	 * on a non-delta manifest means a writer that disagrees with the version
 	 * about how absent chunks read. */
-	if ((j.version == S3_EXPORT_DELTA_VERSION) !=
+	if ((j.version >= S3_EXPORT_DELTA_VERSION) !=
 	    (j.base != NULL && j.zeroes != NULL) ||
-	    (j.version != S3_EXPORT_DELTA_VERSION && (j.base || j.zeroes))) {
+	    (j.version < S3_EXPORT_DELTA_VERSION && (j.base || j.zeroes))) {
 		SPDK_ERRLOG("export manifest version %u %s a template base\n", j.version,
 			    j.base ? "carries" : "lacks");
 		rc = -EINVAL;
 		goto out;
 	}
-	if (j.version == S3_EXPORT_DELTA_VERSION) {
+	if (j.version >= S3_EXPORT_DELTA_VERSION) {
 		struct spdk_uuid parsed;
 
 		if (layout != S3_EXPORT_LAYOUT_REF || spdk_uuid_parse(&parsed, j.base) != 0) {
@@ -1890,7 +2216,7 @@ s3_export_manifest_parse(const void *json, size_t len, struct s3_export_manifest
 			goto out;
 		}
 
-		if (j.version == S3_EXPORT_DELTA_VERSION) {
+		if (j.version >= S3_EXPORT_DELTA_VERSION) {
 			uint64_t i;
 
 			rc = decode_b64_exact(j.zeroes, &m->zeroes, nbytes, "zero bitmap");
@@ -1914,6 +2240,56 @@ s3_export_manifest_parse(const void *json, size_t len, struct s3_export_manifest
 				}
 			}
 			copy_field(m->base_uuid, sizeof(m->base_uuid), j.base);
+		}
+
+		if (j.version == S3_EXPORT_PACK_VERSION) {
+			uint8_t *locs = NULL;
+			uint64_t i, at = 0, seen = 0;
+
+			rc = decode_b64_exact(j.pack_loc, &locs,
+					      (size_t)m->present_chunks * 4, "pack table");
+			if (rc != 0) {
+				goto out;
+			}
+			m->pack_loc = calloc(m->num_chunks ? m->num_chunks : 1,
+					     sizeof(*m->pack_loc));
+			if (!m->pack_loc) {
+				free(locs);
+				rc = -ENOMEM;
+				goto out;
+			}
+			m->pack_chunks = j.pack_chunks;
+			m->pack_count = j.pack_count;
+			for (i = 0; i < m->num_chunks; i++) {
+				uint32_t loc, pack, slot;
+
+				if (!bitmap_test(m->present, i)) {
+					m->pack_loc[i] = S3_EXPORT_PACK_LOC_NONE;
+					continue;
+				}
+				loc = unpack_u32(locs + at);
+				at += 4;
+				pack = loc >> 8;
+				slot = loc & 0xffu;
+				/* Every present chunk must sit in a pack that exists, in a
+				 * slot that exists. Anything else would read another
+				 * object's bytes or past a pack's end. */
+				if (pack >= m->pack_count || slot >= m->pack_chunks) {
+					SPDK_ERRLOG("export manifest chunk %" PRIu64 " names pack "
+						    "%u slot %u of %u x %u\n", i, pack, slot,
+						    m->pack_count, m->pack_chunks);
+					free(locs);
+					rc = -EINVAL;
+					goto out;
+				}
+				m->pack_loc[i] = loc;
+				seen++;
+			}
+			free(locs);
+			if (seen > (uint64_t)m->pack_count * m->pack_chunks) {
+				rc = -EINVAL;
+				goto out;
+			}
 		}
 	}
 

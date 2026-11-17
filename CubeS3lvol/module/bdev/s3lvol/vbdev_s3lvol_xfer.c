@@ -2096,6 +2096,21 @@ export_ref(struct export_ctx *ctx)
 		opts.base_uuid = base_uuid;
 		SPDK_NOTICELOG("Export %s: template delta over base %s\n",
 			       ctx->info.export_uuid, base_uuid);
+		/* S3LVOL_EXPORT_PACKS: copy the delta's own chunks into packs. The
+		 * engine reads them back through blobstore on this thread; the
+		 * channel is freed by export_report(). Without a channel the delta
+		 * simply publishes unpacked. */
+		if (s3_export_packs_enabled()) {
+			if (!ctx->channel) {
+				ctx->channel = spdk_bs_alloc_io_channel(store->blobstore);
+			}
+			if (ctx->channel) {
+				opts.pack_blob = ctx->snapshot->blob;
+				opts.pack_channel = ctx->channel;
+				opts.pack_chunks = s3_export_pack_chunks_from_env(
+					(uint32_t)spdk_bs_get_cluster_size(store->blobstore));
+			}
+		}
 	}
 	opts.bs_dev = s3lvol_lvstore_get_bs_dev(ctx->lvs);
 	opts.chain = chain;
@@ -2362,7 +2377,10 @@ export_copy(struct export_ctx *ctx)
 		return;
 	}
 
-	ctx->channel = spdk_bs_alloc_io_channel(store->blobstore);
+	/* export_ref() may have allocated one for packing before declining. */
+	if (!ctx->channel) {
+		ctx->channel = spdk_bs_alloc_io_channel(store->blobstore);
+	}
 	if (!ctx->channel) {
 		export_report(ctx, -ENOMEM);
 		return;
@@ -6734,7 +6752,10 @@ static void release_finished(void *arg, const struct ea_doc *doc, int status)
 	int rc;
 	if (status) { release_done(r, status); return; }
 	exp = s3lvol_export_find(r->work.lvs, r->uuid);
-	if (exp) s3lvol_export_forget(exp);
+	if (exp) {
+		s3lvol_export_gc_packs(exp);
+		s3lvol_export_forget(exp);
+	}
 	rc = s3lvol_export_registry_save(r->work.lvs, release_done, r);
 	if (rc) release_done(r, rc);
 }
@@ -6884,6 +6905,8 @@ _Static_assert(S3_EXPORT_ADMISSION_VERSION == EXPORT_RECONCILE_V_ADMISSION,
 	       "reconcile admission version");
 _Static_assert(S3_EXPORT_DELTA_VERSION == EXPORT_RECONCILE_V_DELTA,
 	       "reconcile delta version");
+_Static_assert(S3_EXPORT_PACK_VERSION == EXPORT_RECONCILE_V_PACK,
+	       "reconcile pack version");
 struct reconcile_ctx {
 	struct admission_work work;
 	struct s3lvol_export *exp;

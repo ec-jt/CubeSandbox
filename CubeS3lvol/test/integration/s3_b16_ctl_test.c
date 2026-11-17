@@ -458,6 +458,14 @@ test_reconcile_route(void)
 	f = mf(2, true, false, 0);
 	check("v2 ref: refused", export_reconcile_ctl_route(&f) == -ENOTSUP);
 	f = mf(6, true, true, 0);
+	check("v6 packed delta over the local base: manifest route",
+	      export_reconcile_ctl_route(&f) == EXPORT_RECONCILE_REF);
+	f = mf(6, true, true, -EXDEV);
+	check("v6 packed delta over another base: refused -EXDEV",
+	      export_reconcile_ctl_route(&f) == -EXDEV);
+	f = mf(6, true, false, 0);
+	check("v6 without a base: malformed", export_reconcile_ctl_route(&f) == -EINVAL);
+	f = mf(7, true, true, 0);
 	check("unknown future version: refused", export_reconcile_ctl_route(&f) == -ENOTSUP);
 }
 

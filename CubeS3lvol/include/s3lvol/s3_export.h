@@ -80,6 +80,29 @@
  * of the base and overlays this manifest on it. */
 #define S3_EXPORT_DELTA_VERSION 5
 
+/* Version 6: a packed template delta. Everything version 5 says, plus a pack
+ * table: the delta's own chunks were copied into a few large pack objects
+ * (S3LVOL_EXPORT_PACKS) and every present chunk is read as a byte range of one
+ * of them, not from the live object its ref names.
+ *
+ * A version 5 reader refuses it on the version alone, and must: it would read
+ * the refs, whose live objects the source is free to supersede once the packs
+ * hold the bytes. Only the delta import consumes it. */
+#define S3_EXPORT_PACK_VERSION 6
+
+/* The newest version this build reads. */
+#define S3_EXPORT_VERSION_MAX   S3_EXPORT_PACK_VERSION
+
+/* Pack geometry. A pack holds up to pack_chunks chunk slots of chunk_size bytes
+ * each, in ascending chunk order. Deltas with fewer present chunks than
+ * S3_EXPORT_PACK_MIN_CHUNKS stay plain version 5: packing them saves nothing. */
+#define S3_EXPORT_PACK_MIB_DEFAULT 16
+#define S3_EXPORT_PACK_MIB_MIN     4
+#define S3_EXPORT_PACK_MIB_MAX     64
+#define S3_EXPORT_PACK_MIN_CHUNKS  8
+/* No pack location: the chunk is not in a pack. Never valid in version 6. */
+#define S3_EXPORT_PACK_LOC_NONE    UINT32_MAX
+
 /* The oldest a reader accepts. Writing is always at S3_EXPORT_VERSION; reading
  * has to span the range, because manifests already in a bucket outlive the binary
  * that wrote them -- including ones this binary wrote before being upgraded.
@@ -323,6 +346,15 @@ struct s3_export_manifest {
 	 * zeroed chunk would read the base's bytes on the importing node. */
 	uint8_t *zeroes;
 
+	/* Version 6 only. pack_chunks slots per pack, pack_count packs, and for
+	 * every chunk (meaningful where present) its location (pack << 8) | slot.
+	 * pack_loc is NULL for every other version. The pack keys are derived
+	 * from src.prefix, the export uuid and the pack number, so nothing else
+	 * has to travel. */
+	uint32_t  pack_chunks;
+	uint32_t  pack_count;
+	uint32_t *pack_loc;
+
 	/* Over the bitmap, and for a ref manifest over the full bitmap, the packed
 	 * uuids and the partial-length exceptions too, in that order -- and, from
 	 * version 3, src_idx after those. The stage list follows `version` rather
@@ -554,6 +586,54 @@ bool s3_export_manifest_range_is_zeroes(const struct s3_export_manifest *m,
  * serializing an unsealed manifest would record a checksum of stale data.
  */
 void s3_export_manifest_seal(struct s3_export_manifest *m);
+
+/* ==========================================================================
+ * Packs (version 6)
+ * ========================================================================== */
+
+/** True when \p m is a packed delta (version 6 with a pack table). */
+bool s3_export_manifest_is_packed(const struct s3_export_manifest *m);
+
+/** Key of pack \p n of export \p uuid_str under \p prefix. */
+void s3_export_pack_key(const char *prefix, const char *uuid_str, uint32_t n,
+			char *out, size_t out_len);
+
+/**
+ * Turn a sealed delta manifest into a packed one: allocate the location table
+ * and assign every present chunk, in ascending order, to slot (i % pack_chunks)
+ * of pack (i / pack_chunks). Sets version 6.
+ *
+ * \return 0; -EINVAL for a non-delta manifest or pack_chunks outside 1..255;
+ * -ENOMEM.
+ */
+int s3_export_manifest_set_packs(struct s3_export_manifest *m, uint32_t pack_chunks);
+
+/**
+ * Where a present chunk of a packed manifest lives: the pack key, the byte
+ * offset of its slot and how many bytes of it are valid. Fail closed:
+ * -ENOENT for a hole, -EINVAL when the manifest has no location for it.
+ */
+int s3_export_manifest_pack_range(const struct s3_export_manifest *m,
+				  uint64_t chunk_index, char *key, size_t key_len,
+				  uint64_t *offset, uint32_t *len);
+
+/** Undo set_packs(): back to a plain version 5 delta. */
+void s3_export_manifest_clear_packs(struct s3_export_manifest *m);
+
+/**
+ * Delete packs 0..count-1 of export \p uuid_str under \p prefix (pack GC).
+ * A 404 counts as deleted. \p cb gets the first error, or 0. Deletes are issued
+ * one after another so a node with many exports does not burst.
+ */
+int s3_export_packs_delete(struct s3_client *client, const char *prefix,
+			   const char *uuid_str, uint32_t count,
+			   void (*cb)(void *cb_arg, int status), void *cb_arg);
+
+/** Chunks per pack from S3LVOL_EXPORT_PACK_MIB for \p chunk_size; clamped. */
+uint32_t s3_export_pack_chunks_from_env(uint32_t chunk_size);
+
+/** Whether S3LVOL_EXPORT_PACKS is on. Read once. */
+bool s3_export_packs_enabled(void);
 
 /* ==========================================================================
  * Manifest serialization
@@ -790,6 +870,16 @@ struct s3_export_ref_opts {
 	 * the walk settled as zeroes are recorded explicitly. Mutually exclusive
 	 * with `parent`. */
 	const char *base_uuid;
+
+	/* Packs (version 6). When pack_chunks is non-zero, the result is a delta
+	 * and it has at least S3_EXPORT_PACK_MIN_CHUNKS present chunks, every
+	 * present chunk is read from pack_blob (the exported snapshot) through
+	 * pack_channel, copied into pack objects, and the manifest is published as
+	 * version 6 only once every pack is durable. Otherwise ignored. The
+	 * channel must belong to the calling thread and outlive the run. */
+	struct spdk_blob       *pack_blob;
+	struct spdk_io_channel *pack_channel;
+	uint32_t                pack_chunks;
 };
 
 /**

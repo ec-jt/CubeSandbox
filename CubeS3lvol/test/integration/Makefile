@@ -75,7 +75,7 @@ APPS = s3_client_test s3_spawner_test s3_thread_bounce_test s3_bs_dev_test \
        s3_statefile_test s3_local_dev_test s3_checkpoint_test s3_export_swap_test s3_export_prefetch_test \
        s3_copy_xml_test s3_pending_persist_test s3_recovery_test \
        s3_put_etag_test s3_put_etag_request_test s3_b16_ctl_test s3_hedge_test \
-       s3_warm_select_test s3_export_chunk_retry_test
+       s3_warm_select_test s3_export_chunk_retry_test s3_export_pack_test
 
 # (a) minimal library set for the stubbed path
 STUB_SRCS      = spdk_thread_stub.c
@@ -335,6 +335,14 @@ s3_checkpoint_test: s3_checkpoint_test.c $(S3BSDEV_DIR)/libs3bsdev.a
 # B19 whole-chunk reads and prefetch of an imported export. Stubs the s3_client
 # entry points (like the checkpoint test) so GET shape, count and concurrency are
 # observable, and drives a real spdk_thread for the message bounces.
+s3_export_pack_test: s3_export_pack_test.c $(S3BSDEV_DIR)/libs3bsdev.a
+	$(CC) $(COMMON_CFLAGS) s3_export_pack_test.c \
+	    $(S3BSDEV_DIR)/libs3bsdev.a \
+	    $(AWS_LIBS) \
+	    -Wl,--start-group $(BLOB_SPDK_LIBS) -Wl,--end-group \
+	    $(BLOB_DPDK_ARGS) \
+	    $(SYS_LIBS) $(TEST_SYS_LIBS) -o $@
+
 s3_export_prefetch_test: s3_export_prefetch_test.c $(S3BSDEV_DIR)/libs3bsdev.a
 	$(CC) $(COMMON_CFLAGS) s3_export_prefetch_test.c \
 	    $(S3BSDEV_DIR)/libs3bsdev.a \
@@ -371,7 +379,7 @@ check: s3_spawner_test s3_thread_bounce_test s3_journal_test s3_wal_test s3_wal_
        s3_flush_test s3_export_test s3_statefile_test s3_local_dev_test \
        s3_checkpoint_test s3_export_swap_test s3_export_prefetch_test s3_copy_xml_test \
        s3_pending_persist_test s3_recovery_test s3_put_etag_test s3_put_etag_request_test \
-       s3_b16_ctl_test s3_hedge_test s3_warm_select_test s3_export_chunk_retry_test
+       s3_b16_ctl_test s3_hedge_test s3_warm_select_test s3_export_chunk_retry_test s3_export_pack_test
 	./s3_spawner_test
 	./s3_thread_bounce_test
 	./s3_journal_test
@@ -389,6 +397,7 @@ check: s3_spawner_test s3_thread_bounce_test s3_journal_test s3_wal_test s3_wal_
 	./s3_copy_xml_test
 	./s3_warm_select_test
 	./s3_export_chunk_retry_test
+	./s3_export_pack_test
 	./s3_put_etag_test
 	./s3_put_etag_request_test
 	./s3_pending_persist_test

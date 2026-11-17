@@ -138,6 +138,7 @@ struct export_slot {
 	bool                        prefetch_part;
 	uint64_t                    chunk_index;
 	char                        key[S3_EXPORT_KEY_MAX];
+	uint64_t                    offset;       /* where in the object (packs) */
 	uint32_t                    object_len;   /* bytes the GET asked for */
 	uint8_t                    *buf;          /* chunk_size bytes, kept for reuse */
 	uint32_t                    pins;         /* prefetcher references */
@@ -256,6 +257,9 @@ struct s3_export_chunk_io {
 	uint32_t             offset_in_chunk;
 	uint8_t             *dst;
 	uint32_t             object_len;
+	/* Byte offset of the chunk inside its object: 0, except for a chunk
+	 * read out of a pack (version 6), where it is the slot's offset. */
+	uint64_t             object_off;
 
 	/* Result carried back to the origin thread. */
 	int                  result_status;
@@ -328,6 +332,44 @@ export_chunk_key(const struct s3_export_manifest *m, uint64_t chunk_index,
 
 	s3_export_chunk_key(m->src.prefix, m->uuid_str, chunk_index,
 			    out, out_len);
+}
+
+/* The one place a chunk becomes (key, offset, length).
+	*
+	* A packed manifest (version 6) is always read from its pack, never from the
+	* refs: the live objects the refs name may already have been superseded on the
+	* source, which is the point of having packed them. Fail closed: a present
+	* chunk the pack table does not place is -EIO, never a fallback to the ref.
+	*
+	* Returns 0 with key[0] == '\0' when there is nothing to fetch. */
+static int
+export_chunk_locate(const struct s3_export_manifest *m, uint64_t chunk_index,
+		    char *key, size_t key_len, uint64_t *offset, uint32_t *len)
+{
+	const struct s3_export_ref *ref;
+
+	*offset = 0;
+	*len = m->chunk_size;
+	key[0] = '\0';
+	if (m->version == S3_EXPORT_PACK_VERSION) {
+		int rc = s3_export_manifest_pack_range(m, chunk_index, key, key_len,
+						       offset, len);
+
+		if (rc != 0) {
+			key[0] = '\0';
+			return rc == -ENOENT ? 0 : -EIO;
+		}
+		return 0;
+	}
+	if (m->layout == S3_EXPORT_LAYOUT_REF) {
+		ref = s3_export_manifest_get_ref(m, chunk_index);
+		if (!ref || s3_export_manifest_chunk_prefix(m, chunk_index)[0] == '\0') {
+			return -EIO;
+		}
+		*len = ref->valid_bytes;
+	}
+	export_chunk_key(m, chunk_index, key, key_len);
+	return 0;
 }
 
 /* ==========================================================================
@@ -670,7 +712,7 @@ export_slot_send(struct s3_export_dev *dev, struct export_slot *s)
 
 	dev->stats.whole_gets++;
 	dev->stats.get_bytes += s->object_len;
-	rc = s3_get_range_hedged(dev->client, s->key, 0, s->object_len, s->buf,
+	rc = s3_get_range_hedged(dev->client, s->key, s->offset, s->object_len, s->buf,
 				 &s->hedge, export_slot_fetch_done, s);
 	if (rc != 0) {
 		dev->stats.whole_gets--;
@@ -709,10 +751,11 @@ export_slot_start_fetch(struct s3_export_dev *dev, struct export_slot *s)
 
 static void
 export_slot_setup(struct export_slot *s, uint64_t chunk_index, const char *key,
-		  uint32_t object_len)
+		  uint64_t offset, uint32_t object_len)
 {
 	s->chunk_index = chunk_index;
 	snprintf(s->key, sizeof(s->key), "%s", key);
+	s->offset = offset;
 	s->object_len = object_len;
 }
 
@@ -757,7 +800,8 @@ export_fetch_on_home(void *arg)
 		TAILQ_INIT(&s->pf_waiters);
 		dev->stats.transient_fetches++;
 	}
-	export_slot_setup(s, cio->chunk_index, cio->key, cio->object_len);
+	export_slot_setup(s, cio->chunk_index, cio->key, cio->object_off,
+			  cio->object_len);
 	TAILQ_INSERT_TAIL(&s->waiters, cio, slot_link);
 	dev->stats.miss_fetches++;
 	rc = export_slot_start_fetch(dev, s);
@@ -974,12 +1018,15 @@ export_read_internal(struct spdk_bs_dev *bs_dev, struct spdk_io_channel *channel
 		cio->expected = get_len;
 		cio->offset_in_chunk = offset_in_chunk;
 		cio->dst = buf;
-		cio->object_len = chunk_size;
-		if (io->m->layout == S3_EXPORT_LAYOUT_REF) {
-			cio->object_len = s3_export_manifest_get_ref(io->m,
-					  chunk_index)->valid_bytes;
+		if (export_chunk_locate(io->m, chunk_index, cio->key, sizeof(cio->key),
+					&cio->object_off, &cio->object_len) != 0 ||
+		    cio->key[0] == '\0') {
+			SPDK_ERRLOG("export %s: chunk %" PRIu64 " is present but has no "
+				    "readable location\n", io->m->uuid_str, chunk_index);
+			free(cio);
+			io->status = -EIO;
+			break;
 		}
-		export_chunk_key(io->m, chunk_index, cio->key, sizeof(cio->key));
 
 		/* Never a ranged GET sized to the guest I/O: the whole object is
 		 * fetched once into the slot table and this read copies its part. */
@@ -1972,6 +2019,7 @@ pf_launch_one(struct s3_export_prefetcher *p, uint64_t i)
 	uint64_t chunk_index = p->chunks[i];
 	char key[S3_EXPORT_KEY_MAX];
 	uint32_t object_len = m->chunk_size;
+	uint64_t object_off = 0;
 	struct export_slot *s;
 	struct export_pf_wait *w;
 	int rc;
@@ -1981,15 +2029,11 @@ pf_launch_one(struct s3_export_prefetcher *p, uint64_t i)
 		p->pin_slot[i] = NULL;
 		return 0;
 	}
-	if (m->layout == S3_EXPORT_LAYOUT_REF) {
-		const struct s3_export_ref *ref = s3_export_manifest_get_ref(m, chunk_index);
-
-		if (!ref || s3_export_manifest_chunk_prefix(m, chunk_index)[0] == '\0') {
-			return -EIO;
-		}
-		object_len = ref->valid_bytes;
+	rc = export_chunk_locate(m, chunk_index, key, sizeof(key), &object_off,
+				 &object_len);
+	if (rc != 0) {
+		return rc;
 	}
-	export_chunk_key(m, chunk_index, key, sizeof(key));
 	if (key[0] == '\0' || object_len == 0) {
 		p->pin_slot[i] = NULL;
 		return 0;
@@ -2049,7 +2093,7 @@ pf_launch_one(struct s3_export_prefetcher *p, uint64_t i)
 	w->p = p;
 	w->chunk_index = chunk_index;
 	w->launcher = true;
-	export_slot_setup(s, chunk_index, key, object_len);
+	export_slot_setup(s, chunk_index, key, object_off, object_len);
 	s->pins = 1;
 	TAILQ_INSERT_TAIL(&s->pf_waiters, w, link);
 	p->pin_slot[i] = s;

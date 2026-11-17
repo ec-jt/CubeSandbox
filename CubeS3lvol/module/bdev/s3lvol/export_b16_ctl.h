@@ -217,6 +217,7 @@ enum export_reconcile_route {
 #define EXPORT_RECONCILE_V_REF       3u
 #define EXPORT_RECONCILE_V_ADMISSION 4u
 #define EXPORT_RECONCILE_V_DELTA     5u
+#define EXPORT_RECONCILE_V_PACK      6u
 
 /* >0 an export_reconcile_route; <0 refuse with that error. Only a first
  * publication (generation 0) is reconcilable: rewritten history is not. */
@@ -236,7 +237,8 @@ export_reconcile_ctl_route(const struct export_reconcile_manifest_facts *f)
 	if (f->version == EXPORT_RECONCILE_V_REF) {
 		return f->has_base ? -EINVAL : EXPORT_RECONCILE_REF;
 	}
-	if (f->version == EXPORT_RECONCILE_V_DELTA) {
+	if (f->version == EXPORT_RECONCILE_V_DELTA ||
+	    f->version == EXPORT_RECONCILE_V_PACK) {
 		if (!f->has_base) {
 			return -EINVAL;
 		}
