@@ -1227,6 +1227,21 @@ s3_crt_global_fini(void)
  * Client lifecycle: endpoint-based pooling with refcounting 
  * ========================================================================== */
 
+struct s3_client_new_ctx {
+	struct aws_allocator                 *allocator;
+	const struct aws_s3_client_config    *config;
+	struct aws_s3_client                 *out;
+};
+
+static void *
+s3_client_new_on_spawner(void *arg)
+{
+	struct s3_client_new_ctx *ctx = arg;
+
+	ctx->out = aws_s3_client_new(ctx->allocator, ctx->config);
+	return ctx;
+}
+
 int
 s3_client_get_or_create(const struct s3_target *target, struct s3_client **out)
 {
@@ -1476,7 +1491,26 @@ s3_client_get_or_create(const struct s3_target *target, struct s3_client **out)
 	client_config.shutdown_callback = s3_client_shutdown_complete;
 	client_config.shutdown_callback_user_data = client;
 
-	client->aws_client = aws_s3_client_new(client->app_ctx->allocator, &client_config);
+	/* aws_s3_client_new() starts threads of its own (the body-streaming
+	 * event loop group, and host resolver threads through the bootstrap).
+	 * This runs on a reactor, so they would inherit its single-core pin and
+	 * share that core with a busy-polling reactor (seen live: a second set
+	 * of AwsEventLoop threads on core 0). Create it on the spawner, like the
+	 * global event loop group. */
+	if (s3_spawner_is_started()) {
+		struct s3_client_new_ctx nctx = {
+			.allocator = client->app_ctx->allocator,
+			.config    = &client_config,
+		};
+
+		if (s3_spawner_run_task(s3_client_new_on_spawner, &nctx) == NULL) {
+			SPDK_ERRLOG("Failed to dispatch S3 client creation to the spawner\n");
+		}
+		client->aws_client = nctx.out;
+	} else {
+		client->aws_client = aws_s3_client_new(client->app_ctx->allocator,
+						       &client_config);
+	}
 	if (!client->aws_client) {
 		SPDK_ERRLOG("Failed to create aws_s3_client for endpoint %s\n",
 			    target->endpoint);
