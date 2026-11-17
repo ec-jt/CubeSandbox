@@ -73,10 +73,10 @@ const (
 	TemplateBaseReplicaFailed = "FAILED"
 
 	// Annotations Cubelet reads (must match Cubelet storage).
-	templateBaseOpAnnotation           = "cube.master.template.base.op"
-	templateBaseTemplateAnnotation     = "cube.master.template.base.template_id"
-	templateBaseRoleAnnotation         = "cube.master.template.base.role"
-	templateBaseUUIDAnnotation         = "cube.master.template.base.uuid"
+	templateBaseOpAnnotation             = "cube.master.template.base.op"
+	templateBaseTemplateAnnotation       = "cube.master.template.base.template_id"
+	templateBaseRoleAnnotation           = "cube.master.template.base.role"
+	templateBaseUUIDAnnotation           = "cube.master.template.base.uuid"
 	TemplateBaseRootfsCreateAnnotation   = "cube.master.template.base.rootfs"
 	TemplateBaseMemoryCreateAnnotation   = "cube.master.template.base.memory"
 	TemplateBaseMetadataCreateAnnotation = "cube.master.template.base.metadata"
