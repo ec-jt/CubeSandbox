@@ -11,9 +11,11 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"golang.org/x/sys/unix"
@@ -79,7 +81,9 @@ var (
 
 	s3MetadataMu     sync.Mutex
 	s3MetadataMounts = map[string]string{} // snapshotID → current mount path
-	testS3MetadataKV s3MetadataKV
+	// Mount paths with a mount running outside s3MetadataMu (guarded by it).
+	s3MetadataMountsInFlight = map[string]bool{}
+	testS3MetadataKV         s3MetadataKV
 )
 
 // S3MetadataVolumeName is the writable cubecow volume for one template /
@@ -773,9 +777,23 @@ func mountS3MetadataLockedTimeout(snapshotID, devicePath, mountPath string,
 	if attempts < 1 {
 		attempts = 1
 	}
+	// The mount itself runs without s3MetadataMu. A mount over an NVMe/TCP
+	// namespace whose I/O never completes sits in the kernel (D state) for as
+	// long as the device stays stuck, and holding the package-wide lock
+	// across it stalled every other Create on the node behind one bad volume
+	// (app1, 2026-11-17: one mount, 60 minutes, every Create 408). The path
+	// is claimed first so two callers never mount the same directory at once.
+	cleanPath := filepath.Clean(mountPath)
+	if s3MetadataMountsInFlight[cleanPath] {
+		return fmt.Errorf("s3 metadata mount at %s is already in progress", mountPath)
+	}
+	s3MetadataMountsInFlight[cleanPath] = true
+	defer delete(s3MetadataMountsInFlight, cleanPath)
 	var lastErr error
 	for attempt := 1; attempt <= attempts; attempt++ {
+		s3MetadataMu.Unlock()
 		lastErr = mountS3MetadataDeviceTimeout(devicePath, mountPath, timeout)
+		s3MetadataMu.Lock()
 		if lastErr == nil {
 			s3MetadataMounts[snapshotID] = filepath.Clean(mountPath)
 			return nil
@@ -794,7 +812,14 @@ func mountS3MetadataLockedTimeout(snapshotID, devicePath, mountPath string,
 				return nil
 			}
 		}
+		if errors.Is(lastErr, errS3MetadataMountStuck) {
+			// The previous mount is still in the kernel; another one on
+			// the same device would only queue behind it.
+			break
+		}
+		s3MetadataMu.Unlock()
 		metadataMountRetrySleep(time.Duration(attempt) * metadataMountRetryBackoff)
+		s3MetadataMu.Lock()
 	}
 	return fmt.Errorf("after %d attempt(s): %w", attempts, lastErr)
 }
@@ -967,16 +992,68 @@ func mountS3MetadataDeviceImpl(devicePath, mountPath string) error {
 	return mountS3MetadataDeviceTimeoutImpl(devicePath, mountPath, metadataMountTimeout)
 }
 
+// errS3MetadataMountStuck: the mount process outlived its timeout and could
+// not be reaped, i.e. it is blocked in the kernel on device I/O.
+var errS3MetadataMountStuck = errors.New("mount process is stuck in the kernel")
+
+// s3MetadataMountArgv builds the mount command; a variable so tests can run
+// something else through the same timeout handling.
+var s3MetadataMountArgv = func(devicePath, mountPath string) []string {
+	return []string{"mount", devicePath, mountPath}
+}
+
+// s3MetadataMountReapGrace is how long a killed mount gets to exit before it
+// is treated as stuck.
+var s3MetadataMountReapGrace = 2 * time.Second
+
 func mountS3MetadataDeviceTimeoutImpl(devicePath, mountPath string, timeout time.Duration) error {
 	devicePath = strings.TrimSpace(devicePath)
 	if devicePath == "" {
 		return errS3EmptyDevicePath("metadata", "ActivateVolume")
 	}
-	if _, stderr, err := utils.ExecV([]string{"mount", devicePath, mountPath}, timeout); err != nil {
-		return fmt.Errorf("mount s3 metadata %s at %s failed (timeout %s): %v: %s",
-			devicePath, mountPath, timeout, err, stderr)
+	return runS3MetadataMount(s3MetadataMountArgv(devicePath, mountPath), devicePath, mountPath, timeout)
+}
+
+// runS3MetadataMount runs a mount and returns within timeout plus a short
+// grace period no matter what the process does. utils.ExecV cannot do that:
+// exec.CommandContext kills on timeout but Wait still waits for the exit, and
+// a mount blocked in the kernel on a stuck namespace (D state) ignores
+// SIGKILL until its I/O completes -- one such mount ran for an hour. Here a
+// process that has not exited by the grace deadline is left to be reaped in
+// the background and the caller gets errS3MetadataMountStuck.
+func runS3MetadataMount(argv []string, devicePath, mountPath string, timeout time.Duration) error {
+	var stderr strings.Builder
+	cmd := exec.Command(argv[0], argv[1:]...)
+	cmd.Stderr = &stderr
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("mount s3 metadata %s at %s: %w", devicePath, mountPath, err)
 	}
-	return nil
+	done := make(chan error, 1)
+	go func() { done <- cmd.Wait() }()
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case err := <-done:
+		if err != nil {
+			return fmt.Errorf("mount s3 metadata %s at %s failed: %v: %s",
+				devicePath, mountPath, err, stderr.String())
+		}
+		return nil
+	case <-timer.C:
+	}
+	_ = cmd.Process.Kill()
+	select {
+	case <-done:
+		return fmt.Errorf("mount s3 metadata %s at %s failed: timed out after %s",
+			devicePath, mountPath, timeout)
+	case <-time.After(s3MetadataMountReapGrace):
+		CubeLog.Errorf("mount s3 metadata %s at %s: pid %d did not exit %s after SIGKILL; "+
+			"the device is not completing I/O. Leaving it to be reaped in the background",
+			devicePath, mountPath, cmd.Process.Pid, s3MetadataMountReapGrace)
+		return fmt.Errorf("mount s3 metadata %s at %s (timeout %s): %w",
+			devicePath, mountPath, timeout, errS3MetadataMountStuck)
+	}
 }
 
 func unmountS3MetadataPathImpl(mountPath string) error {
