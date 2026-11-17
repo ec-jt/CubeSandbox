@@ -106,6 +106,37 @@ func (m *S3Cow) Upload(ctx context.Context, snapshotID string) (*cow.RemoteUUIDs
 	return uuids, nil
 }
 
+// recordRemoteRole fills one role of uuids from the object's live export, and
+// the template base that export is a delta over.
+//
+// The async export worker (B15) submits through uploadOne, not Upload, so
+// UploadStatus is the only place the bases of its exports are learnt. Live
+// 2026-11-17: pauses of sandboxes cloned from bases published export_uuids
+// without rootfs_base/memory_base, which hides the reference from Master's
+// base GC and leaves an importer unable to install a missing base.
+func recordRemoteRole(ctx context.Context, u *cow.RemoteUUIDs, role, name, uuid string) {
+	if u == nil || uuid == "" {
+		return
+	}
+	var id, base *string
+	switch role {
+	case "rootfs":
+		id, base = &u.Rootfs, &u.RootfsBase
+	case "memory":
+		id, base = &u.Memory, &u.MemoryBase
+	case "metadata":
+		id, base = &u.Metadata, &u.MetadataBase
+	default:
+		return
+	}
+	if *id == "" {
+		*id = uuid
+	}
+	if *id == uuid && *base == "" {
+		*base = exportedBaseOf(ctx, name)
+	}
+}
+
 // exportedBaseOf names the template base a just-exported snapshot was
 // published as a delta over. s3lvol stops at a base only with
 // S3LVOL_EXPORT_TEMPLATE_DELTA on, and templateBaseBelow answers "" otherwise,
@@ -271,20 +302,7 @@ func (m *S3Cow) UploadStatus(ctx context.Context, snapshotID string) (*cow.Remot
 			if st.RemoteUUIDs == nil {
 				st.RemoteUUIDs = &cow.RemoteUUIDs{}
 			}
-			switch ref.Role {
-			case "rootfs":
-				if st.RemoteUUIDs.Rootfs == "" {
-					st.RemoteUUIDs.Rootfs = uuid
-				}
-			case "memory":
-				if st.RemoteUUIDs.Memory == "" {
-					st.RemoteUUIDs.Memory = uuid
-				}
-			case "metadata":
-				if st.RemoteUUIDs.Metadata == "" {
-					st.RemoteUUIDs.Metadata = uuid
-				}
-			}
+			recordRemoteRole(ctx, st.RemoteUUIDs, ref.Role, ref.Name, uuid)
 		}
 		switch {
 		case status == cow.ExportStatusDone:

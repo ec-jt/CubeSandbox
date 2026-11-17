@@ -463,6 +463,34 @@ func TestInstallTemplateBaseMetadataRole(t *testing.T) {
 	require.True(t, isInstalledBaseName(want))
 }
 
+// The async export worker reports export uuids only through UploadStatus; the
+// bases its delta exports stand on must be recorded there too (live
+// 2026-11-17: pause rows of base-cloned sandboxes had no rootfs_base).
+func TestRecordRemoteRoleRecordsTheBase(t *testing.T) {
+	f := useFakeS3lvol(t)
+	f.delta = true
+	f.below["tpl-snap-1-rootfs"] = testBase
+	f.below["tpl-snap-1-memory-snap"] = testMemBase
+	ctx := context.Background()
+	u := &cow.RemoteUUIDs{}
+	recordRemoteRole(ctx, u, "rootfs", "tpl-snap-1-rootfs", "r1")
+	recordRemoteRole(ctx, u, "memory", "tpl-snap-1-memory-snap", "m1")
+	recordRemoteRole(ctx, u, "metadata", "s3-meta-snap-1-snap", "d1")
+	require.Equal(t, cow.RemoteUUIDs{Rootfs: "r1", RootfsBase: testBase, Memory: "m1", MemoryBase: testMemBase, Metadata: "d1"}, *u)
+
+	// A different uuid for a role already recorded never overwrites it or
+	// borrows its base.
+	recordRemoteRole(ctx, u, "rootfs", "tpl-snap-2-rootfs", "r2")
+	require.Equal(t, "r1", u.Rootfs)
+	require.Equal(t, testBase, u.RootfsBase)
+
+	// Writer off: no base recorded.
+	f.delta = false
+	u2 := &cow.RemoteUUIDs{}
+	recordRemoteRole(ctx, u2, "rootfs", "tpl-snap-1-rootfs", "r1")
+	require.Empty(t, u2.RootfsBase)
+}
+
 // A delta metadata export names its base, and the importer installs it first.
 func TestRemoteUUIDsCarryMetadataBase(t *testing.T) {
 	u := cow.ParseRemoteUUIDs(`{"rootfs":"r","metadata":"x","metadata_base":"b3"}`)
