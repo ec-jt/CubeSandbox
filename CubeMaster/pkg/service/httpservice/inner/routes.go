@@ -15,6 +15,7 @@ func RegisterInnerRoutes(g *gin.RouterGroup) {
 	g.GET(NodeAction, nodeGinHandler)
 	g.GET(PausedEvictionAction, pausedEvictionGinHandler)
 	g.POST(PublicationReconcileAction, publicationReconcileGinHandler)
+	g.GET(RestoreProgressAction, restoreProgressGinHandler)
 	g.Any(StateWs, websocketGinHandler)
 	g.Any(StateQuery, queryGinHandler)
 	g.POST(FakeCreateAction, fakeCreateGinHandler)

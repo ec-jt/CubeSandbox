@@ -8,6 +8,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/service/sandbox/restoreprogress"
 	"strconv"
 	"strings"
 	"time"
@@ -419,6 +420,8 @@ func resumeFromPauseSnapshot(ctx context.Context, req *types.UpdateRequest, host
 
 	calleeEndpoint := cubelet.GetCubeletAddr(targetIP)
 	if placement != nil && placement.CrossNode {
+		// GET /internal/sandbox/{id}/restore-progress asks this node first.
+		restoreprogress.Record(req.SandboxID, targetIP)
 		log.G(ctx).Infof("resume-from-pause: cross-node sandbox=%s snap=%s origin=%s target=%s",
 			req.SandboxID, snapID, rec.NodeIP, targetIP)
 	} else {
