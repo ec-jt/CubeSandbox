@@ -424,6 +424,44 @@ static uint32_t g_connect_timeout_ms = S3_DEFAULT_CONNECT_TIMEOUT_MS;
 static uint64_t g_request_timeout_ms = S3_DEFAULT_REQUEST_TIMEOUT_MS;
 static uint64_t g_meta_timeout_ms    = S3_DEFAULT_META_TIMEOUT_MS;
 
+/* ==========================================================================
+ * Connection budget and stall detection (2026-11-18)
+ *
+ * throughput_target_gbps used to be 30, from which CRT derives its connection
+ * target: 30 / 0.4 Gbps per connection = 75 connections per client. Against
+ * Hetzner Object Storage that is far more than the endpoint gives one client:
+ * it answers 503 SlowDown (seen ~1000/h per node) and lets requests stall with
+ * no bytes for 10+ s. A signed curl from the same node, 16 GETs in parallel,
+ * saw the same stalls (1-8% over 3 s, a few 20 s timeouts, IPv4 and IPv6
+ * alike), so the stalls are the endpoint's; what the client controls is how
+ * many requests it puts in flight and how long it waits on a stalled one.
+ *
+ *   S3LVOL_S3_MAX_CONNECTIONS   32   max_active_connections_override
+ *   S3LVOL_S3_THROUGHPUT_GBPS    5   throughput target (sizes CRT's pools)
+ *   S3LVOL_S3_STALL_SECONDS      4   no-progress window before CRT aborts and
+ *                                    retries an attempt (was 10)
+ *
+ * The stall floor stays at 1 KiB/s: it catches "stopped", not "slow". A
+ * shorter window means a stalled attempt is retried after ~5 s instead of
+ * ~11 s; the hedge (s3_hedge.c) still races a duplicate sooner than that.
+ * ========================================================================== */
+#define S3_DEFAULT_MAX_CONNECTIONS 32
+#define S3_DEFAULT_THROUGHPUT_GBPS 5
+#define S3_DEFAULT_STALL_SECONDS   4
+
+static uint32_t g_max_connections = S3_DEFAULT_MAX_CONNECTIONS;
+static double   g_throughput_gbps = S3_DEFAULT_THROUGHPUT_GBPS;
+static uint32_t g_stall_seconds   = S3_DEFAULT_STALL_SECONDS;
+
+/* Attempt counters across all clients, for a failure rate in the log:
+ * every attempt CRT makes, and the ones that failed for a reason other than
+ * a 404 (which is an answer, not a failure). */
+static struct aws_atomic_var g_att_total;
+static struct aws_atomic_var g_att_stall;
+static struct aws_atomic_var g_att_throttle;
+static struct aws_atomic_var g_att_other;
+static struct aws_atomic_var g_att_last_report;
+
 static uint64_t
 s3_env_ms(const char *name, uint64_t dflt)
 {
@@ -456,6 +494,63 @@ s3_deadline_config_load(void)
 	SPDK_NOTICELOG("S3 request limits: connect %u ms, data %" PRIu64 " ms "
 		       "(+1 s per 256 KiB), head/delete %" PRIu64 " ms (0 = none)\n",
 		       g_connect_timeout_ms, g_request_timeout_ms, g_meta_timeout_ms);
+
+	g_max_connections = (uint32_t)s3_env_ms("S3LVOL_S3_MAX_CONNECTIONS",
+						S3_DEFAULT_MAX_CONNECTIONS);
+	g_throughput_gbps = (double)s3_env_ms("S3LVOL_S3_THROUGHPUT_GBPS",
+					      S3_DEFAULT_THROUGHPUT_GBPS);
+	if (g_throughput_gbps < 1) {
+		g_throughput_gbps = 1;
+	}
+	g_stall_seconds = (uint32_t)s3_env_ms("S3LVOL_S3_STALL_SECONDS",
+					      S3_DEFAULT_STALL_SECONDS);
+	if (g_stall_seconds < 2) {
+		g_stall_seconds = 2;
+	}
+	SPDK_NOTICELOG("S3 connections: at most %u per client (0 = CRT's own), "
+		       "throughput target %.0f Gbps, stall window %u s at 1 KiB/s\n",
+		       g_max_connections, g_throughput_gbps, g_stall_seconds);
+	aws_atomic_init_int(&g_att_total, 0);
+	aws_atomic_init_int(&g_att_stall, 0);
+	aws_atomic_init_int(&g_att_throttle, 0);
+	aws_atomic_init_int(&g_att_other, 0);
+	aws_atomic_init_int(&g_att_last_report, (size_t)time(NULL));
+}
+
+/* One line a minute: attempts and failed attempts since the last line. */
+static void
+s3_attempts_account(int err, int status)
+{
+	size_t now = (size_t)time(NULL);
+	size_t last;
+
+	aws_atomic_fetch_add(&g_att_total, 1);
+	if (err == AWS_ERROR_HTTP_CHANNEL_THROUGHPUT_FAILURE) {
+		aws_atomic_fetch_add(&g_att_stall, 1);
+	} else if (status == 503 || status == 429) {
+		aws_atomic_fetch_add(&g_att_throttle, 1);
+	} else if ((err != AWS_ERROR_SUCCESS || status >= 300) && status != 404) {
+		aws_atomic_fetch_add(&g_att_other, 1);
+	}
+
+	last = aws_atomic_load_int(&g_att_last_report);
+	if (now < last + 60 ||
+	    !aws_atomic_compare_exchange_int(&g_att_last_report, &last, now)) {
+		return;
+	}
+	{
+		size_t total = aws_atomic_exchange_int(&g_att_total, 0);
+		size_t stall = aws_atomic_exchange_int(&g_att_stall, 0);
+		size_t thr = aws_atomic_exchange_int(&g_att_throttle, 0);
+		size_t other = aws_atomic_exchange_int(&g_att_other, 0);
+
+		SPDK_NOTICELOG("S3 attempts in the last %zu s: %zu, stalled %zu "
+			       "(%.2f%%), throttled %zu (%.2f%%), other failures %zu\n",
+			       now - last, total, stall,
+			       total ? 100.0 * (double)stall / (double)total : 0.0,
+			       thr, total ? 100.0 * (double)thr / (double)total : 0.0,
+			       other);
+	}
 }
 
 static void
@@ -650,6 +745,7 @@ s3_trace_telemetry(struct aws_s3_meta_request *meta_request,
 		status = 0;
 	}
 	err = aws_s3_request_metrics_get_error_code(metrics);
+	s3_attempts_account(err, status);
 
 	if (err != AWS_ERROR_SUCCESS || status >= 300) {
 		SPDK_WARNLOG("S3 %s attempt %u failed: key=%s http=%d crt=%d (%s) "
@@ -1442,7 +1538,7 @@ s3_client_get_or_create(const struct s3_target *target, struct s3_client **out)
 	 */
 	struct aws_http_connection_monitoring_options monitoring = {
 		.minimum_throughput_bytes_per_second = 1024,
-		.allowable_throughput_failure_interval_seconds = 10,
+		.allowable_throughput_failure_interval_seconds = g_stall_seconds,
 	};
 
 	/* 2. TCP keepalive, tightened from what this used to be.
@@ -1466,7 +1562,8 @@ s3_client_get_or_create(const struct s3_target *target, struct s3_client **out)
 		.region                 = aws_byte_cursor_from_c_str(client->region),
 		.signing_config         = &client->signing_config,
 		.memory_limit_in_bytes  = 4ULL * 1024 * 1024 * 1024,
-		.throughput_target_gbps = 30.0,
+		.throughput_target_gbps = g_throughput_gbps,
+		.max_active_connections_override = g_max_connections,
 		/* Explicit rather than CRT's implicit default (also 3 s), so the
 		 * value is visible and tunable: S3LVOL_S3_CONNECT_TIMEOUT_MS. */
 		.connect_timeout_ms     = g_connect_timeout_ms,
