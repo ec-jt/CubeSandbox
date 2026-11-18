@@ -438,16 +438,19 @@ static uint64_t g_meta_timeout_ms    = S3_DEFAULT_META_TIMEOUT_MS;
  *
  *   S3LVOL_S3_MAX_CONNECTIONS   32   max_active_connections_override
  *   S3LVOL_S3_THROUGHPUT_GBPS    5   throughput target (sizes CRT's pools)
- *   S3LVOL_S3_STALL_SECONDS      4   no-progress window before CRT aborts and
- *                                    retries an attempt (was 10)
+ *   S3LVOL_S3_STALL_SECONDS     10   no-progress window before CRT aborts and
+ *                                    retries an attempt
  *
- * The stall floor stays at 1 KiB/s: it catches "stopped", not "slow". A
- * shorter window means a stalled attempt is retried after ~5 s instead of
- * ~11 s; the hedge (s3_hedge.c) still races a duplicate sooner than that.
+ * The stall window must not be shortened below 10 s against Hetzner: the
+ * monitor counts a request waiting for response headers as making no
+ * progress, and a small PUT there sometimes waits more than 4 s for them.
+ * Tried live at 4 s (2026-11-18 06:00, app1): the ownership probe PUT was
+ * cut off six attempts in a row and the lvstore could not be attached. The
+ * hedge (s3_hedge.c) is what races a stalled data request sooner.
  * ========================================================================== */
 #define S3_DEFAULT_MAX_CONNECTIONS 32
 #define S3_DEFAULT_THROUGHPUT_GBPS 5
-#define S3_DEFAULT_STALL_SECONDS   4
+#define S3_DEFAULT_STALL_SECONDS   10
 
 static uint32_t g_max_connections = S3_DEFAULT_MAX_CONNECTIONS;
 static double   g_throughput_gbps = S3_DEFAULT_THROUGHPUT_GBPS;
