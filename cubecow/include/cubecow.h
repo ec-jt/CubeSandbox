@@ -328,6 +328,18 @@ int32_t cubecow_import_lvol(
     char** out_device_path);
 
 /*
+ * cubecow_import_lvol with the source node's private address ("ip[:port]"),
+ * from which packs may be read before S3 (peer pull). NULL or "" is exactly
+ * cubecow_import_lvol.
+ */
+int32_t cubecow_import_lvol_peer(
+    CubecowEngineHandle engine,
+    const char* lvol_name,
+    const char* export_uuid,
+    const char* peer,
+    char** out_device_path);
+
+/*
  * Derive a writable, data-independent volume from an existing
  * snapshot. The resulting volume is auto-activated (mirroring
  * cubecow_create_volume's "volume-device lifetime" contract) and its

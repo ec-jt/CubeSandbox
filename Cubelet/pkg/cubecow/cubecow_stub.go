@@ -100,6 +100,10 @@ func (e *Engine) ImportLvol(string, string) (string, error) {
 	return "", fmt.Errorf(nativeBuildHint)
 }
 
+func (e *Engine) ImportLvolPeer(string, string, string) (string, error) {
+	return "", fmt.Errorf(nativeBuildHint)
+}
+
 func (e *Engine) ImportStatus(string) (string, error) {
 	return "", fmt.Errorf(nativeBuildHint)
 }

@@ -1212,6 +1212,15 @@ impl Engine for S3Engine {
     }
 
     fn import_lvol(&self, lvol_name: &str, export_uuid: &str) -> CubecowResult<Volume> {
+        self.import_lvol_peer(lvol_name, export_uuid, None)
+    }
+
+    fn import_lvol_peer(
+        &self,
+        lvol_name: &str,
+        export_uuid: &str,
+        peer: Option<&str>,
+    ) -> CubecowResult<Volume> {
         Self::validate_name(lvol_name, "volume")?;
         if export_uuid.is_empty() {
             return Err(CubecowError::InvalidArg(
@@ -1229,17 +1238,20 @@ impl Engine for S3Engine {
             )));
         }
 
-        match self.rpc.call_typed(
-            "rcow_import_lvol",
-            &serde_json::json!({
-                "lvol_name": lvol_name,
-                "export_uuid": export_uuid,
-                "decouple": true,
-                // B19: fetch every present chunk whole and in parallel and
-                // materialise locally; callers wait on rcow_import_status.
-                "prefetch": true,
-            }),
-        ) {
+        let mut params = serde_json::json!({
+            "lvol_name": lvol_name,
+            "export_uuid": export_uuid,
+            "decouple": true,
+            // B19: fetch every present chunk whole and in parallel and
+            // materialise locally; callers wait on rcow_import_status.
+            "prefetch": true,
+        });
+        // Peer pull: only sent when known, so an older native side never
+        // sees a member it does not decode.
+        if let Some(p) = peer.map(str::trim).filter(|p| !p.is_empty()) {
+            params["peer"] = serde_json::Value::String(p.to_string());
+        }
+        match self.rpc.call_typed("rcow_import_lvol", &params) {
             Ok(_) => {}
             Err(CubecowError::AlreadyExists(_)) => {}
             Err(e) => return Err(e),
@@ -1900,6 +1912,54 @@ mod tests {
             "manifest_version":4,"generation":1,"cluster_size":4194304,"chunk_size":4194304,
             "block_size":4096,"blob_id":123,"source_blob_id":456,"size_bytes":1073741824u64
         }})
+    }
+
+    /// Peer pull: rcow_import_lvol carries `peer` exactly when one is given,
+    /// so an older native side never sees a member it cannot decode.
+    #[test]
+    fn import_lvol_peer_param_only_when_set() {
+        use std::io::{BufRead, BufReader};
+        use std::os::unix::net::UnixListener;
+        for (peer, want) in [(Some("10.0.1.1:17310"), Some("10.0.1.1:17310")),
+                             (Some("  "), None), (None, None)] {
+            let dir = std::env::temp_dir().join(format!("peer-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir(&dir).unwrap();
+            let socket = dir.join("rpc.sock");
+            let listener = UnixListener::bind(&socket).unwrap();
+            let params = Arc::new(Mutex::new(None::<serde_json::Value>));
+            let seen = params.clone();
+            let thread = std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap() == 0 { break; }
+                    let request: serde_json::Value = serde_json::from_str(&line).unwrap();
+                    let method = request["method"].as_str().unwrap();
+                    let result = match method {
+                        "rcow_import_lvol" => {
+                            *seen.lock().unwrap() = Some(request["params"].clone());
+                            // Stop here: only the request shape matters.
+                            serde_json::json!({"bool_value":false,"string_value":"stop"})
+                        }
+                        other => panic!("unexpected RPC: {other}"),
+                    };
+                    writeln!(stream, "{}", serde_json::json!({"jsonrpc":"2.0","id":request["id"],"result":result})).unwrap();
+                }
+            });
+            let engine = S3Engine {
+                cfg: S3Config { state_dir: dir.clone(), ..Default::default() },
+                rpc: Arc::new(JsonRpcClient::new(socket, Duration::from_secs(2))),
+                name_index: RwLock::new(HashMap::new()),
+                metrics: Arc::new(MetricsCollector::new()),
+            };
+            assert!(engine.import_lvol_peer("target", "export-a", peer).is_err());
+            let got = params.lock().unwrap().clone().expect("rcow_import_lvol sent");
+            assert_eq!(got["export_uuid"], "export-a");
+            assert_eq!(got["prefetch"], true);
+            assert_eq!(got.get("peer").and_then(|v| v.as_str()), want, "peer={peer:?}");
+            drop(engine); thread.join().unwrap(); std::fs::remove_dir_all(dir).unwrap();
+        }
     }
 
     #[test]

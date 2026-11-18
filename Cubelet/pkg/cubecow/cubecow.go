@@ -538,6 +538,36 @@ func (e *Engine) ImportLvol(lvolName, exportUUID string) (string, error) {
 	return takeCString(cDevicePath), nil
 }
 
+// ImportLvolPeer is ImportLvol with the source node's private address, from
+// which s3lvol may read packs before S3 (peer pull). "" is ImportLvol.
+func (e *Engine) ImportLvolPeer(lvolName, exportUUID, peer string) (string, error) {
+	if peer == "" {
+		return e.ImportLvol(lvolName, exportUUID)
+	}
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+
+	ptr, err := e.openHandle()
+	if err != nil {
+		return "", err
+	}
+	defer e.mu.RUnlock()
+
+	cName := C.CString(lvolName)
+	defer C.free(unsafe.Pointer(cName))
+	cUUID := C.CString(exportUUID)
+	defer C.free(unsafe.Pointer(cUUID))
+	cPeer := C.CString(peer)
+	defer C.free(unsafe.Pointer(cPeer))
+
+	var cDevicePath *C.char
+	rc := C.cubecow_import_lvol_peer(C.CubecowEngineHandle(ptr), cName, cUUID, cPeer, &cDevicePath)
+	if rc != 0 {
+		return "", makeError(rc)
+	}
+	return takeCString(cDevicePath), nil
+}
+
 func (e *Engine) GetMetrics() (map[string]uint64, error) {
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()

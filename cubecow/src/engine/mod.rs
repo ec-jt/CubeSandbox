@@ -148,6 +148,18 @@ pub trait Engine: Send + Sync {
         ))
     }
 
+    /// `import_lvol` with the source node's private address ("ip[:port]"),
+    /// which the native side may read packs from before S3 (peer pull). An
+    /// empty or absent peer is exactly `import_lvol`.
+    fn import_lvol_peer(
+        &self,
+        lvol_name: &str,
+        export_uuid: &str,
+        _peer: Option<&str>,
+    ) -> CubecowResult<Volume> {
+        self.import_lvol(lvol_name, export_uuid)
+    }
+
     /// B19: progress of an imported volume's whole-chunk prefetch and
     /// decouple, as the native JSON object of `rcow_import_status`. `done`
     /// is true once no read of the volume can reach the export.

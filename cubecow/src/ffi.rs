@@ -1224,6 +1224,56 @@ pub extern "C" fn cubecow_import_lvol(
     }
 }
 
+/// `cubecow_import_lvol` with the source node's private address
+/// ("ip[:port]"), from which the native side may read packs before S3 (peer
+/// pull). A NULL or empty `peer` is exactly `cubecow_import_lvol`.
+///
+/// # Returns
+/// 0 on success, negative error code on failure.
+#[no_mangle]
+pub extern "C" fn cubecow_import_lvol_peer(
+    engine: *mut std::ffi::c_void,
+    lvol_name: *const c_char,
+    export_uuid: *const c_char,
+    peer: *const c_char,
+    out_device_path: *mut *mut c_char,
+) -> i32 {
+    let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+        // SAFETY: `engine` was created by `cubecow_init` and is valid.
+        let eng = unsafe { engine_ref(engine) }?;
+        // SAFETY: `lvol_name` is a valid C string provided by the caller.
+        let name = unsafe { c_str_to_str(lvol_name) }?;
+        // SAFETY: `export_uuid` is a valid C string provided by the caller.
+        let uuid = unsafe { c_str_to_str(export_uuid) }?;
+        let peer = if peer.is_null() {
+            None
+        } else {
+            // SAFETY: `peer` is non-null and a valid C string from the caller.
+            Some(unsafe { c_str_to_str(peer) }?)
+        };
+
+        match eng.import_lvol_peer(name, uuid, peer) {
+            Ok(vol) => {
+                if !out_device_path.is_null() {
+                    // SAFETY: `out_device_path` is non-null and writable.
+                    unsafe { *out_device_path = rust_string_to_c(&vol.device_path) };
+                }
+                Ok(COW_OK)
+            }
+            Err(e) => Err(handle_cow_error(&e)),
+        }
+    }));
+
+    match result {
+        Ok(Ok(code)) => code,
+        Ok(Err(code)) => code,
+        Err(_) => {
+            set_last_error("panic during cubecow_import_lvol_peer");
+            COW_ERR_PANIC
+        }
+    }
+}
+
 /// Derive a writable, data-independent volume from an existing snapshot.
 ///
 /// The resulting volume is auto-activated (mirroring

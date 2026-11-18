@@ -224,6 +224,12 @@ const (
 	// can know this, so Cubelet takes it as fact and refuses a restore it
 	// cannot satisfy instead of failing later on an unexplained catalog miss.
 	MasterAnnotationSnapshotCrossNode = "cube.master.snapshot.cross_node"
+	// MasterAnnotationSnapshotSourcePeer is the private address ("ip" or
+	// "ip:port") of the node that published the package a cross-node
+	// restore imports. Cubelet passes it to rcow_import_lvol as `peer`, so
+	// s3lvol may read packs from that node before S3 (peer pull). Advisory:
+	// absent or unreachable means S3 only.
+	MasterAnnotationSnapshotSourcePeer = "cube.master.snapshot.source_peer"
 	// MasterAnnotationDesiredSandboxID asks createid to use this sandbox ID
 	// instead of generating a new one (Resume-from-pause / same-ID recreate).
 	MasterAnnotationDesiredSandboxID = "cube.master.desired.sandbox.id"

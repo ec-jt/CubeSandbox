@@ -104,6 +104,11 @@ const (
 	// from S3 before it can be used. Value is the literal "true". Only Master
 	// knows this, and it is a fact about the chosen node, not a permission.
 	CubeAnnotationSnapshotCrossNode = "cube.master.snapshot.cross_node"
+	// CubeAnnotationSnapshotSourcePeer is the private IP of the node that
+	// published the package of a cross-node restore (the pause snapshot's
+	// node_ip). Cubelet hands it to s3lvol for peer pull; set only together
+	// with CubeAnnotationSnapshotCrossNode.
+	CubeAnnotationSnapshotSourcePeer = "cube.master.snapshot.source_peer"
 	// CubeAnnotationPauseKeepTombstone is used by Cubelet's in-process Destroy
 	// after PauseToSnapshot (Master no longer issues a separate Destroy RPC).
 	CubeAnnotationPauseKeepTombstone = "cube.pause.keep_tombstone"

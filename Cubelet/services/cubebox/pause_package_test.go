@@ -100,6 +100,7 @@ func TestPauseRestoreBindingSurvivesPackedSpecSwap(t *testing.T) {
 			constants.MasterAnnotationDesiredSandboxID:    "sb-1",
 			constants.MasterAnnotationSnapshotRemoteUUIDs: `{"rootfs":"r1","memory":"m1","metadata":"d1"}`,
 			constants.MasterAnnotationSnapshotCrossNode:   "true",
+			constants.MasterAnnotationSnapshotSourcePeer:  "10.0.1.2",
 		},
 	}
 	binding := pauseRestoreBindingFrom(thin, "snap-1", "s3")
@@ -126,6 +127,8 @@ func TestPauseRestoreBindingSurvivesPackedSpecSwap(t *testing.T) {
 	assert.Equal(t, `{"rootfs":"r1","memory":"m1","metadata":"d1"}`,
 		req.Annotations[constants.MasterAnnotationSnapshotRemoteUUIDs])
 	assert.Equal(t, "true", req.Annotations[constants.MasterAnnotationSnapshotCrossNode])
+	// Peer pull: the source node survives the packed-spec swap.
+	assert.Equal(t, "10.0.1.2", req.Annotations[constants.MasterAnnotationSnapshotSourcePeer])
 	assert.Equal(t, "tpl-T", req.Annotations[constants.MasterAnnotationLaunchMemorySnapshotID])
 	assert.NotEmpty(t, req.Annotations[constants.MasterAnnotationRuntimeSnapshotAttachedAt])
 }
@@ -141,6 +144,7 @@ func TestPauseRestoreBindingKeepsSameNodeResumeLocal(t *testing.T) {
 	req := &cubebox.RunCubeSandboxRequest{}
 	pauseRestoreBindingFrom(thin, "snap-1", "s3").applyTo(req)
 	assert.Empty(t, req.Annotations[constants.MasterAnnotationSnapshotCrossNode])
+	assert.Empty(t, req.Annotations[constants.MasterAnnotationSnapshotSourcePeer])
 }
 
 func TestMergeThinNetworkFieldsOntoPackedPauseSpec(t *testing.T) {

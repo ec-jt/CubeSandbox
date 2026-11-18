@@ -194,6 +194,7 @@ type pauseRestoreBinding struct {
 	attachedAt       string
 	remoteUUIDs      string
 	crossNode        bool
+	sourcePeer       string
 	coldPolicy       string
 }
 
@@ -207,6 +208,7 @@ func pauseRestoreBindingFrom(req *cubebox.RunCubeSandboxRequest, snapshotID, bac
 		attachedAt:       strings.TrimSpace(ann[constants.MasterAnnotationRuntimeSnapshotAttachedAt]),
 		remoteUUIDs:      strings.TrimSpace(ann[constants.MasterAnnotationSnapshotRemoteUUIDs]),
 		crossNode:        isCrossNodeRestore(ann),
+		sourcePeer:       strings.TrimSpace(ann[constants.MasterAnnotationSnapshotSourcePeer]),
 		coldPolicy:       ann[workflow.ColdRecreatePolicy],
 	}
 }
@@ -248,6 +250,10 @@ func (b pauseRestoreBinding) applyTo(req *cubebox.RunCubeSandboxRequest) {
 	}
 	if b.crossNode {
 		req.Annotations[constants.MasterAnnotationSnapshotCrossNode] = "true"
+		// Peer pull: the source node travels with the cross-node verdict.
+		if b.sourcePeer != "" {
+			req.Annotations[constants.MasterAnnotationSnapshotSourcePeer] = b.sourcePeer
+		}
 	}
 	delete(req.Annotations, constants.MasterAnnotationsAppSnapshotCreate)
 	// Keep appsnapshot.template.id=tpl-* so Resume can EnsureCubeRunTemplate

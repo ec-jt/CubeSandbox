@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/service/sandbox/restoreprogress"
+	"net"
 	"strconv"
 	"strings"
 	"time"
@@ -415,6 +416,12 @@ func resumeFromPauseSnapshot(ctx context.Context, req *types.UpdateRequest, host
 		// Cubelet import the package up front instead of inferring it from a
 		// catalog miss, and lets it reject a restore it cannot serve.
 		cubeletReq.Annotations[constants.CubeAnnotationSnapshotCrossNode] = "true"
+		// Peer pull: the node that paused the sandbox published its packs
+		// and keeps a local copy of them. Advisory; the target falls back
+		// to S3 for anything it cannot get there.
+		if peer := crossNodeSourcePeer(rec.NodeIP, targetIP); peer != "" {
+			cubeletReq.Annotations[constants.CubeAnnotationSnapshotSourcePeer] = peer
+		}
 	}
 	fillResumeRecreateFields(ctx, req.SandboxID, cubeletReq, createReq)
 
@@ -720,4 +727,19 @@ func remoteUUIDsFromExtInfo(extInfo map[string][]byte) string {
 		return ""
 	}
 	return strings.TrimSpace(string(extInfo[extInfoRemoteUUIDs]))
+}
+
+// crossNodeSourcePeer is the source node's private address to hand the
+// target for peer pull, or "" when there is none worth naming: unknown,
+// the same node, or not an IPv4 address.
+func crossNodeSourcePeer(originIP, targetIP string) string {
+	origin := strings.TrimSpace(originIP)
+	if origin == "" || origin == strings.TrimSpace(targetIP) {
+		return ""
+	}
+	ip := net.ParseIP(origin)
+	if ip == nil || ip.To4() == nil || ip.IsUnspecified() || ip.IsLoopback() {
+		return ""
+	}
+	return origin
 }

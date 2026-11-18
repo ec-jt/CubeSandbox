@@ -8,6 +8,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"strings"
 	"sync"
@@ -43,6 +44,9 @@ import (
 type SandboxImport struct {
 	SandboxID string
 	UUIDs     *cow.RemoteUUIDs
+	// Peer is the source node's private address for peer pull, or "".
+	// Advisory: the import reads S3 for anything the peer cannot serve.
+	Peer string
 }
 
 // CrossNodeSandboxImport reports the imports a create owes, or nil when this
@@ -81,7 +85,36 @@ func CrossNodeSandboxImport(ann map[string]string) *SandboxImport {
 	if uuids.Empty() {
 		return nil
 	}
-	return &SandboxImport{SandboxID: id, UUIDs: uuids}
+	return &SandboxImport{SandboxID: id, UUIDs: uuids,
+		Peer: SourcePeerFromAnnotations(ann)}
+}
+
+// SourcePeerFromAnnotations is the source node's private address from
+// cube.master.snapshot.source_peer, or "" when absent or not an IPv4
+// "ip" / "ip:port". Malformed values are dropped rather than sent on: the
+// peer is an optimisation, and s3lvol would only refuse it.
+func SourcePeerFromAnnotations(ann map[string]string) string {
+	v := strings.TrimSpace(ann[constants.MasterAnnotationSnapshotSourcePeer])
+	if v == "" {
+		return ""
+	}
+	host, port := v, ""
+	if i := strings.LastIndexByte(v, ':'); i >= 0 {
+		host, port = v[:i], v[i+1:]
+		if port == "" {
+			return ""
+		}
+		for _, c := range port {
+			if c < '0' || c > '9' {
+				return ""
+			}
+		}
+	}
+	ip := net.ParseIP(host)
+	if ip == nil || ip.To4() == nil || ip.IsUnspecified() || ip.IsLoopback() {
+		return ""
+	}
+	return v
 }
 
 // SandboxObjectNamePrefix is what every disk minted for a sandbox is named
@@ -243,7 +276,7 @@ func (s *SandboxImport) materialize(ctx context.Context, store *S3Cow, name, rol
 	if !ok || importer == nil {
 		return fmt.Errorf("cubecow engine cannot import %s %s", role, name)
 	}
-	info, err := importWithRetry(ctx, store, importer, name, role, uuid)
+	info, err := importWithRetry(ctx, store, withPeer(importer, s.Peer), name, role, uuid)
 	if err != nil {
 		return err
 	}
@@ -520,6 +553,35 @@ func importWithRetry(ctx context.Context, store *S3Cow, importer cowVolumeImport
 		case <-time.After(importBusyBackoff):
 		}
 	}
+}
+
+// cowVolumePeerImporter is an importer that can be told the source node for
+// peer pull (cubecow_import_lvol_peer).
+type cowVolumePeerImporter interface {
+	ImportLvolPeer(name, remoteUUID, peer string) (string, error)
+}
+
+// peerImporter binds a peer to an importer so importWithRetry stays
+// unchanged.
+type peerImporter struct {
+	inner cowVolumePeerImporter
+	peer  string
+}
+
+func (p peerImporter) ImportLvol(name, remoteUUID string) (string, error) {
+	return p.inner.ImportLvolPeer(name, remoteUUID, p.peer)
+}
+
+// withPeer routes imports through ImportLvolPeer when a peer is known and
+// the engine supports it; otherwise the plain importer, i.e. S3 only.
+func withPeer(importer cowVolumeImporter, peer string) cowVolumeImporter {
+	if peer == "" {
+		return importer
+	}
+	if pi, ok := importer.(cowVolumePeerImporter); ok {
+		return peerImporter{inner: pi, peer: peer}
+	}
+	return importer
 }
 
 func requireImportedOrigin(info *cubecow.Volume, name, uuid string) error {
