@@ -3116,12 +3116,14 @@ lvs_attach_imports_loaded(void *cb_arg, int status)
 	}
 }
 
+static void lvs_attach_load_blobstore(struct lvs_setup_ctx *ctx);
+static void lvs_attach_warm_md(struct lvs_setup_ctx *ctx);
+
 static void
 lvs_attach_exports_loaded(void *cb_arg, int status)
 {
 	struct lvs_setup_ctx *ctx = cb_arg;
 	struct s3lvol_lvstore *lvs = ctx->lvs;
-	struct spdk_lvs_opts lvs_opts;
 
 	if (status != 0) {
 		SPDK_ERRLOG("Failed to read the imports registry of '%s': %s. Not "
@@ -3131,6 +3133,180 @@ lvs_attach_exports_loaded(void *cb_arg, int status)
 		lvs_setup_fail_step(ctx, status);
 		return;
 	}
+
+	lvs_attach_warm_md(ctx);
+}
+
+/* Blobstore metadata warm-up before the load.
+ *
+ * spdk_lvs_load_ext() reads the masks and then every metadata page one 4 KiB
+ * request at a time, each waiting for the previous one. After a restart the
+ * chunk cache index is empty, so each of those reads is its own S3 GET: on a
+ * node with ~200 volumes the load took 160 s (live, app2) and on a slow
+ * bucket it ran into the attach deadline (-ETIMEDOUT, app1). Fetching the
+ * whole metadata region first, as whole chunks and many at a time, turns
+ * those thousands of serial round trips into a few parallel ones; the load
+ * then reads from the local cache.
+ *
+ * Best effort: any failure here only means the load reads from S3 as before.
+ * S3LVOL_ATTACH_WARM_MD=0 turns it off. */
+struct lvs_md_warm {
+	struct lvs_setup_ctx   *ctx;
+	struct spdk_io_channel *ch;
+	void                   *sb;
+	uint64_t                start_us;
+	struct spdk_bs_dev_cb_args cb_args;
+};
+
+static uint64_t
+lvs_md_warm_now_us(void)
+{
+	return spdk_get_ticks() * SPDK_SEC_TO_USEC / spdk_get_ticks_hz();
+}
+
+static void
+lvs_md_warm_finish(struct lvs_md_warm *w)
+{
+	struct lvs_setup_ctx *ctx = w->ctx;
+
+	if (w->ch) {
+		ctx->lvs->bs_dev->destroy_channel(ctx->lvs->bs_dev, w->ch);
+	}
+	spdk_dma_free(w->sb);
+	free(w);
+	lvs_attach_load_blobstore(ctx);
+}
+
+static void
+lvs_md_warm_done(void *cb_arg, int status, const struct s3_warm_stats *st)
+{
+	struct lvs_md_warm *w = cb_arg;
+
+	SPDK_NOTICELOG("lvstore '%s': metadata warm-up %s: %" PRIu64 " chunk(s), "
+		       "%" PRIu64 " fetched, %" PRIu64 " already local, %" PRIu64
+		       " hole(s), %" PRIu64 " failed, %" PRIu64 " byte(s) in %" PRIu64
+		       " ms\n", w->ctx->lvs->name, status == 0 ? "done" : spdk_strerror(-status),
+		       st ? st->requested : 0, st ? st->fetched : 0,
+		       st ? st->already : 0, st ? st->holes : 0, st ? st->failed : 0,
+		       st ? st->bytes : 0,
+		       (lvs_md_warm_now_us() - w->start_us) / 1000);
+	lvs_md_warm_finish(w);
+}
+
+/* The region to warm: every page from the super block up to the end of the
+ * metadata, which covers the masks too (they precede md_start). 0 when the
+ * super block is not one we can read.
+ *
+ * Read by offset from blobstore's on-disk super block (lib/blob/blobstore.h,
+ * packed, little-endian): signature[8]@0, md_start@48, md_len@52,
+ * md_page_size@92. That header is private to lib/blob, hence no include. */
+#define LVS_MD_PAGE           4096u
+#define LVS_SB_OFF_MD_START   48
+#define LVS_SB_OFF_MD_LEN     52
+#define LVS_SB_OFF_MD_PAGE_SZ 92
+
+static uint64_t
+lvs_md_region_bytes(const uint8_t *sb)
+{
+	uint32_t md_start, md_len, md_page;
+	uint64_t page = LVS_MD_PAGE;
+
+	if (memcmp(sb, "SPDKBLOB", 8) != 0) {
+		return 0;
+	}
+	memcpy(&md_start, sb + LVS_SB_OFF_MD_START, sizeof(md_start));
+	memcpy(&md_len, sb + LVS_SB_OFF_MD_LEN, sizeof(md_len));
+	memcpy(&md_page, sb + LVS_SB_OFF_MD_PAGE_SZ, sizeof(md_page));
+	if (md_page >= LVS_MD_PAGE && md_page <= 65536) {
+		page = md_page;
+	}
+	return ((uint64_t)md_start + md_len) * page;
+}
+
+static void
+lvs_md_warm_sb_read(struct spdk_io_channel *channel, void *cb_arg, int bserrno)
+{
+	struct lvs_md_warm *w = cb_arg;
+	struct s3lvol_lvstore *lvs = w->ctx->lvs;
+	uint32_t chunk_size = s3_bs_dev_get_chunk_size(lvs->bs_dev);
+	uint64_t bytes, n, i, *chunks;
+	int rc;
+
+	(void)channel;
+	if (bserrno != 0 || chunk_size == 0) {
+		SPDK_NOTICELOG("lvstore '%s': metadata warm-up skipped (super block "
+			       "read: %d)\n", lvs->name, bserrno);
+		lvs_md_warm_finish(w);
+		return;
+	}
+	bytes = lvs_md_region_bytes(w->sb);
+	if (bytes == 0) {
+		/* A fresh lvstore has no super block yet; nothing to warm. */
+		lvs_md_warm_finish(w);
+		return;
+	}
+	n = spdk_divide_round_up(bytes, chunk_size);
+	if (n > 65536) {
+		/* 64 GiB of metadata is not a real blobstore; do not trust it. */
+		lvs_md_warm_finish(w);
+		return;
+	}
+	chunks = calloc(n, sizeof(*chunks));
+	if (!chunks) {
+		lvs_md_warm_finish(w);
+		return;
+	}
+	for (i = 0; i < n; i++) {
+		chunks[i] = i;
+	}
+	rc = s3_bs_dev_warm(lvs->bs_dev, chunks, n, 0, lvs_md_warm_done, w);
+	free(chunks);   /* copied by s3_bs_dev_warm */
+	if (rc != 0) {
+		if (rc != -ENOTSUP) {
+			SPDK_NOTICELOG("lvstore '%s': metadata warm-up not started: %s\n",
+				       lvs->name, spdk_strerror(-rc));
+		}
+		lvs_md_warm_finish(w);
+	}
+}
+
+static void
+lvs_attach_warm_md(struct lvs_setup_ctx *ctx)
+{
+	struct spdk_bs_dev *dev = ctx->lvs->bs_dev;
+	const char *env = getenv("S3LVOL_ATTACH_WARM_MD");
+	struct lvs_md_warm *w;
+
+	if ((env && strcmp(env, "0") == 0) || !dev) {
+		lvs_attach_load_blobstore(ctx);
+		return;
+	}
+	w = calloc(1, sizeof(*w));
+	if (w) {
+		w->sb = spdk_dma_zmalloc(LVS_MD_PAGE, LVS_MD_PAGE, NULL);
+		w->ch = w->sb ? dev->create_channel(dev) : NULL;
+	}
+	if (!w || !w->ch) {
+		if (w) {
+			spdk_dma_free(w->sb);
+			free(w);
+		}
+		lvs_attach_load_blobstore(ctx);
+		return;
+	}
+	w->ctx = ctx;
+	w->start_us = lvs_md_warm_now_us();
+	w->cb_args.cb_fn = lvs_md_warm_sb_read;
+	w->cb_args.cb_arg = w;
+	w->cb_args.channel = w->ch;
+	dev->read(dev, w->ch, w->sb, 0, LVS_MD_PAGE / dev->blocklen, &w->cb_args);
+}
+
+static void
+lvs_attach_load_blobstore(struct lvs_setup_ctx *ctx)
+{
+	struct s3lvol_lvstore *lvs = ctx->lvs;
+	struct spdk_lvs_opts lvs_opts;
 
 	/* Registered before spdk_lvs_load_ext() because all of its failure paths
 	 * destroy the bs_dev, and that teardown is asynchronous. */
