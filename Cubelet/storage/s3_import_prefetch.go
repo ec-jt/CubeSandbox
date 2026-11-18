@@ -128,6 +128,7 @@ func waitImportPrefetch(ctx context.Context, eng cowImportStatuser, name, role s
 			return fmt.Errorf("import status of %s %s: %w", role, name, err)
 		}
 		last = st
+		reportImportProgress(ctx, name, role, st)
 		if st.Done {
 			CubeLog.Infof("cross-node import %s %s is local: %d/%d chunk(s) in %s",
 				role, name, st.PresentChunks, st.PresentChunks,

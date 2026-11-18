@@ -335,6 +335,16 @@ func (s *service) Create(ctx context.Context, req *cubebox.RunCubeSandboxRequest
 				s.releaseFailedCrossNodeRestore(lifecycleCtx, sid)
 			}
 		}()
+		// Final phase for the restore-progress endpoint. Registered after
+		// the release so it runs first: a poller sees failed as soon as
+		// Create gives up, not after the rollback.
+		defer func() {
+			if ret.IsSuccessCode(rsp.Ret.RetCode) {
+				storage.MarkRestorePhase(sid, storage.RestorePhaseDone, nil)
+			} else {
+				storage.MarkRestorePhase(sid, storage.RestorePhaseFailed, errors.New(rsp.Ret.RetMsg))
+			}
+		}()
 	}
 	if err := prepareCrossNodeRestore(ctx, req); err != nil {
 		rsp.Ret.RetMsg = err.Error()

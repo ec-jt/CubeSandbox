@@ -51,6 +51,7 @@ import (
 	dynamConf "github.com/tencentcloud/CubeSandbox/Cubelet/pkg/config"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/services/images"
 	srvconfig "github.com/tencentcloud/CubeSandbox/Cubelet/services/server/config"
+	"github.com/tencentcloud/CubeSandbox/Cubelet/storage"
 	bolt "go.etcd.io/bbolt"
 )
 
@@ -303,6 +304,11 @@ func (s *Server) ServeHttp(l net.Listener) error {
 	}
 
 	log.G(context.Background()).Infof("ServeHttp: Serve snhost.")
+
+	handlers, err = appendHttpHandlers(handlers, storage.RestoreProgressHTTPHandlers())
+	if err != nil {
+		return fmt.Errorf("failed to append http handlers for restore progress: %s", err.Error())
+	}
 
 	// Plugin HTTP handlers are appended after built-in endpoints so path conflicts
 	// are detected against the complete Cubelet HTTP surface.

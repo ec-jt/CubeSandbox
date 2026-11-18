@@ -330,6 +330,8 @@ func (s *SandboxImport) PrefetchAll(ctx context.Context) error {
 	}
 	ctx, cancel := context.WithTimeout(ctx, deadline)
 	defer cancel()
+	restoreProgress.begin(s.SandboxID, jobs)
+	ctx = withRestoreProgress(ctx, s.SandboxID)
 
 	start := time.Now()
 	errs := make([]error, len(jobs))
@@ -359,9 +361,11 @@ func (s *SandboxImport) PrefetchAll(ctx context.Context) error {
 	}
 	wg.Wait()
 	if err := firstImportError(errs); err != nil {
+		MarkRestorePhase(s.SandboxID, RestorePhaseFailed, err)
 		return fmt.Errorf("cross-node restore of sandbox %s: import phase failed after %s (deadline %s): %w",
 			s.SandboxID, time.Since(start).Round(time.Millisecond), deadline, err)
 	}
+	MarkRestorePhase(s.SandboxID, RestorePhaseRestoringVM, nil)
 	log.G(ctx).Infof("cross-node restore of sandbox %s: %d disk(s) local in %s",
 		s.SandboxID, len(jobs), time.Since(start).Round(time.Millisecond))
 	return nil
