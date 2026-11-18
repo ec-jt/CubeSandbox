@@ -7,12 +7,18 @@
 //! (guest memory, then device state, then vCPU resume) and then waits for
 //! the guest agent. Cubelet cannot see inside that call. When Cubelet wants
 //! the detail it creates `PHASE_ROOT/<sandbox_id>/` before Create; the VMM
-//! then records each step in `<dir>/phase` (atomic rename, one short line).
-//! Without that directory nothing is written, so ordinary creates pay one
-//! failed stat per step and leave nothing behind.
+//! then records each step in `<dir>/phase` (one short line). Without that
+//! directory the open fails with ENOENT, so ordinary creates pay one failed
+//! open per step and leave nothing behind.
+//!
+//! Only open, write and close are used: this runs on the VMM thread, whose
+//! seccomp filter traps rename and stat (SIGSYS, seen live). The write is not
+//! atomic; the reader in Cubelet ignores anything that is not a whole known
+//! phase name, so a torn read only delays the bar by one poll.
 
 use std::fs;
 use std::io::Write;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::PathBuf;
 
 pub const PHASE_ROOT: &str = "/run/cube-restore-phase";
@@ -41,25 +47,16 @@ pub fn mark_at(root: &str, sandbox_id: &str, phase: &str) -> bool {
     if !valid_sandbox_id(sandbox_id) || !valid_phase(phase) {
         return false;
     }
-    let dir = PathBuf::from(root).join(sandbox_id);
-    match fs::symlink_metadata(&dir) {
-        Ok(m) if m.is_dir() => {}
-        _ => return false,
-    }
-    let tmp = dir.join("phase.tmp");
-    let dst = dir.join("phase");
-    let res = (|| -> std::io::Result<()> {
-        let mut f = fs::File::create(&tmp)?;
-        f.write_all(phase.as_bytes())?;
-        f.write_all(b"\n")?;
-        drop(f);
-        fs::rename(&tmp, &dst)
-    })();
-    if res.is_err() {
-        let _ = fs::remove_file(&tmp);
-        return false;
-    }
-    true
+    let dst = PathBuf::from(root).join(sandbox_id).join("phase");
+    let line = format!("{}\n", phase);
+    fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&dst)
+        .and_then(|mut f| f.write_all(line.as_bytes()))
+        .is_ok()
 }
 
 /// Records `phase` for `sandbox_id` under PHASE_ROOT.
@@ -94,7 +91,6 @@ mod tests {
         assert!(mark_at(r, "sb-1", VM_RESUME));
         let got = fs::read_to_string(root.join("sb-1").join("phase")).unwrap();
         assert_eq!(got, "vm_resume\n");
-        assert!(!root.join("sb-1").join("phase.tmp").exists());
         let _ = fs::remove_dir_all(&root);
     }
 
