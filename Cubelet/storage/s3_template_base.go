@@ -490,14 +490,15 @@ func InstallTemplateBase(ctx context.Context, templateID, role, baseUUID string)
 			return "", err
 		}
 		if !present {
-			if _, err := importer.ImportLvol(anchor, baseUUID); err != nil && !isCowSemantic(err, cubecow.SemAlreadyExists) {
+			// Retried like a sandbox disk: a cross-node restore installs
+			// its bases while its own disks import in parallel, and
+			// s3lvol answers EBUSY to all but one manifest fetch.
+			info, err = importWithRetry(ctx, store, importer, anchor, "template base "+role, baseUUID)
+			if err != nil {
 				if isCowSemantic(err, cubecow.SemNotFound) {
 					return "", fmt.Errorf("%w: base %s export is gone: %v", ErrTemplateBaseMissing, baseUUID, err)
 				}
 				return "", fmt.Errorf("import base %s as %s: %w", baseUUID, anchor, err)
-			}
-			if info, err = store.GetVolumeInfo(ctx, anchor); err != nil {
-				return "", err
 			}
 		}
 		if err := requireImportedOrigin(info, anchor, baseUUID); err != nil {

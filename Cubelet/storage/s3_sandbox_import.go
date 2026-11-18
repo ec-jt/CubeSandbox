@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/containerd/log"
@@ -187,15 +188,9 @@ func (s *SandboxImport) Memory(ctx context.Context) (string, string, error) {
 // empty shell s3lvol leaves behind, and mounting it reports a corrupt
 // filesystem several steps later.
 func (s *SandboxImport) importOne(ctx context.Context, name, role, uuid string) (string, error) {
-	if IsS3MetadataBaseName(name) {
-		return "", fmt.Errorf("refusing to import %s onto the node-local s3 metadata base", role)
-	}
-	store, err := requireS3Cow()
+	store, err := s.importStore(name, role)
 	if err != nil {
 		return "", err
-	}
-	if store == nil {
-		return "", fmt.Errorf("s3 cow store is not initialized")
 	}
 	// Acquire the COMPLETE committed set before any import, activation, mount,
 	// or metadata read. Service calls reuse a trusted request-scoped attempt;
@@ -204,28 +199,8 @@ func (s *SandboxImport) importOne(ctx context.Context, name, role, uuid string) 
 	if _, err := s.acquireRemoteRestoreRetention(ctx, store); err != nil {
 		return "", fmt.Errorf("protect cross-node restore before %s use: %w", role, err)
 	}
-	importer, ok := store.engine.(cowVolumeImporter)
-	if !ok || importer == nil {
-		return "", fmt.Errorf("cubecow engine cannot import %s %s", role, name)
-	}
-	info, err := importWithRetry(ctx, store, importer, name, role, uuid)
-	if err != nil {
+	if err := s.materialize(ctx, store, name, role, uuid, importPrefetchTimeout); err != nil {
 		return "", err
-	}
-	if err := requireImportedOrigin(info, name, uuid); err != nil {
-		return "", fmt.Errorf("refuse imported %s %s: %w", role, name, err)
-	}
-	// B19: the volume must not be used while its reads still go to the
-	// export. Wait for the whole-chunk prefetch and decouple to finish before
-	// activating it, so the metadata mount and the VM only ever read local
-	// data. A timeout or prefetch error fails the Create; the B18 rollback
-	// releases what was imported.
-	statuser, ok := store.engine.(cowImportStatuser)
-	if !ok {
-		return "", fmt.Errorf("cubecow engine cannot report import status of %s %s", role, name)
-	}
-	if err := waitImportPrefetch(ctx, statuser, name, role, importPrefetchTimeout); err != nil {
-		return "", fmt.Errorf("imported %s %s is not local: %w", role, name, err)
 	}
 	if _, err := store.engine.ActivateVolume(name); err != nil && !isCowSemantic(err, cubecow.SemAlreadyExists) {
 		return "", fmt.Errorf("activate imported %s %s: %w", role, name, err)
@@ -235,6 +210,179 @@ func (s *SandboxImport) importOne(ctx context.Context, name, role, uuid string) 
 		return "", fmt.Errorf("resolve imported %s %s: %w", role, name, err)
 	}
 	return dev, nil
+}
+
+func (s *SandboxImport) importStore(name, role string) (*S3Cow, error) {
+	if IsS3MetadataBaseName(name) {
+		return nil, fmt.Errorf("refusing to import %s onto the node-local s3 metadata base", role)
+	}
+	store, err := requireS3Cow()
+	if err != nil {
+		return nil, err
+	}
+	if store == nil {
+		return nil, fmt.Errorf("s3 cow store is not initialized")
+	}
+	return store, nil
+}
+
+// materialize imports uuid as name (or adopts an earlier import of it),
+// proves the native origin, and waits until the volume no longer reads
+// through to the export. It never activates the volume.
+//
+// B19: the volume must not be used while its reads still go to the export.
+// Waiting for the whole-chunk prefetch and decouple before activation means
+// the metadata mount and the VM only ever read local data. A timeout or a
+// prefetch error fails the Create; the B18 rollback releases what was
+// imported. The wait ends at the earlier of importPrefetchTimeout and the
+// deadline of ctx, so the restore-wide deadline set by PrefetchAll bounds it.
+// wait is the per-disk bound.
+func (s *SandboxImport) materialize(ctx context.Context, store *S3Cow, name, role, uuid string,
+	wait time.Duration) error {
+	importer, ok := store.engine.(cowVolumeImporter)
+	if !ok || importer == nil {
+		return fmt.Errorf("cubecow engine cannot import %s %s", role, name)
+	}
+	info, err := importWithRetry(ctx, store, importer, name, role, uuid)
+	if err != nil {
+		return err
+	}
+	if err := requireImportedOrigin(info, name, uuid); err != nil {
+		return fmt.Errorf("refuse imported %s %s: %w", role, name, err)
+	}
+	statuser, ok := store.engine.(cowImportStatuser)
+	if !ok {
+		return fmt.Errorf("cubecow engine cannot report import status of %s %s", role, name)
+	}
+	if err := waitImportPrefetch(ctx, statuser, name, role, wait); err != nil {
+		return fmt.Errorf("imported %s %s is not local: %w", role, name, err)
+	}
+	return nil
+}
+
+// importRestoreDeadline bounds the whole import phase of one cross-node
+// restore: every disk's manifest import, template base install and
+// whole-chunk prefetch together. It must stay below the cube-api route budget
+// for a resume (CUBE_API_PAUSE_RESUME_TIMEOUT_SECS, 360 s) and the Master
+// resume lock (CUBE_MASTER_RESUME_LOCK_TTL_SECS, 420 s), leaving room for the
+// VM restore that follows. Set from import_restore_deadline in the storage
+// config.
+var importRestoreDeadline = defaultImportRestoreDeadline
+
+// importJob is one disk a cross-node restore owes.
+type importJob struct {
+	name, role, uuid string
+	baseRole         string
+	baseUUID         string
+}
+
+func (s *SandboxImport) importJobs() ([]importJob, error) {
+	if s == nil || s.UUIDs == nil {
+		return nil, fmt.Errorf("cross-node restore carries no export set")
+	}
+	u := s.UUIDs
+	if strings.TrimSpace(u.Metadata) == "" {
+		return nil, fmt.Errorf("cross-node restore of sandbox %s carries no metadata export", s.SandboxID)
+	}
+	if strings.TrimSpace(u.Rootfs) == "" {
+		return nil, fmt.Errorf("cross-node restore of sandbox %s carries no rootfs export", s.SandboxID)
+	}
+	jobs := []importJob{
+		{SandboxRootfsName(s.SandboxID, 0), "rootfs", strings.TrimSpace(u.Rootfs), TemplateBaseRoleRootfs, u.RootfsBase},
+	}
+	if m := strings.TrimSpace(u.Memory); m != "" {
+		jobs = append(jobs, importJob{SandboxMemoryName(s.SandboxID), "memory", m, TemplateBaseRoleMemory, u.MemoryBase})
+	}
+	jobs = append(jobs, importJob{S3MetadataVolumeName(s.SandboxID), "metadata", strings.TrimSpace(u.Metadata),
+		TemplateBaseRoleMetadata, u.MetadataBase})
+	return jobs, nil
+}
+
+// PrefetchAll imports every disk of the restore at once and waits until all
+// of them are local, under one deadline (importRestoreDeadline).
+//
+// The disks used to be imported one after another, as each create step got
+// to it, and each wait had its own 300 s budget: a slow S3 made a resume fail
+// with a 500 at 302-322 s on the second disk while the first had long been
+// done. Running them together lets s3lvol share its per-lvstore prefetch
+// budget across the three, and the single deadline makes the whole phase
+// end before cube-api gives up on the request.
+//
+// Nothing is activated here. The later per-disk calls (EnsureMetadata,
+// Rootfs, Memory) adopt these imports, find the prefetch done, and only
+// activate and mount. The first failure cancels the other waits; the B18
+// rollback releases whatever was imported.
+func (s *SandboxImport) PrefetchAll(ctx context.Context) error {
+	jobs, err := s.importJobs()
+	if err != nil {
+		return err
+	}
+	store, err := s.importStore(jobs[0].name, jobs[0].role)
+	if err != nil {
+		return err
+	}
+	if _, err := s.acquireRemoteRestoreRetention(ctx, store); err != nil {
+		return fmt.Errorf("protect cross-node restore before import: %w", err)
+	}
+	deadline := importRestoreDeadline
+	if deadline <= 0 {
+		deadline = defaultImportRestoreDeadline
+	}
+	ctx, cancel := context.WithTimeout(ctx, deadline)
+	defer cancel()
+
+	start := time.Now()
+	errs := make([]error, len(jobs))
+	var wg sync.WaitGroup
+	for i := range jobs {
+		j := jobs[i]
+		if _, err := s.importStore(j.name, j.role); err != nil {
+			return err
+		}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			var err error
+			if err = ensureDeltaBase(ctx, s.UUIDs.TemplateID, j.baseRole, j.baseUUID); err != nil {
+				err = fmt.Errorf("cross-node restore of sandbox %s: %s: %w", s.SandboxID, j.role, err)
+			} else {
+				// The restore-wide deadline is the only bound here; the
+				// per-disk importPrefetchTimeout is for callers that wait
+				// on one disk alone.
+				err = s.materialize(ctx, store, j.name, j.role, j.uuid, deadline)
+			}
+			if err != nil {
+				errs[i] = err
+				cancel()
+			}
+		}()
+	}
+	wg.Wait()
+	if err := firstImportError(errs); err != nil {
+		return fmt.Errorf("cross-node restore of sandbox %s: import phase failed after %s (deadline %s): %w",
+			s.SandboxID, time.Since(start).Round(time.Millisecond), deadline, err)
+	}
+	log.G(ctx).Infof("cross-node restore of sandbox %s: %d disk(s) local in %s",
+		s.SandboxID, len(jobs), time.Since(start).Round(time.Millisecond))
+	return nil
+}
+
+// firstImportError prefers the error that caused the cancellation over the
+// "context canceled" the other waits report because of it.
+func firstImportError(errs []error) error {
+	var fallback error
+	for _, err := range errs {
+		if err == nil {
+			continue
+		}
+		if !errors.Is(err, context.Canceled) {
+			return err
+		}
+		if fallback == nil {
+			fallback = err
+		}
+	}
+	return fallback
 }
 
 // ReleaseCrossNodeSandboxImports deletes the disks a cross-node restore

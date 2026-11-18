@@ -7,6 +7,7 @@ package storage
 import (
 	"context"
 	"errors"
+	"sync"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -16,6 +17,9 @@ import (
 )
 
 type fakeCowEngine struct {
+	// mu serializes the calls a parallel cross-node import makes
+	// (GetVolumeInfo, ImportLvol, ImportStatus).
+	mu                sync.Mutex
 	createVolumePath  string
 	createVolumeErr   error
 	createVolumes     []string
@@ -66,6 +70,8 @@ type fakeCowEngine struct {
 // ImportStatus answers rcow_import_status. Without a scripted reply the
 // import is reported done, which is what every pre-B19 test expects.
 func (f *fakeCowEngine) ImportStatus(name string) (string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.importStatusCalls = append(f.importStatusCalls, name)
 	if f.importStatusFn != nil {
 		return f.importStatusFn(name, len(f.importStatusCalls))
@@ -74,6 +80,8 @@ func (f *fakeCowEngine) ImportStatus(name string) (string, error) {
 }
 
 func (f *fakeCowEngine) ImportLvol(name, remoteUUID string) (string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.importedLvols = append(f.importedLvols, [2]string{name, remoteUUID})
 	if len(f.importErrQueue) > 0 {
 		err := f.importErrQueue[0]
@@ -273,6 +281,8 @@ func (f *fakeCowEngine) ResizeVolume(name string, newSizeBytes uint64) (uint64, 
 }
 
 func (f *fakeCowEngine) GetVolumeInfo(name string) (*cubecow.Volume, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	if f.getVolumeInfoErr != nil {
 		return nil, f.getVolumeInfoErr
 	}

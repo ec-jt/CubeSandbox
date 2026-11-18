@@ -45,9 +45,10 @@ func isCrossNodeRestore(ann map[string]string) bool {
 // the same id off the request. Resume already carries one, since it restores
 // a sandbox that keeps its identity.
 //
-// The rootfs and memory are left to the storage plugin, which imports them
-// under the same sandbox-private naming once the create is under way, so a
-// create that dies halfway leaves only disks destroy already knows about.
+// The rootfs and memory are imported here too, in parallel with the metadata
+// disk (PrefetchAll), but only activated by the storage plugin once the
+// create is under way. They are named for the sandbox, so a create that dies
+// halfway leaves only disks the B18 rollback and destroy already know about.
 func prepareCrossNodeRestore(ctx context.Context, req *cubebox.RunCubeSandboxRequest) error {
 	if req == nil {
 		return nil
@@ -77,6 +78,12 @@ func prepareCrossNodeRestore(ctx context.Context, req *cubebox.RunCubeSandboxReq
 	imp := storage.CrossNodeSandboxImport(req.GetAnnotations())
 	if imp == nil {
 		return fmt.Errorf("cross-node restore of %s is incomplete", sandboxID)
+	}
+	// Import every disk the restore owes at once, under one deadline, before
+	// any of them is activated. The steps below and the storage plugin then
+	// only adopt, activate and mount what is already local.
+	if err := imp.PrefetchAll(ctx); err != nil {
+		return fmt.Errorf("import disks for cross-node restore of %s: %w", sandboxID, err)
 	}
 	dir, err := imp.EnsureMetadata(ctx)
 	if err != nil {

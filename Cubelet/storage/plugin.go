@@ -115,6 +115,13 @@ type Config struct {
 	// before using it (B19). Default 300s.
 	ImportPrefetchTimeout tomlext.Duration `toml:"import_prefetch_timeout"`
 
+	// ImportRestoreDeadline bounds the whole import phase of one cross-node
+	// restore: every disk is imported and prefetched in parallel and all
+	// must be local by then. Default 330s, below cube-api's 360s resume
+	// route budget (CUBE_API_PAUSE_RESUME_TIMEOUT_SECS) and the Master's
+	// 420s resume lock (CUBE_MASTER_RESUME_LOCK_TTL_SECS).
+	ImportRestoreDeadline tomlext.Duration `toml:"import_restore_deadline"`
+
 	// ImportedMetadataMountTimeout is the mount timeout for the metadata
 	// disk a cross-node restore imported, used instead of cmd_timeout
 	// (B19). Default 120s.

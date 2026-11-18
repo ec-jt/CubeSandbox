@@ -34,6 +34,10 @@ import (
 
 const (
 	defaultImportPrefetchTimeout = 300 * time.Second
+	// defaultImportRestoreDeadline bounds all imports of one cross-node
+	// restore together. Below cube-api's 360 s resume route budget and the
+	// Master's 420 s resume lock.
+	defaultImportRestoreDeadline = 330 * time.Second
 	defaultImportPrefetchPoll    = 500 * time.Millisecond
 	importPrefetchProgressEvery  = 5 * time.Second
 	defaultImportedMountTimeout  = 120 * time.Second
@@ -180,6 +184,11 @@ func applyImportTimeouts(cfg *Config) error {
 		return fmt.Errorf("import_prefetch_timeout must be non-negative, got %v", d)
 	} else if d > 0 {
 		importPrefetchTimeout = d
+	}
+	if d := tomlext.ToStdTime(cfg.ImportRestoreDeadline); d < 0 {
+		return fmt.Errorf("import_restore_deadline must be non-negative, got %v", d)
+	} else if d > 0 {
+		importRestoreDeadline = d
 	}
 	if d := tomlext.ToStdTime(cfg.ImportedMetadataMountTimeout); d < 0 {
 		return fmt.Errorf("imported_metadata_mount_timeout must be non-negative, got %v", d)
