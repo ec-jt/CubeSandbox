@@ -152,6 +152,9 @@ func requireS3Cow() (*S3Cow, error) {
 	if localStorage == nil || localStorage.s3CowManager == nil {
 		return nil, ErrS3NotReady
 	}
+	if starting, _ := s3lvolStarting(); starting {
+		return nil, ErrS3NotReady
+	}
 	store, ok := localStorage.s3CowManager.(*S3Cow)
 	if !ok || store == nil {
 		return nil, fmt.Errorf("s3 cow store is not *S3Cow")

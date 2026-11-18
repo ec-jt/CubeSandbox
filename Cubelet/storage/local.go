@@ -1330,6 +1330,12 @@ func (l *local) storeForBackend(backend string) (cow.Store, error) {
 	switch normalized {
 	case cow.BackendS3:
 		if l.s3CowManager != nil {
+			// s3lvol restarted under this Cubelet: fail fast with
+			// ErrS3NotReady until its start is done rather than race
+			// the registry replay. The handle reconnects on its own.
+			if starting, _ := s3lvolStarting(); starting {
+				return nil, ErrS3NotReady
+			}
 			return l.s3CowManager, nil
 		}
 		if l.config == nil || !l.config.s3lvolConfigured() {

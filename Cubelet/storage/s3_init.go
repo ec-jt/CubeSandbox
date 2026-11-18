@@ -17,6 +17,10 @@ import (
 // s3InitRetryInterval is the pause between failed S3 init attempts.
 var s3InitRetryInterval = 5 * time.Second
 
+// s3InitStartingPoll is how often the init loop looks again while s3lvol is
+// starting. Retries forever: Cubelet never gives up on s3lvol, it only waits.
+var s3InitStartingPoll = 2 * time.Second
+
 // ErrS3NotReady is returned for backend=s3 requests while the S3 cubecow
 // handle and metadata base are still initializing (or retrying).
 var ErrS3NotReady = errors.New("s3 storage is not ready (initializing)")
@@ -70,18 +74,35 @@ func (l *local) stopS3CowInitLoop() {
 
 func (l *local) runS3CowInitLoop(ctx context.Context) {
 	start := time.Now()
+	failures := 0
 	for attempt := 1; ; attempt++ {
 		if ctx.Err() != nil {
 			CubeLog.Warnf("s3 cubecow init loop stopped before attempt %d: %v", attempt, ctx.Err())
 			return
 		}
-		CubeLog.Infof("s3 cubecow init attempt %d", attempt)
-		if err := l.tryS3CowInitOnce(ctx); err != nil {
-			CubeLog.Errorf("s3 cubecow init attempt %d fail (retry in %s): %v", attempt, s3InitRetryInterval, err)
+		// Do not touch s3lvol while it is starting: an RPC in that window
+		// reads an active registry that is still being replayed.
+		if starting, since := s3lvolStarting(); starting {
+			if attempt == 1 || attempt%10 == 0 {
+				CubeLog.Warnf("s3 cubecow init: s3lvol is starting (for %s); waiting",
+					time.Since(since).Round(time.Second))
+			}
 			select {
 			case <-ctx.Done():
 				return
-			case <-time.After(s3InitRetryInterval):
+			case <-time.After(s3InitStartingPoll):
+			}
+			continue
+		}
+		CubeLog.Infof("s3 cubecow init attempt %d", attempt)
+		if err := l.tryS3CowInitOnce(ctx); err != nil {
+			failures++
+			wait := s3InitBackoff(failures)
+			CubeLog.Errorf("s3 cubecow init attempt %d fail (retry in %s): %v", attempt, wait, err)
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(wait):
 			}
 			continue
 		}

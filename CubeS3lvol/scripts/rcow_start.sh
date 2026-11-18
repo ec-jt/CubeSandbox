@@ -128,6 +128,7 @@ clears the marker this pid leaves behind"
 
 bail()
 {
+	rm -f "${RCOW_STARTING_FILE}"
 	rcow_err "$*"
 	rcow_log_tail 30
 
@@ -227,6 +228,13 @@ fi
 # Only now that nothing is running can these be assumed dead rather than in use.
 rm -f "${RCOW_RPC_SOCK}" "${RCOW_RPC_SOCK}.lock" "/var/tmp/spdk_cpu_lock_"* \
 	"${RCOW_PIDFILE}"
+
+# From here until "up", Cubelet keeps its hands off (see RCOW_STARTING_FILE).
+echo "$$" >"${RCOW_STARTING_FILE}" ||
+	rcow_die "cannot write ${RCOW_STARTING_FILE}"
+# Every way out (bail, rcow_die, a signal, "up") drops it. A file left by a
+# killed start names a dead pid, which Cubelet ignores.
+trap 'rm -f "${RCOW_STARTING_FILE}"' EXIT
 
 rcow_load_credentials ||
 	rcow_die "could not read access_key_id/secret_access_key from ${RCOW_S3_CFG}"
@@ -498,6 +506,7 @@ fi
 
 # ==========================================================================
 rcow_step "up"
+rm -f "${RCOW_STARTING_FILE}"
 
 rcow_log "pid ${TGT_PID}   rpc ${RCOW_RPC_SOCK}   log ${RCOW_LOG}"
 rcow_log "subsystems ${RCOW_NQN_PREFIX}00..$(printf '%02d' $((RCOW_NUM_SUBSYS - 1))) \

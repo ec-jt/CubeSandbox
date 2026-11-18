@@ -293,6 +293,20 @@ RCOW_NO_HUGE="${RCOW_NO_HUGE:-1}"
 RCOW_RUN_DIR="${RCOW_RUN_DIR:-/var/tmp/rcow}"
 RCOW_PIDFILE="${RCOW_PIDFILE:-${RCOW_RUN_DIR}/s3lvol_tgt.pid}"
 
+# Present (holding the pid of the rcow_start.sh that wrote it) from the moment
+# a start begins until the target is fully up: lvstore attached, every recorded
+# namespace back, listeners and the initiator connected. Cubelet does not touch
+# s3lvol while it exists and names a live process, so nothing it does can race
+# the attach or the registry replay. Absent on targets that predate it, which
+# Cubelet takes as ready.
+RCOW_STARTING_FILE="${RCOW_STARTING_FILE:-${RCOW_RUN_DIR}/s3lvol.starting}"
+
+# Seconds between kernel reconnect attempts of an NVMe/TCP controller whose
+# target went away. The kernel default is 10; after a restart the target comes
+# back within seconds of adding listeners, and every second of delay is a
+# second of I/O blocked in mounted filesystems.
+RCOW_RECONNECT_DELAY="${RCOW_RECONNECT_DELAY:-2}"
+
 # Log directory separate from the run directory: the pid lives in a tmpfs location
 # and the log is persistent under /data.
 RCOW_LOG_DIR="${RCOW_LOG_DIR:-/data/log/rcow}"
@@ -1058,6 +1072,7 @@ rcow_connect_all()
 		fi
 		if nvme connect -t tcp -a "${RCOW_LISTEN_ADDR}" \
 				-s "${RCOW_LISTEN_PORT}" -n "${nqn}" \
+				-c "${RCOW_RECONNECT_DELAY}" \
 				-i "${RCOW_IO_QUEUES}" >/dev/null 2>&1; then
 			connected=$((connected + 1))
 		else
@@ -1066,9 +1081,30 @@ rcow_connect_all()
 		fi
 	done
 
+	rcow_set_reconnect_delay
+
 	rcow_log "initiator: ${connected} connected, ${already} already up, \
 ${failed} failed (${RCOW_IO_QUEUES} io queues each)"
 	[ "${failed}" -eq 0 ]
+}
+
+# Controllers connected by an older start keep the kernel default (10 s). The
+# attribute is writable, so bring them to RCOW_RECONNECT_DELAY too. Best effort.
+rcow_set_reconnect_delay()
+{
+	local c nqn n=0
+
+	for c in /sys/class/nvme/nvme*; do
+		[ -r "${c}/subsysnqn" ] || continue
+		nqn="$(cat "${c}/subsysnqn" 2>/dev/null)"
+		case "${nqn}" in "${RCOW_NQN_PREFIX}"*) ;; *) continue ;; esac
+		[ -w "${c}/reconnect_delay" ] || continue
+		[ "$(cat "${c}/reconnect_delay" 2>/dev/null)" = "${RCOW_RECONNECT_DELAY}" ] && continue
+		echo "${RCOW_RECONNECT_DELAY}" >"${c}/reconnect_delay" 2>/dev/null && n=$((n + 1))
+	done
+	[ "${n}" -eq 0 ] || rcow_log "initiator: reconnect_delay set to \
+${RCOW_RECONNECT_DELAY}s on ${n} existing controller(s)"
+	return 0
 }
 
 rcow_disconnect_all()
