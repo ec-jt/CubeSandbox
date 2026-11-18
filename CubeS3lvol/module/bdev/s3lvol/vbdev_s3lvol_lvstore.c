@@ -3241,13 +3241,25 @@ lvs_md_warm_sb_read(struct spdk_io_channel *channel, void *cb_arg, int bserrno)
 	}
 	bytes = lvs_md_region_bytes(w->sb);
 	if (bytes == 0) {
+		const uint8_t *b = w->sb;
+
 		/* A fresh lvstore has no super block yet; nothing to warm. */
+		SPDK_NOTICELOG("lvstore '%s': metadata warm-up skipped: no blobstore "
+			       "super block at offset 0 (%02x%02x%02x%02x%02x%02x%02x%02x)\n",
+			       lvs->name, b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]);
 		lvs_md_warm_finish(w);
 		return;
 	}
+	SPDK_NOTICELOG("lvstore '%s': metadata warm-up of %" PRIu64 " KiB\n",
+		       lvs->name, bytes >> 10);
 	n = spdk_divide_round_up(bytes, chunk_size);
-	if (n > 65536) {
-		/* 64 GiB of metadata is not a real blobstore; do not trust it. */
+	/* md_len is sized for the whole 16 TiB device (one page per cluster),
+	 * so this is typically ~64 Ki chunks; almost all of them are unmapped
+	 * and cost nothing (s3_bs_dev_warm counts them as holes without a
+	 * GET). The cap only rejects a super block that cannot be real. */
+	if (n > (1u << 22)) {
+		SPDK_NOTICELOG("lvstore '%s': metadata warm-up skipped: region of %"
+			       PRIu64 " chunk(s) is implausible\n", lvs->name, n);
 		lvs_md_warm_finish(w);
 		return;
 	}
@@ -3262,10 +3274,8 @@ lvs_md_warm_sb_read(struct spdk_io_channel *channel, void *cb_arg, int bserrno)
 	rc = s3_bs_dev_warm(lvs->bs_dev, chunks, n, 0, lvs_md_warm_done, w);
 	free(chunks);   /* copied by s3_bs_dev_warm */
 	if (rc != 0) {
-		if (rc != -ENOTSUP) {
-			SPDK_NOTICELOG("lvstore '%s': metadata warm-up not started: %s\n",
-				       lvs->name, spdk_strerror(-rc));
-		}
+		SPDK_NOTICELOG("lvstore '%s': metadata warm-up not started: %s\n",
+			       lvs->name, spdk_strerror(-rc));
 		lvs_md_warm_finish(w);
 	}
 }
@@ -3278,6 +3288,7 @@ lvs_attach_warm_md(struct lvs_setup_ctx *ctx)
 	struct lvs_md_warm *w;
 
 	if ((env && strcmp(env, "0") == 0) || !dev) {
+		SPDK_NOTICELOG("lvstore '%s': metadata warm-up off\n", ctx->lvs->name);
 		lvs_attach_load_blobstore(ctx);
 		return;
 	}
@@ -3287,6 +3298,8 @@ lvs_attach_warm_md(struct lvs_setup_ctx *ctx)
 		w->ch = w->sb ? dev->create_channel(dev) : NULL;
 	}
 	if (!w || !w->ch) {
+		SPDK_NOTICELOG("lvstore '%s': metadata warm-up skipped: no channel\n",
+			       ctx->lvs->name);
 		if (w) {
 			spdk_dma_free(w->sb);
 			free(w);
