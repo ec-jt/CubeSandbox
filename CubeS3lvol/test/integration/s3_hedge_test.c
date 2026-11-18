@@ -820,7 +820,164 @@ test_retry(struct s3_export_manifest *m)
 	s3_export_prefetcher_destroy(pf);
 	dev->destroy(dev);
 	poll_some(50);
+
+	/* A 64 KiB chunk object is one range at any S3LVOL_PACK_RANGE_MIB: the
+	 * tests above see exactly one GET per chunk. */
+	check_u64("64 KiB chunk with 1 MiB ranges is one range",
+		  s3_export_range_count(CHUNK_SIZE, 1u << 20), 1);
+	check_u64("16 MiB pack with 4 MiB ranges is four",
+		  s3_export_range_count(16u << 20, 4u << 20), 4);
 	setenv("S3LVOL_IMPORT_CHUNK_RETRIES", "5", 1);
+}
+
+/* Per-range hedge and per-range resume, on 4 MiB objects split into 1 MiB
+	* ranges. Uses the real s3_get_range_hedged against the gate-aware fake. */
+#define BIG_SIZE   (4u << 20)
+#define BIG_CHUNKS 2
+
+static void
+test_ranges(void)
+{
+	struct s3_export_manifest *m = NULL;
+	struct spdk_uuid u[BIG_CHUNKS];
+	struct spdk_bs_dev *dev = NULL;
+	struct s3_export_prefetcher *pf = NULL;
+	struct s3_export_prefetch_progress pg;
+	struct s3_export_bs_dev_stats st;
+	struct pf_seen seen = {0};
+	struct pf_done_arg done;
+	uint64_t chunks[1] = {0};
+	struct fake_req *r;
+	uint32_t i, n;
+	uint64_t t0;
+
+	if (s3_export_manifest_create(TEST_UUID, (uint64_t)BIG_CHUNKS * BIG_SIZE, BIG_SIZE,
+				      S3_EXPORT_LAYOUT_REF, &m) != 0) {
+		check_true("big manifest", false);
+		return;
+	}
+	m->generation = 1;
+	snprintf(m->src.prefix, sizeof(m->src.prefix), "%s", SRC_PREFIX);
+	snprintf(m->srcs[0].prefix, sizeof(m->srcs[0].prefix), "%s", SRC_PREFIX);
+	for (i = 0; i < BIG_CHUNKS; i++) {
+		uint8_t raw[16];
+
+		memset(raw, 0x70 + i, sizeof(raw));
+		memcpy(&u[i], raw, sizeof(u[i]));
+		s3_export_manifest_set_ref(m, i, &u[i], BIG_SIZE);
+	}
+	s3_export_manifest_seal(m);
+	setenv("S3LVOL_PACK_RANGE_MIB", "1", 1);
+	setenv("S3LVOL_IMPORT_CHUNK_RETRIES", "3", 1);
+	setenv("S3LVOL_IMPORT_RETRY_BASE_MS", "1", 1);
+	setenv("S3LVOL_IMPORT_RETRY_CAP_MS", "2", 1);
+
+	printf("\n[8c] ranged fetch: a range that aborts partway resumes alone\n");
+	hedge_env("0", "30", "4");
+	reset_fake();
+	s3_export_bs_dev_create((struct s3_client *)0x1, m, &dev);
+	s3_chunk_data_key(SRC_PREFIX, &u[0], g_flaky_key, sizeof(g_flaky_key));
+	g_flaky_left = 1;
+	g_flaky_partial = 300 * 1024;
+	s3_export_prefetcher_create(dev, chunks, 1, 1, pf_cb, &seen, &pf);
+	s3_export_prefetcher_pump(pf);
+	check_u64("four range GETs in flight at once", g_inflight, 4);
+	done.p = pf;
+	done.n = 1;
+	check_true("settles", poll_until(pf_settled, &done, 5000));
+	s3_export_prefetcher_get_progress(pf, &pg);
+	check_true("object fetched", pg.fetched == 1 && pg.status == 0);
+	check_u64("4 ranges + 1 resume", g_reqs, 5);
+	check_u64("the resume asks only for that range's tail",
+		  g_last_get_len, (1u << 20) - 300 * 1024);
+	check_u64("starting where it stopped", g_last_get_offset, 300 * 1024);
+	s3_export_bs_dev_get_stats(dev, &st);
+	check_u64("one ranged fetch", st.ranged_fetches, 1);
+	check_u64("one range retry", st.range_retries, 1);
+	check_u64("prefix kept", st.resumed_bytes, 300 * 1024);
+	{
+		struct read_arg ra;
+		uint8_t *out = calloc(1, CHUNK_SIZE);
+		struct spdk_io_channel *ch = dev->create_channel(dev);
+		uint32_t bl = dev->blocklen;
+
+		/* The first 64 KiB of the object straddle nothing, so read the
+		 * 64 KiB that crosses the resumed boundary at 300 KiB. */
+		memset(&ra, 0, sizeof(ra));
+		ra.args.cb_fn = read_arg_done;
+		ra.args.cb_arg = &ra;
+		ra.args.channel = ch;
+		dev->read(dev, ch, out, (280 * 1024) / bl, CHUNK_SIZE / bl, &ra.args);
+		poll_until(read_arg_settled, &ra, 5000);
+		check_true("bytes across the resume boundary are the object's",
+			   ra.done && ra.status == 0 && ({
+				   bool ok = true;
+				   uint64_t k;
+
+				   for (k = 0; k < CHUNK_SIZE && ok; k++) {
+					   ok = out[k] == obj_byte(g_flaky_key, 280 * 1024 + k);
+				   }
+				   ok;
+			   }));
+		dev->destroy_channel(dev, ch);
+		poll_some(10);
+		free(out);
+	}
+	s3_export_prefetcher_destroy(pf);
+	pf = NULL;
+	dev->destroy(dev);
+	poll_some(50);
+
+	printf("\n[8d] per-range hedge: one slow range is hedged, the others are not\n");
+	hedge_env("1", "20", "8");
+	reset_fake();
+	s3_export_bs_dev_create((struct s3_client *)0x1, m, &dev);
+	memset(&seen, 0, sizeof(seen));
+	s3_export_prefetcher_create(dev, chunks, 1, 1, pf_cb, &seen, &pf);
+	s3_export_prefetcher_pump(pf);
+	check_u64("four range GETs", g_reqs, 4);
+	/* Complete three ranges now; leave the third one (offset 2 MiB) slow. */
+	n = 0;
+	for (i = 0; i < 4; i++) {
+		r = fake_nth(n);
+		if (r && r->offset == 2u * (1u << 20)) {
+			n++;
+			continue;
+		}
+		if (r) {
+			fake_finish(r, 0);
+		}
+	}
+	poll_some(10);
+	t0 = now_ms();
+	while (g_reqs < 5 && now_ms() - t0 < 2000) {
+		poll_some(5);
+	}
+	check_u64("exactly one hedge, for the slow range", g_reqs, 5);
+	check_u64("of the same range", g_last_get_offset, 2u * (1u << 20));
+	check_u64("same length", g_last_get_len, 1u << 20);
+	/* The duplicate wins. */
+	r = fake_nth(1);
+	if (r) {
+		fake_finish(r, 0);
+	}
+	done.p = pf;
+	done.n = 1;
+	check_true("settles", poll_until(pf_settled, &done, 5000));
+	s3_export_prefetcher_get_progress(pf, &pg);
+	check_true("object fetched", pg.fetched == 1 && pg.status == 0);
+	s3_export_bs_dev_get_stats(dev, &st);
+	check_u64("one hedge issued", st.hedges_issued, 1);
+	check_u64("and it won", st.hedges_won, 1);
+	s3_export_prefetcher_destroy(pf);
+	dev->destroy(dev);
+	poll_some(50);
+	s3_export_manifest_unref(m);
+	unsetenv("S3LVOL_PACK_RANGE_MIB");
+	unsetenv("S3LVOL_IMPORT_RETRY_BASE_MS");
+	unsetenv("S3LVOL_IMPORT_RETRY_CAP_MS");
+	setenv("S3LVOL_IMPORT_CHUNK_RETRIES", "5", 1);
+	hedge_env("0", "30", "4");
 }
 
 struct two_arg {
@@ -943,6 +1100,7 @@ main(void)
 	if (m) {
 		test_retry(m);
 		test_two_volumes(m);
+		test_ranges();
 	}
 
 out:

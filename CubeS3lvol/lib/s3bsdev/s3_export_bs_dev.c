@@ -96,6 +96,11 @@
  *   Before this, one chunk whose GET stalled five times in a row (crt=2073,
  *   then the 60 s deadline) failed a 626-chunk import at chunk 157.
  *
+ *   An object larger than S3LVOL_PACK_RANGE_MIB (default 4 MiB; a 16 MiB pack)
+ *   is fetched as that many ranges in parallel, each one hedged, retried and
+ *   resumed on its own (struct export_range); the slot is filled when all of
+ *   them are. A stall costs one range, not the pack.
+ *
  *   === Shared prefetch budget ===
  *
  *   Each prefetcher bounds what it *holds* with its window. A budget, when one
@@ -120,6 +125,31 @@
 /* Demand-miss partition of the slot table. See the file comment. */
 #define EXPORT_MISS_SLOTS 16
 
+/* A slot's object is fetched as ranges of at most range_bytes each, every one
+ * its own hedged GET with its own retry and ranged resume, all in parallel.
+ * Before this, a 16 MiB pack was one GET: one stalled connection held the
+ * whole pack, and every disk read waiting on it, for as long as the stall
+ * lasted (56 s seen live). Now a stall costs one range, which its hedge or its
+ * retry replaces. S3LVOL_PACK_RANGE_MIB, 1..16, default 4. A plain 1 MiB chunk
+ * object is still a single GET. */
+#define EXPORT_RANGE_MIB_DEFAULT 4
+#define EXPORT_RANGE_MIB_MAX     16
+
+struct export_slot;
+
+struct export_range {
+	struct export_slot         *s;
+	uint32_t                    off;          /* within the object */
+	uint32_t                    len;
+	/* Bytes [off, off + have) are in buf: an earlier attempt of this range
+	 * delivered them before it failed (ranged retry). */
+	uint32_t                    have;
+	uint32_t                    retries;      /* retries done for this range */
+	uint32_t                    resumes;      /* progressing retries */
+	struct spdk_poller         *retry_poller;
+	struct s3_hedge_counters    hedge;        /* this range, all attempts */
+};
+
 enum export_slot_state {
 	EXPORT_SLOT_FREE = 0,
 	EXPORT_SLOT_FETCHING,
@@ -139,20 +169,19 @@ struct export_slot {
 	uint64_t                    chunk_index;
 	char                        key[S3_EXPORT_KEY_MAX];
 	uint64_t                    offset;       /* where in the object (packs) */
-	uint32_t                    object_len;   /* bytes the GET asked for */
-	/* Bytes [0, have) of the object are already in buf: an earlier attempt
-	 * of this fetch delivered them before it failed (ranged retry). */
-	uint32_t                    have;
-	uint32_t                    resumes;      /* progressing retries of this fetch */
+	uint32_t                    object_len;   /* bytes the fetch asks for */
 	uint8_t                    *buf;          /* buf_len bytes, kept for reuse */
 	uint32_t                    buf_len;
 	uint32_t                    pins;         /* prefetcher references */
 	uint64_t                    gen;          /* bumped on every reuse */
 	uint64_t                    lru;
-	/* Retry state of the fetch in progress (see the file comment). */
-	uint32_t                    retries;      /* retries done for this fetch */
-	struct spdk_poller         *retry_poller;
-	struct s3_hedge_counters    hedge;        /* this fetch, all attempts */
+	/* The fetch in progress: its ranges, how many have not finished for
+	 * good, and the first final failure (the slot fails once all have
+	 * finished; no range retries after another failed for good). */
+	struct export_range        *ranges;
+	uint32_t                    nranges;
+	uint32_t                    ranges_left;
+	int                         fail_status;
 	TAILQ_HEAD(, s3_export_chunk_io) waiters;
 	TAILQ_HEAD(, export_pf_wait)     pf_waiters;
 };
@@ -205,6 +234,7 @@ struct s3_export_dev {
 	uint32_t                   max_retries;
 	uint32_t                   retry_base_ms;
 	uint32_t                   retry_cap_ms;
+	uint32_t                   range_bytes;
 	unsigned int               rand_seed;
 	struct s3_export_bs_dev_stats stats;
 };
@@ -462,7 +492,6 @@ export_io_put(struct s3_export_io *io)
 static void export_chunk_read_done(void *cb_arg, uint64_t bytes_read, int status);
 static void export_pf_slot_done(struct export_pf_wait *w,
 				const struct export_fetch_result *res);
-static int export_slot_send(struct s3_export_dev *dev, struct export_slot *s);
 static void export_destroy_now(struct s3_export_dev *dev);
 
 /* ==========================================================================
@@ -527,10 +556,6 @@ export_slot_alloc(struct s3_export_dev *dev, bool prefetch_part, uint32_t window
 	victim->prefetch_part = prefetch_part;
 	victim->pins = 0;
 	victim->gen++;
-	victim->retries = 0;
-	victim->have = 0;
-	victim->resumes = 0;
-	memset(&victim->hedge, 0, sizeof(victim->hedge));
 	TAILQ_INIT(&victim->waiters);
 	TAILQ_INIT(&victim->pf_waiters);
 	return victim;
@@ -539,6 +564,7 @@ export_slot_alloc(struct s3_export_dev *dev, bool prefetch_part, uint32_t window
 static void
 export_slot_release_transient(struct export_slot *s)
 {
+	free(s->ranges);
 	free(s->buf);
 	free(s);
 }
@@ -604,106 +630,136 @@ export_retry_delay_ms(struct s3_export_dev *dev, uint32_t n)
 	return d / 2 + (uint64_t)rand_r(&dev->rand_seed) % (d / 2 + 1);
 }
 
-static void export_slot_fetch_done(void *cb_arg, uint64_t bytes_read, int status);
+static void export_range_done(void *cb_arg, uint64_t bytes_read, int status);
+static void export_slot_finish(struct export_slot *s, int status);
+static int export_range_send(struct s3_export_dev *dev, struct export_range *r);
 
 static int
-export_slot_retry_fire(void *arg)
+export_range_retry_fire(void *arg)
 {
-	struct export_slot *s = arg;
-	struct s3_export_dev *dev = s->dev;
+	struct export_range *r = arg;
+	struct s3_export_dev *dev = r->s->dev;
 	int rc;
 
-	spdk_poller_unregister(&s->retry_poller);
-	if (dev->destroy_pending) {
-		/* Whoever waited on this is gone or going; do not send more. */
-		export_slot_fetch_done(s, 0, -ECANCELED);
+	spdk_poller_unregister(&r->retry_poller);
+	if (dev->destroy_pending || r->s->fail_status != 0) {
+		/* Whoever waited on this is gone or going, or another range of
+		 * the same object failed for good: do not send more. */
+		export_range_done(r, 0, -ECANCELED);
 		return SPDK_POLLER_BUSY;
 	}
-	rc = export_slot_send(dev, s);
+	rc = export_range_send(dev, r);
 	if (rc != 0) {
 		/* Could not even submit: counts as this retry failing. */
-		export_slot_fetch_done(s, 0, rc);
+		export_range_done(r, 0, rc);
 	}
 	return SPDK_POLLER_BUSY;
 }
 
-/* A failed fetch that may be tried again: anything but a 404 (its own meaning,
- * see export_chunk_read_done) and a teardown cancel. */
+/* A failed range that may be tried again: anything but a 404 (its own
+ * meaning, see export_chunk_read_done) and a teardown cancel, while no other
+ * range of the object has failed for good. */
 static bool
-export_slot_should_retry(struct s3_export_dev *dev, struct export_slot *s, int status)
+export_range_should_retry(struct s3_export_dev *dev, struct export_range *r, int status)
 {
 	return status != 0 && status != -ENOENT && status != -ECANCELED &&
-	       !dev->destroy_pending && s->retries < dev->max_retries;
+	       !dev->destroy_pending && r->s->fail_status == 0 &&
+	       r->retries < dev->max_retries;
 }
 
+/* One range's GET attempt completed. Each range is independent: its own
+ * hedge, its own ranged resume (a failed attempt's in-order prefix is kept
+ * and only the rest asked for again), its own retry budget. The slot is done
+ * when every range is. */
 static void
-export_slot_fetch_done(void *cb_arg, uint64_t bytes_read, int status)
+export_range_done(void *cb_arg, uint64_t bytes_read, int status)
 {
-	struct export_slot *s = cb_arg;
+	struct export_range *r = cb_arg;
+	struct export_slot *s = r->s;
+	struct s3_export_dev *dev = s->dev;
+	bool progressed = false;
+
+	if (status == 0 && bytes_read != r->len - r->have) {
+		/* Same rule as a ranged read: a short answer is an error, never zeroes. */
+		SPDK_ERRLOG("Short read of export object '%s' [%u, +%u): asked for %u "
+			    "byte(s) from %u, got %" PRIu64 ". Refusing to treat the "
+			    "remainder as zeroes.\n", s->key, r->off, r->len,
+			    r->len - r->have, r->have, bytes_read);
+		status = -EIO;
+	} else if (status != 0 && bytes_read > 0 &&
+		   bytes_read < (uint64_t)(r->len - r->have)) {
+		/* Ranged retry: the failed GET left an in-order prefix of what it
+		 * asked for in buf (s3_get_range_hedged). The object is immutable,
+		 * so those bytes are final: keep them, and the retry asks only for
+		 * the rest of this range. */
+		r->have += (uint32_t)bytes_read;
+		dev->stats.ranged_resumes++;
+		dev->stats.resumed_bytes += bytes_read;
+		progressed = true;
+	}
+
+	if (export_range_should_retry(dev, r, status)) {
+		uint64_t delay = export_retry_delay_ms(dev, r->retries + 1);
+
+		/* An attempt that moved the range forward does not use up a retry
+		 * (up to 4x the retry budget of them, so a peer that trickles a
+		 * few bytes per attempt still ends). A stall that delivers nothing
+		 * spends one. */
+		if (progressed && r->resumes < 4 * dev->max_retries) {
+			r->resumes++;
+		} else {
+			r->retries++;
+		}
+		dev->stats.fetch_retries++;
+		dev->stats.range_retries++;
+		SPDK_WARNLOG("Export object '%s' range [%u, +%u) failed (%s); retry %u "
+			     "of %u in %" PRIu64 " ms, %u byte(s) kept, the other %u "
+			     "range(s) unaffected\n", s->key, r->off, r->len,
+			     spdk_strerror(-status), r->retries, dev->max_retries, delay,
+			     r->have, s->nranges - 1);
+		/* Still in flight as far as everyone is concerned. */
+		r->retry_poller = SPDK_POLLER_REGISTER(export_range_retry_fire, r,
+						       delay * 1000);
+		if (r->retry_poller) {
+			return;
+		}
+		SPDK_ERRLOG("Export object '%s': no poller for the retry\n", s->key);
+	}
+
+	dev->stats.hedges_issued += r->hedge.issued;
+	dev->stats.hedges_won += r->hedge.won;
+	if (status != 0 && s->fail_status == 0) {
+		s->fail_status = status;
+	}
+	assert(s->ranges_left > 0);
+	if (--s->ranges_left > 0) {
+		return;
+	}
+	export_slot_finish(s, s->fail_status);
+}
+
+/* Every range of the slot's fetch has finished for good. */
+static void
+export_slot_finish(struct export_slot *s, int status)
+{
 	struct s3_export_dev *dev = s->dev;
 	struct s3_export_chunk_io *cio, *ctmp;
 	struct export_pf_wait *w, *wtmp;
 	struct export_fetch_result res;
 	TAILQ_HEAD(, s3_export_chunk_io) waiters;
 	TAILQ_HEAD(, export_pf_wait) pf_waiters;
-	bool progressed = false;
-
-	if (status == 0 && bytes_read != s->object_len - s->have) {
-		/* Same rule as a ranged read: a short answer is an error, never zeroes. */
-		SPDK_ERRLOG("Short read of export chunk '%s': asked for %u byte(s) "
-			    "from %u, got %" PRIu64 ". Refusing to treat the remainder "
-			    "as zeroes.\n", s->key, s->object_len - s->have, s->have,
-			    bytes_read);
-		status = -EIO;
-	} else if (status != 0 && bytes_read > 0 &&
-		   bytes_read < (uint64_t)(s->object_len - s->have)) {
-		/* Ranged retry: the failed GET left an in-order prefix of what it
-		 * asked for in buf (s3_get_range_hedged). The object is immutable,
-		 * so those bytes are final: keep them, and the retry asks only for
-		 * the rest. A whole pack is many MiB; a stall near its end no longer
-		 * costs the whole download again. */
-		s->have += (uint32_t)bytes_read;
-		dev->stats.ranged_resumes++;
-		dev->stats.resumed_bytes += bytes_read;
-		progressed = true;
-	}
-
-	if (export_slot_should_retry(dev, s, status)) {
-		uint64_t delay = export_retry_delay_ms(dev, s->retries + 1);
-
-		/* An attempt that moved the fetch forward does not use up a retry
-		 * (up to 4x the retry budget of them, so a peer that trickles a
-		 * few bytes per attempt still ends). A stall that delivers nothing
-		 * spends one as before. */
-		if (progressed && s->resumes < 4 * dev->max_retries) {
-			s->resumes++;
-		} else {
-			s->retries++;
-		}
-		dev->stats.fetch_retries++;
-		SPDK_WARNLOG("Export chunk '%s' fetch failed (%s); retry %u of %u in "
-			     "%" PRIu64 " ms, %u of %u byte(s) kept\n", s->key,
-			     spdk_strerror(-status), s->retries, dev->max_retries, delay,
-			     s->have, s->object_len);
-		/* Still in flight as far as everyone is concerned: the readers and
-		 * the prefetcher keep waiting, and destroy keeps waiting for it. */
-		s->retry_poller = SPDK_POLLER_REGISTER(export_slot_retry_fire, s,
-						       delay * 1000);
-		if (s->retry_poller) {
-			return;
-		}
-		SPDK_ERRLOG("Export chunk '%s': no poller for the retry\n", s->key);
-	}
+	uint32_t i;
 
 	assert(dev->fetch_inflight > 0);
 	dev->fetch_inflight--;
-	dev->stats.hedges_issued += s->hedge.issued;
-	dev->stats.hedges_won += s->hedge.won;
+	memset(&res, 0, sizeof(res));
+	for (i = 0; i < s->nranges; i++) {
+		res.retries += s->ranges[i].retries;
+		res.hedges_issued += s->ranges[i].hedge.issued;
+		res.hedges_won += s->ranges[i].hedge.won;
+	}
 	res.status = status;
 	res.bytes = status == 0 ? s->object_len : 0;
-	res.retries = s->retries;
-	res.hedges_issued = s->hedge.issued;
-	res.hedges_won = s->hedge.won;
 
 	if (status == 0) {
 		s->state = EXPORT_SLOT_FILLED;
@@ -754,21 +810,21 @@ export_slot_fetch_done(void *cb_arg, uint64_t bytes_read, int status)
 	}
 }
 
-/* One GET attempt of a slot's object: the first one, or a retry. Hedged: the
- * key names an immutable object, so a duplicate is always equally good. */
+/* One GET attempt of one range: the first, or a retry. Hedged: the key names
+ * an immutable object, so a duplicate is always equally good. A retry after a
+ * partial answer asks only for the missing tail of this range; a hedge of it
+ * duplicates the same tail, never the whole object. */
 static int
-export_slot_send(struct s3_export_dev *dev, struct export_slot *s)
+export_range_send(struct s3_export_dev *dev, struct export_range *r)
 {
+	struct export_slot *s = r->s;
+	uint32_t want = r->len - r->have;
 	int rc;
-
-	uint32_t want = s->object_len - s->have;
 
 	dev->stats.whole_gets++;
 	dev->stats.get_bytes += want;
-	/* A retry after a partial answer asks only for the missing tail; a
-	 * hedge of it duplicates the same tail, never the whole object. */
-	rc = s3_get_range_hedged(dev->client, s->key, s->offset + s->have, want,
-				 s->buf + s->have, &s->hedge, export_slot_fetch_done, s);
+	rc = s3_get_range_hedged(dev->client, s->key, s->offset + r->off + r->have, want,
+				 s->buf + r->off + r->have, &r->hedge, export_range_done, r);
 	if (rc != 0) {
 		dev->stats.whole_gets--;
 		dev->stats.get_bytes -= want;
@@ -776,11 +832,25 @@ export_slot_send(struct s3_export_dev *dev, struct export_slot *s)
 	return rc;
 }
 
-/* Start the whole-object GET for a slot already set up with its key. */
+uint32_t
+s3_export_range_count(uint32_t len, uint32_t range_bytes)
+{
+	if (len == 0) {
+		return 1;
+	}
+	if (range_bytes == 0 || range_bytes >= len) {
+		return 1;
+	}
+	return (len + range_bytes - 1) / range_bytes;
+}
+
+/* Start the fetch of a slot already set up with its key: every range at once,
+ * each landing at its own offset of the slot buffer. */
 static int
 export_slot_start_fetch(struct s3_export_dev *dev, struct export_slot *s)
 {
-	int rc;
+	uint32_t n, i, sent = 0, rb;
+	int rc = 0;
 
 	if (!s->buf || s->buf_len < s->object_len) {
 		uint32_t want = spdk_max(s->object_len, dev->m->chunk_size);
@@ -793,20 +863,57 @@ export_slot_start_fetch(struct s3_export_dev *dev, struct export_slot *s)
 		}
 		s->buf_len = want;
 	}
+	n = s3_export_range_count(s->object_len, dev->range_bytes);
+	rb = n == 1 ? s->object_len : dev->range_bytes;
+	if (!s->ranges || s->nranges < n) {
+		free(s->ranges);
+		s->nranges = 0;
+		s->ranges = calloc(n, sizeof(*s->ranges));
+		if (!s->ranges) {
+			return -ENOMEM;
+		}
+	}
+	s->nranges = n;
+	for (i = 0; i < n; i++) {
+		struct export_range *r = &s->ranges[i];
+
+		memset(r, 0, sizeof(*r));
+		r->s = s;
+		r->off = i * rb;
+		r->len = spdk_min(rb, s->object_len - r->off);
+	}
+	s->ranges_left = n;
+	s->fail_status = 0;
 	s->state = EXPORT_SLOT_FETCHING;
-	s->retries = 0;
-	s->have = 0;
-	s->resumes = 0;
-	memset(&s->hedge, 0, sizeof(s->hedge));
 	dev->fetch_inflight++;
 	if (dev->fetch_inflight > dev->stats.peak_fetch_inflight) {
 		dev->stats.peak_fetch_inflight = dev->fetch_inflight;
 	}
-	rc = export_slot_send(dev, s);
-	if (rc != 0) {
+	if (n > 1) {
+		dev->stats.ranged_fetches++;
+	}
+	for (i = 0; i < n; i++) {
+		rc = export_range_send(dev, &s->ranges[i]);
+		if (rc != 0) {
+			break;
+		}
+		sent++;
+	}
+	if (sent == 0) {
 		dev->fetch_inflight--;
 		s->state = EXPORT_SLOT_FREE;
 		return rc;
+	}
+	if (sent < n) {
+		/* The ranges already in flight finish normally; the fetch then
+		 * fails with the submit error for the ones never sent. Their
+		 * completions may already have run, so finish here if none is
+		 * left. */
+		s->fail_status = rc;
+		s->ranges_left -= n - sent;
+		if (s->ranges_left == 0) {
+			export_slot_finish(s, rc);
+		}
 	}
 	return 0;
 }
@@ -1322,6 +1429,7 @@ export_io_device_unregistered(void *io_device)
 
 	for (i = 0; i < SPDK_COUNTOF(dev->slots); i++) {
 		free(dev->slots[i].buf);
+		free(dev->slots[i].ranges);
 	}
 	s3_export_manifest_unref(dev->m);
 	if (dev->client) {
@@ -1848,6 +1956,15 @@ s3_export_bs_dev_create(struct s3_client *client, struct s3_export_manifest *m,
 					   S3_EXPORT_RETRY_CAP_MS, 600000);
 	if (dev->retry_cap_ms < dev->retry_base_ms) {
 		dev->retry_cap_ms = dev->retry_base_ms;
+	}
+	{
+		uint32_t mib = export_env_u32("S3LVOL_PACK_RANGE_MIB",
+					      EXPORT_RANGE_MIB_DEFAULT, EXPORT_RANGE_MIB_MAX);
+
+		if (mib < 1) {
+			mib = 1;
+		}
+		dev->range_bytes = mib * 1024u * 1024u;
 	}
 	dev->rand_seed = (unsigned int)(uintptr_t)dev ^ (unsigned int)time(NULL);
 

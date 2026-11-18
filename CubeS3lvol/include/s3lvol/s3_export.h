@@ -1048,7 +1048,13 @@ struct s3_export_bs_dev_stats {
 	uint64_t hedges_won;          /* of which completed first */
 	uint64_t ranged_resumes;      /* retries that kept a failed GET's prefix */
 	uint64_t resumed_bytes;       /* bytes those retries did not fetch again */
+	uint64_t ranged_fetches;      /* objects fetched as more than one range */
+	uint64_t range_retries;       /* retries of a single range */
 };
+
+/** Ranges an object of \p len bytes is fetched in, at most \p range_bytes
+	* each (S3LVOL_PACK_RANGE_MIB); 1 when it fits in one. */
+uint32_t s3_export_range_count(uint32_t len, uint32_t range_bytes);
 
 /** True when \p bs_dev was built by s3_export_bs_dev_create(). */
 bool s3_export_bs_dev_is_export(const struct spdk_bs_dev *bs_dev);

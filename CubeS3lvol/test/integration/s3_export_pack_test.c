@@ -78,6 +78,14 @@ static bool     g_present[NUM_CHUNKS];
 static struct spdk_uuid g_uuids[NUM_CHUNKS];
 static struct s3_export_manifest *g_m;  /* where the fake looks up slots */
 static char     g_missing_pack[S3_EXPORT_KEY_MAX];
+/* Fail the next GET whose offset is this (UINT64_MAX: none), after writing
+ * g_fail_prefix bytes of it -- a stalled range that delivered a prefix. */
+static uint64_t g_fail_off = UINT64_MAX;
+static uint64_t g_fail_prefix;
+static uint32_t g_fail_left;
+#define MAX_SEEN 64
+static uint64_t g_seen_off[MAX_SEEN], g_seen_len[MAX_SEEN];
+static uint32_t g_nseen;
 static uint32_t g_gets, g_pack_gets, g_ref_gets;
 static uint64_t g_last_off, g_last_len;
 static char     g_deleted[64][S3_EXPORT_KEY_MAX];
@@ -146,6 +154,11 @@ s3_get_range(struct s3_client *client, const char *key, uint64_t offset,
 	}
 	g_last_off = offset;
 	g_last_len = len;
+	if (g_nseen < MAX_SEEN) {
+		g_seen_off[g_nseen] = offset;
+		g_seen_len[g_nseen] = len;
+		g_nseen++;
+	}
 	TAILQ_INSERT_TAIL(&g_pending, g, link);
 	return 0;
 }
@@ -168,14 +181,21 @@ fake_complete_all(void)
 		if (c < 0) {
 			status = -ENOENT;
 		} else {
+			uint64_t n = g->len;
+
+			if (g->offset == g_fail_off && g_fail_left > 0) {
+				g_fail_left--;
+				n = spdk_min(g_fail_prefix, g->len);
+				status = -ETIMEDOUT;
+			}
 			/* A range may span several slots of the pack. */
-			for (i = 0; i < g->len; i++) {
+			for (i = 0; i < n; i++) {
 				uint64_t p = g->offset + i;
 				int cc = pack_slot_chunk(g->key, p);
 
 				((uint8_t *)g->buf)[i] = cc < 0 ? 0 : obj_byte(cc, p % CHUNK_SIZE);
 			}
-			got = g->len;
+			got = n;
 		}
 		g->cb(g->cb_arg, got, status);
 		free(g);
@@ -402,9 +422,11 @@ main(void)
 	spdk_log_open(NULL);
 	printf("=== s3lvol pack export test (version 6) ===\n");
 
-	/* Exact GET counts: no hedges, no per-chunk retries. */
+	/* Exact GET counts: no hedges, no per-chunk retries, and (for [4]) one
+	 * range per pack: 4 MiB packs here, 4 MiB ranges. */
 	setenv("S3LVOL_S3_HEDGE", "0", 1);
 	setenv("S3LVOL_IMPORT_CHUNK_RETRIES", "0", 1);
+	setenv("S3LVOL_PACK_RANGE_MIB", "4", 1);
 	s3_hedge_config_load();
 
 	printf("\n[1] SPDK env and a thread\n");
@@ -582,6 +604,108 @@ main(void)
 	check_true("buffer is not zero-filled", r.buf[0] == 0xEE);
 	free(r.buf);
 	g_missing_pack[0] = '\0';
+
+	printf("\n[5b] ranged pack fetch: split, assembly, a failed range retried alone\n");
+	check_u64("range count 16 MiB / 4 MiB", s3_export_range_count(16u << 20, 4u << 20), 4);
+	check_u64("range count 1 MiB object is one", s3_export_range_count(1u << 20, 4u << 20), 1);
+	check_u64("range count rounds up", s3_export_range_count((9u << 20), 4u << 20), 3);
+	check_u64("range count with no size", s3_export_range_count(4u << 20, 0), 1);
+	dev->destroy_channel(dev, ch);
+	dev->destroy(dev);
+	poll_some(50);
+	ch = NULL;
+	dev = NULL;
+	/* 1 MiB ranges over 4 MiB packs: 4 ranges per pack, retries on. */
+	setenv("S3LVOL_PACK_RANGE_MIB", "1", 1);
+	setenv("S3LVOL_IMPORT_CHUNK_RETRIES", "3", 1);
+	setenv("S3LVOL_IMPORT_RETRY_BASE_MS", "1", 1);
+	setenv("S3LVOL_IMPORT_RETRY_CAP_MS", "1", 1);
+	rc = s3_export_bs_dev_create((struct s3_client *)0x1, p, &dev);
+	check_true("ranged export device", rc == 0 && dev != NULL);
+	if (rc != 0) {
+		goto out;
+	}
+	ch = dev->create_channel(dev);
+	g_gets = g_pack_gets = g_ref_gets = 0;
+	g_nseen = 0;
+	/* The range at pack offset 2 MiB stalls once after 300 KiB. */
+	g_fail_off = 2u * CHUNK_SIZE;
+	g_fail_prefix = 300 * 1024;
+	g_fail_left = 1;
+	/* Read own chunk 9 (pack 0, slot 2): its range is the one that fails. */
+	rd_start(dev, ch, &r, (uint64_t)9 * CHUNK_SIZE + BLOCK, 8 * BLOCK);
+	for (i = 0; i < 40 && !r.done; i++) {
+		poll_some(5);
+		fake_complete_all();
+		usleep(2000);
+		poll_some(5);
+	}
+	check_true("read completes after the retry", r.done && r.status == 0);
+	check_true("bytes assembled from the ranges are the chunk's",
+		   r.done && rd_matches(&r, 9, BLOCK, 8 * BLOCK));
+	check_u64("4 range GETs + 1 retry", g_gets, 5);
+	{
+		uint32_t k, at_fail = 0, others = 0;
+		bool sized = true;
+
+		for (k = 0; k < g_nseen; k++) {
+			if (g_seen_off[k] == 2u * CHUNK_SIZE) {
+				at_fail++;
+			} else {
+				others++;
+			}
+			sized = sized && g_seen_len[k] == CHUNK_SIZE;
+		}
+		check_true("every GET is exactly one 1 MiB range", sized);
+		/* This fake does not model the gate's prefix, so the retry asks
+		 * for the whole range again; s3_hedge_test [8c] covers the
+		 * ranged resume of a single range. */
+		check_u64("only the failed range was sent again", at_fail, 2);
+		check_u64("the other 3 ranges were sent once", others, 3);
+	}
+	free(r.buf);
+	/* Every chunk of pack 0 is in the slot now: another read costs nothing. */
+	g_gets = 0;
+	rd_start(dev, ch, &r, (uint64_t)3 * CHUNK_SIZE, 2 * BLOCK);
+	poll_some(10);
+	check_true("assembled slot serves the other chunks of the pack",
+		   g_gets == 0 && r.done && r.status == 0 && rd_matches(&r, 3, 0, 2 * BLOCK));
+	free(r.buf);
+	{
+		struct s3_export_bs_dev_stats st;
+
+		s3_export_bs_dev_get_stats(dev, &st);
+		check_u64("ranged_fetches counted", st.ranged_fetches, 1);
+		check_u64("one range retry", st.range_retries, 1);
+	}
+	/* A range that fails for good fails the read, after its own retries,
+	 * and nothing reads as zeroes. */
+	dev->destroy_channel(dev, ch);
+	dev->destroy(dev);
+	poll_some(50);
+	rc = s3_export_bs_dev_create((struct s3_client *)0x1, p, &dev);
+	ch = dev->create_channel(dev);
+	g_fail_off = 1u * CHUNK_SIZE;
+	g_fail_prefix = 0;
+	g_fail_left = 100;
+	g_gets = 0;
+	rd_start(dev, ch, &r, (uint64_t)6 * CHUNK_SIZE, BLOCK);
+	for (i = 0; i < 60 && !r.done; i++) {
+		poll_some(5);
+		fake_complete_all();
+		usleep(2000);
+		poll_some(5);
+	}
+	check_true("a range out of retries fails the read", r.done && r.status != 0);
+	check_true("failed read is not zero-filled", r.buf[0] == 0xEE);
+	check_u64("that range: 1 + 3 retries; the others once", g_gets, 4 + 3);
+	free(r.buf);
+	g_fail_off = UINT64_MAX;
+	g_fail_left = 0;
+	unsetenv("S3LVOL_IMPORT_RETRY_BASE_MS");
+	unsetenv("S3LVOL_IMPORT_RETRY_CAP_MS");
+	setenv("S3LVOL_IMPORT_CHUNK_RETRIES", "0", 1);
+	setenv("S3LVOL_PACK_RANGE_MIB", "4", 1);
 
 	printf("\n[6] pack GC\n");
 	g_ndeleted = 0;
