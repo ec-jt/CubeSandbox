@@ -1335,6 +1335,13 @@ ${failed_n} failed"
 	# for; one more activation per missing entry repairs it (the target
 	# re-attaches a recorded volume whose namespace is gone).
 	local missing name_only
+	if [ "${failed_n}" -gt 0 ]; then
+		# The failed entries are still in the plan, not in the registry the
+		# check reads; claiming "verified" here would be wrong.
+		rcow_err "${failed_n} volume(s) could not be restored; they are still \
+listed in ${plan} and will be retried by the next start or by rcow_recovery.sh"
+		return 1
+	fi
 	if ! missing="$(rcow_verify_namespaces)"; then
 		rcow_warn "after replay, recorded volume(s) have no live namespace; \
 re-activating:"
@@ -1354,12 +1361,6 @@ re-activating:"
 		fi
 	fi
 	rcow_log "replay verified: every recorded volume has its namespace"
-
-	if [ "${failed_n}" -gt 0 ]; then
-		rcow_err "${failed_n} volume(s) could not be restored; they are still \
-listed in ${plan} and will be retried by the next start or by rcow_recovery.sh"
-		return 1
-	fi
 	return 0
 }
 
