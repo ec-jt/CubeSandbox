@@ -35,6 +35,7 @@
 #include "spdk_internal/lvolstore.h"
 
 #include "s3lvol/s3_export.h"
+#include "s3lvol/s3_peer.h"
 
 #include "vbdev_s3lvol.h"
 #include "vbdev_s3lvol_json.h"
@@ -1064,7 +1065,13 @@ s3lvol_export_gc_packs(struct s3lvol_export *exp)
 	char *uuid;
 	int rc;
 
-	if (!exp || exp->pack_count == 0) {
+	if (!exp) {
+		return;
+	}
+	/* The local peer copies go with the export (s3_peer.h). Small blocking
+	 * unlinks, only on the release path. */
+	s3_peer_drop_export(exp->uuid_str);
+	if (exp->pack_count == 0) {
 		return;
 	}
 	uuid = strdup(exp->uuid_str);

@@ -90,6 +90,7 @@
 #include "s3lvol/s3_recovery.h"
 #include "s3lvol/s3_types.h"
 #include "s3lvol/s3_wal.h"
+#include "s3lvol/s3_hedge.h"
 
 static int g_pass, g_fail;
 
@@ -596,6 +597,59 @@ s3_get_range(struct s3_client *client, const char *key, uint64_t offset,
 	return 0;
 }
 
+/* Gate fakes (s3_deadline.c / s3_client_aws.c are not linked). A gated GET is
+ * parked like any other; abandon only records the request, as the real one
+ * asks CRT to cancel and the completion still runs once. */
+#define MAXGATE 64
+struct s3_gate { bool abandoned; bool freed; };
+static struct s3_gate g_gates[MAXGATE];
+static uint32_t g_ngates, g_gates_abandoned, g_gates_freed;
+static struct s3_gate *g_get_gate[MAXOP];
+
+struct s3_gate *
+s3_gate_new(void)
+{
+	REQUIRE(g_ngates < MAXGATE);
+	memset(&g_gates[g_ngates], 0, sizeof(g_gates[0]));
+	return &g_gates[g_ngates++];
+}
+
+void
+s3_gate_free(struct s3_gate *g)
+{
+	if (g) {
+		REQUIRE(!g->freed);
+		g->freed = true;
+		g_gates_freed++;
+	}
+}
+
+void
+s3_gate_abandon(struct s3_gate *g)
+{
+	if (g && !g->abandoned) {
+		REQUIRE(!g->freed);
+		g->abandoned = true;
+		g_gates_abandoned++;
+	}
+}
+
+bool s3_gate_is_abandoned(struct s3_gate *g) { return g && g->abandoned; }
+
+int
+s3_get_range_gated(struct s3_client *client, const char *key, uint64_t offset,
+		   uint64_t len, void *buf, struct s3_gate *gate, s3_get_cb cb,
+		   void *cb_arg)
+{
+	uint32_t i = g_get.n;
+	int rc = s3_get_range(client, key, offset, len, buf, cb, cb_arg);
+
+	if (rc == 0) {
+		g_get_gate[i] = gate;
+	}
+	return rc;
+}
+
 static void
 get_complete(uint32_t i, int status)
 {
@@ -618,6 +672,17 @@ s3_put(struct s3_client *client, const char *key, struct iovec *iov,
 	g_put.pending[g_put.n] = true;
 	g_put.n++;
 	return 0;
+}
+
+/* The flusher's chunk PUT is hedged in production (s3_hedge.c is not linked):
+ * here it is one plain parked PUT, which is all this harness needs. */
+int
+s3_put_hedged(struct s3_client *client, const char *key, struct iovec *iov,
+	      int iovcnt, struct s3_hedge_counters *counters, s3_op_cb cb,
+	      void *cb_arg)
+{
+	(void)counters;
+	return s3_put(client, key, iov, iovcnt, false, cb, cb_arg);
 }
 
 static void
@@ -1388,6 +1453,8 @@ t7_wal_upload_inflight_requeue(void)
 	 * retiring (stopping) flusher would refuse to do. */
 	put_complete(pb, -EIO);
 	run_msgs();
+	/* B16: a failed round waits out a retry backoff (100 ms first). */
+	g_ticks += S3_FLUSHER_RETRY_BACKOFF_MIN_US * 2;
 	pump(2);
 	CHECK(g_put.n == pb + 2);
 	check_nothing_downstream(&e, "T7 after upload failure");
@@ -1548,6 +1615,108 @@ t10_idle_cache_controls(void)
 	teardown_env(&e);
 }
 
+struct warm_state { uint32_t calls; int status; struct s3_warm_stats st; };
+
+static void
+warm_cb(void *arg, int status, const struct s3_warm_stats *st)
+{
+	struct warm_state *w = arg;
+
+	w->calls++;
+	w->status = status;
+	w->st = *st;
+}
+
+/* B1: destroy with warm-up GETs stalled in S3. Teardown must abandon them at
+ * once (not wait for the request deadline), and resume only after their
+ * completions ran, with no cache fill from an abandoned GET. */
+static void
+t11_warm_cancelled_at_destroy(void)
+{
+	struct env e;
+	struct warm_state w = {0};
+	uint64_t chunks[] = {1, 2, 3, 4};
+	uint32_t g0 = g_get.n, ab0 = g_gates_abandoned, fr0 = g_gates_freed;
+	uint32_t writes;
+
+	fprintf(stderr, "T11 no-WAL: warm-up GETs stalled at destroy\n");
+	setup(&e, false, false);
+	for (uint64_t c = 1; c <= 4; c++) {
+		seed_chunk(&e, c, c);
+	}
+	CHECK(s3_bs_dev_warm(e.dev, chunks, 4, 2, warm_cb, &w) == 0);
+	CHECK(g_get.n == g0 + 2);              /* window 2 */
+	CHECK(g_get_gate[g0] && g_get_gate[g0 + 1]);
+	writes = g_dev.submitted_writes;
+
+	do_destroy(&e);
+	CHECK(g_gates_abandoned == ab0 + 2);   /* both abandoned inside destroy */
+	CHECK(g_get.n == g0 + 2);              /* nothing new issued */
+	check_nothing_downstream(&e, "T11 after destroy");
+
+	/* One stalled GET reports success after the abandon: its bytes must
+	 * not be cached. The other is cancelled. */
+	get_complete(g0, 0);
+	run_msgs();
+	check_nothing_downstream(&e, "T11 one warm GET left");
+	get_complete(g0 + 1, -ECANCELED);
+	run_msgs();
+	CHECK(g_dev.submitted_writes == writes);   /* no fill */
+	CHECK(w.calls == 1 && w.status == -ECANCELED);
+	CHECK(w.st.warmed == 0);
+	CHECK(g_gates_freed == fr0 + 2);
+	CHECK(g_get.n == g0 + 2);
+	check_finished(&e, 0);
+	teardown_env(&e);
+}
+
+/* B2: while a foreground read waits on S3, a warm-up keeps one GET in flight
+ * instead of its full window, and widens again once the foreground is done. */
+static void
+t12_warm_yields_to_foreground(void)
+{
+	struct env e;
+	struct warm_state w = {0};
+	struct io_state st = {0};
+	struct spdk_bs_dev_cb_args cba = { .cb_fn = bs_cpl, .channel = NULL };
+	uint64_t chunks[] = {2, 3, 4, 5, 6};
+	uint32_t fg, g0;
+
+	fprintf(stderr, "T12 no-WAL: warm-up yields to a foreground read\n");
+	setup(&e, false, false);
+	for (uint64_t c = 1; c <= 6; c++) {
+		seed_chunk(&e, c, c);
+	}
+	cba.cb_arg = &st;
+	fg = g_get.n;
+	e.dev->read(e.dev, NULL, e.buf + 1 * CHUNK, 1 * BLK_PER_CHUNK,
+		    BLK_PER_CHUNK, &cba);
+	CHECK(g_get.n == fg + 1);
+
+	g0 = g_get.n;
+	CHECK(s3_bs_dev_warm(e.dev, chunks, 5, 4, warm_cb, &w) == 0);
+	CHECK(g_get.n == g0 + 1);              /* yielded: one, not four */
+
+	/* Foreground done; the warm-up widens on its next completion. */
+	get_complete(fg, 0);
+	run_msgs();
+	CHECK(st.calls == 1 && st.status == 0);
+	dev_complete_slot(dev_nth_outstanding(0), true);   /* fg cache fill */
+	run_msgs();
+	get_complete(g0, -EIO);
+	run_msgs();
+	CHECK(g_get.n == g0 + 1 + 4);          /* rest of the chunks, window 4 */
+	for (uint32_t i = g0 + 1; i < g_get.n; i++) {
+		get_complete(i, -EIO);
+	}
+	run_msgs();
+	CHECK(w.calls == 1 && w.status == -EIO && w.st.failed == 5);
+	do_destroy(&e);
+	run_msgs();
+	check_finished(&e, 0);
+	teardown_env(&e);
+}
+
 int
 main(void)
 {
@@ -1561,6 +1730,8 @@ main(void)
 	t8_wal_drain_timeout_then_upload_fails();
 	t9_reentry_ckpt_deletes_cache();
 	t10_idle_cache_controls();
+	t11_warm_cancelled_at_destroy();
+	t12_warm_yields_to_foreground();
 
 	printf("s3_bsdev_cache_teardown_test: %d passed, %d failed "
 	       "(error logs seen: %d)\n", g_pass, g_fail, g_errlogs);

@@ -14,6 +14,7 @@ include ../../mk/s3lvol.common.mk
 LIBNAME = s3bsdev
 
 SRCS = s3_bs_dev.c \
+       s3_peer.c \
        s3_local_dev.c \
        s3_spawner.c \
        s3_export_bs_dev.c \

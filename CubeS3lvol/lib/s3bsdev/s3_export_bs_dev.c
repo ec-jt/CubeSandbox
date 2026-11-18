@@ -121,6 +121,29 @@
 #include "s3lvol/s3_chunk_map.h"
 #include "s3lvol/s3_export.h"
 #include "s3lvol/s3_hedge.h"
+#include "s3lvol/s3_peer.h"
+
+/* === Peer pull (s3_peer.h) ===
+ *
+ * A pack slot of a manifest that carries pack digests, on a device told its
+ * source node (s3_export_bs_dev_set_peer), is fetched from that node first:
+ *
+ *   1. the whole pack is requested from the peer into a private buffer, and
+ *      verified there against the manifest digest (on the peer worker);
+ *   2. a peer that answers in time fills the slot by swapping buffers;
+ *   3. a peer that fails (down, refused, 404, bad digest, bad signature) hands
+ *      the slot to the ordinary S3 path at once;
+ *   4. a peer still silent after S3LVOL_PEER_HEDGE_MS starts the S3 path in
+ *      parallel. Its late answer is never written into a buffer S3 is filling:
+ *      it is kept aside, stops further S3 retries, and is used if S3 fails.
+ *
+ * After EXPORT_PEER_BREAKER consecutive peer failures the device stops asking
+ * its peer, so a dead source costs at most a few connect timeouts per volume.
+ * Writes never go to a peer, and S3 stays the source of truth: the peer only
+ * ever supplies bytes whose digest the manifest already names. */
+#define EXPORT_PEER_BREAKER 3
+
+struct export_peer_ctx;
 
 /* Demand-miss partition of the slot table. See the file comment. */
 #define EXPORT_MISS_SLOTS 16
@@ -184,6 +207,25 @@ struct export_slot {
 	int                         fail_status;
 	TAILQ_HEAD(, s3_export_chunk_io) waiters;
 	TAILQ_HEAD(, export_pf_wait)     pf_waiters;
+
+	/* Peer pull of this slot's pack, see above. peer_ctx is the request in
+	 * flight (NULL when none); peer_phase means S3 has not been started;
+	 * peer_buf holds a verified peer answer that arrived while S3 was
+	 * running. */
+	struct export_peer_ctx     *peer_ctx;
+	struct spdk_poller         *peer_hedge;
+	bool                        peer_phase;
+	uint8_t                    *peer_buf;
+	uint32_t                    peer_buf_len;
+};
+
+struct export_peer_ctx {
+	struct s3_export_dev       *dev;
+	struct export_slot         *s;      /* NULL once the slot let go of it */
+	uint8_t                    *buf;
+	uint32_t                    len;
+	uint32_t                    pack;
+	struct s3_peer_req         *req;
 };
 
 struct s3_export_dev {
@@ -237,6 +279,12 @@ struct s3_export_dev {
 	uint32_t                   range_bytes;
 	unsigned int               rand_seed;
 	struct s3_export_bs_dev_stats stats;
+
+	/* Peer pull, home_thread only. peer[0] == '\0': none. */
+	char                       peer[S3_PEER_ADDR_MAX];
+	uint32_t                   peer_inflight;
+	uint32_t                   peer_fail_streak;
+	bool                       peer_disabled;
 };
 
 /* One bs_dev read, possibly spanning several chunks. */
@@ -662,9 +710,43 @@ export_range_retry_fire(void *arg)
 static bool
 export_range_should_retry(struct s3_export_dev *dev, struct export_range *r, int status)
 {
+	/* A verified peer copy is waiting: no point in retrying S3. */
 	return status != 0 && status != -ENOENT && status != -ECANCELED &&
 	       !dev->destroy_pending && r->s->fail_status == 0 &&
-	       r->retries < dev->max_retries;
+	       r->s->peer_buf == NULL && r->retries < dev->max_retries;
+}
+
+static void
+export_maybe_destroy(struct s3_export_dev *dev)
+{
+	if (dev->destroy_pending && dev->fetch_inflight == 0 && dev->peer_inflight == 0) {
+		export_destroy_now(dev);
+	}
+}
+
+/* The slot no longer waits for its peer request: the request finishes on its
+ * own and frees its buffer. */
+static void
+export_slot_peer_detach(struct export_slot *s)
+{
+	if (s->peer_hedge) {
+		spdk_poller_unregister(&s->peer_hedge);
+	}
+	if (s->peer_ctx) {
+		s->peer_ctx->s = NULL;
+		s3_peer_abandon(s->peer_ctx->req);
+		s->peer_ctx = NULL;
+	}
+	s->peer_phase = false;
+}
+
+/* Take a verified peer buffer as the slot's contents. */
+static void
+export_slot_adopt(struct export_slot *s, uint8_t *buf, uint32_t len)
+{
+	free(s->buf);
+	s->buf = buf;
+	s->buf_len = len;
 }
 
 /* One range's GET attempt completed. Each range is independent: its own
@@ -750,6 +832,22 @@ export_slot_finish(struct export_slot *s, int status)
 	TAILQ_HEAD(, export_pf_wait) pf_waiters;
 	uint32_t i;
 
+	export_slot_peer_detach(s);
+	if (s->peer_buf) {
+		if (status != 0) {
+			/* S3 failed after the hedge; the peer's verified copy is
+			 * the same bytes. */
+			SPDK_NOTICELOG("Export object '%s': S3 failed (%s), served from "
+				       "the peer copy\n", s->key, spdk_strerror(-status));
+			export_slot_adopt(s, s->peer_buf, s->peer_buf_len);
+			dev->stats.peer_rescues++;
+			status = 0;
+		} else {
+			free(s->peer_buf);
+		}
+		s->peer_buf = NULL;
+		s->peer_buf_len = 0;
+	}
 	assert(dev->fetch_inflight > 0);
 	dev->fetch_inflight--;
 	memset(&res, 0, sizeof(res));
@@ -805,9 +903,7 @@ export_slot_finish(struct export_slot *s, int status)
 		export_pf_slot_done(w, &res);
 	}
 
-	if (dev->destroy_pending && dev->fetch_inflight == 0) {
-		export_destroy_now(dev);
-	}
+	export_maybe_destroy(dev);
 }
 
 /* One GET attempt of one range: the first, or a retry. Hedged: the key names
@@ -844,10 +940,12 @@ s3_export_range_count(uint32_t len, uint32_t range_bytes)
 	return (len + range_bytes - 1) / range_bytes;
 }
 
-/* Start the fetch of a slot already set up with its key: every range at once,
- * each landing at its own offset of the slot buffer. */
+/* Send the S3 ranges of a slot that is already FETCHING (fetch_inflight
+ * counted): every range at once, each landing at its own offset of the slot
+ * buffer. Nonzero only when not a single range could be submitted, in which
+ * case the caller owns the slot's state. */
 static int
-export_slot_start_fetch(struct s3_export_dev *dev, struct export_slot *s)
+export_slot_send_s3(struct s3_export_dev *dev, struct export_slot *s)
 {
 	uint32_t n, i, sent = 0, rb;
 	int rc = 0;
@@ -884,11 +982,6 @@ export_slot_start_fetch(struct s3_export_dev *dev, struct export_slot *s)
 	}
 	s->ranges_left = n;
 	s->fail_status = 0;
-	s->state = EXPORT_SLOT_FETCHING;
-	dev->fetch_inflight++;
-	if (dev->fetch_inflight > dev->stats.peak_fetch_inflight) {
-		dev->stats.peak_fetch_inflight = dev->fetch_inflight;
-	}
 	if (n > 1) {
 		dev->stats.ranged_fetches++;
 	}
@@ -900,8 +993,7 @@ export_slot_start_fetch(struct s3_export_dev *dev, struct export_slot *s)
 		sent++;
 	}
 	if (sent == 0) {
-		dev->fetch_inflight--;
-		s->state = EXPORT_SLOT_FREE;
+		s->nranges = 0;
 		return rc;
 	}
 	if (sent < n) {
@@ -916,6 +1008,179 @@ export_slot_start_fetch(struct s3_export_dev *dev, struct export_slot *s)
 		}
 	}
 	return 0;
+}
+
+/* S3 after the peer phase: the slot is FETCHING and counted, so a submit
+	* failure finishes it rather than handing it back. */
+static void
+export_slot_fall_back(struct s3_export_dev *dev, struct export_slot *s)
+{
+	int rc;
+
+	s->peer_phase = false;
+	rc = export_slot_send_s3(dev, s);
+	if (rc != 0) {
+		export_slot_finish(s, rc);
+	}
+}
+
+static int
+export_peer_hedge_fire(void *arg)
+{
+	struct export_slot *s = arg;
+	struct s3_export_dev *dev = s->dev;
+
+	spdk_poller_unregister(&s->peer_hedge);
+	if (!s->peer_phase) {
+		return SPDK_POLLER_BUSY;
+	}
+	/* The peer is slow, not failed: S3 starts, the peer keeps going. */
+	dev->stats.peer_hedged++;
+	SPDK_WARNLOG("Export object '%s': peer %s silent after %" PRIu64 " ms; "
+		     "S3 started in parallel\n", s->key, dev->peer,
+		     s3_peer_hedge_us() / 1000);
+	export_slot_fall_back(dev, s);
+	return SPDK_POLLER_BUSY;
+}
+
+static void
+export_peer_done(void *cb_arg, int status)
+{
+	struct export_peer_ctx *ctx = cb_arg;
+	struct s3_export_dev *dev = ctx->dev;
+	struct export_slot *s = ctx->s;
+
+	assert(dev->peer_inflight > 0);
+	dev->peer_inflight--;
+	if (status == 0) {
+		dev->stats.peer_hits++;
+		dev->stats.peer_bytes += ctx->len;
+		dev->peer_fail_streak = 0;
+	} else if (status != -ECANCELED) {
+		dev->stats.peer_misses++;
+		if (status == -EBADMSG) {
+			dev->stats.peer_mismatches++;
+		}
+		if (dev->stats.peer_misses <= 8 || status == -EBADMSG) {
+			SPDK_WARNLOG("Export %s pack %u: peer %s %s (%s); reading S3\n",
+				     dev->m->uuid_str, ctx->pack, dev->peer,
+				     status == -EBADMSG ? "returned bytes that do not match "
+				     "the manifest digest" : "failed",
+				     spdk_strerror(-status));
+		}
+		if (++dev->peer_fail_streak >= EXPORT_PEER_BREAKER && !dev->peer_disabled) {
+			dev->peer_disabled = true;
+			SPDK_WARNLOG("Export %s: %u peer failures in a row; S3 only from "
+				     "here on\n", dev->m->uuid_str, dev->peer_fail_streak);
+		}
+	}
+
+	if (!s) {
+		/* The slot finished without it (S3 won, or teardown). */
+		free(ctx->buf);
+		free(ctx);
+		export_maybe_destroy(dev);
+		return;
+	}
+	s->peer_ctx = NULL;
+	if (status == 0 && s->peer_phase) {
+		spdk_poller_unregister(&s->peer_hedge);
+		s->peer_phase = false;
+		export_slot_adopt(s, ctx->buf, ctx->len);
+		free(ctx);
+		export_slot_finish(s, 0);
+		return;
+	}
+	if (status == 0) {
+		/* S3 is filling s->buf: keep this aside (see the file comment). */
+		s->peer_buf = ctx->buf;
+		s->peer_buf_len = ctx->len;
+		free(ctx);
+		return;
+	}
+	free(ctx->buf);
+	free(ctx);
+	if (s->peer_phase) {
+		spdk_poller_unregister(&s->peer_hedge);
+		dev->stats.peer_fallbacks++;
+		export_slot_fall_back(dev, s);
+	}
+}
+
+/* Start the peer phase of a pack slot. false: not eligible or could not be
+	* queued; the caller goes to S3. */
+static bool
+export_peer_start(struct s3_export_dev *dev, struct export_slot *s)
+{
+	const struct s3_export_manifest *m = dev->m;
+	struct export_peer_ctx *ctx;
+	uint64_t pack;
+
+	if (dev->peer[0] == '\0' || dev->peer_disabled || !m->pack_sha ||
+		   s->offset != 0 || s->object_len == 0 || !s3_peer_pull_enabled()) {
+		return false;
+	}
+	pack = UINT64_MAX - s->chunk_index;
+	if (pack >= m->pack_count) {
+		return false;
+	}
+	ctx = calloc(1, sizeof(*ctx));
+	if (!ctx) {
+		return false;
+	}
+	ctx->buf = malloc(s->object_len);
+	if (!ctx->buf) {
+		free(ctx);
+		return false;
+	}
+	ctx->dev = dev;
+	ctx->s = s;
+	ctx->len = s->object_len;
+	ctx->pack = (uint32_t)pack;
+	ctx->req = s3_peer_get(dev->peer, m->uuid_str, ctx->pack, ctx->len,
+			       m->pack_sha + pack * 32, ctx->buf, export_peer_done, ctx);
+	if (!ctx->req) {
+		free(ctx->buf);
+		free(ctx);
+		return false;
+	}
+	dev->stats.peer_gets++;
+	dev->peer_inflight++;
+	s->peer_ctx = ctx;
+	s->peer_phase = true;
+	s->nranges = 0;
+	s->ranges_left = 0;
+	s->fail_status = 0;
+	s->peer_hedge = SPDK_POLLER_REGISTER(export_peer_hedge_fire, s, s3_peer_hedge_us());
+	if (!s->peer_hedge) {
+		/* No timer: race S3 right away rather than wait unbounded. */
+		s->peer_phase = false;
+		return false;
+	}
+	return true;
+}
+
+/* Start the fetch of a slot already set up with its key. */
+static int
+export_slot_start_fetch(struct s3_export_dev *dev, struct export_slot *s)
+{
+	int rc;
+
+	s->state = EXPORT_SLOT_FETCHING;
+	dev->fetch_inflight++;
+	if (dev->fetch_inflight > dev->stats.peak_fetch_inflight) {
+		dev->stats.peak_fetch_inflight = dev->fetch_inflight;
+	}
+	if (export_peer_start(dev, s)) {
+		return 0;
+	}
+	rc = export_slot_send_s3(dev, s);
+	if (rc != 0) {
+		export_slot_peer_detach(s);
+		dev->fetch_inflight--;
+		s->state = EXPORT_SLOT_FREE;
+	}
+	return rc;
 }
 
 static void
@@ -1456,7 +1721,7 @@ export_destroy_on_home(void *arg)
 	 * prefetcher blobstore or decouple is still waiting for -- but a GET whose
 	 * last reader was satisfied elsewhere is not impossible, so the free waits
 	 * for it rather than racing it. */
-	if (dev->fetch_inflight > 0) {
+	if (dev->fetch_inflight > 0 || dev->peer_inflight > 0) {
 		dev->destroy_pending = true;
 		return;
 	}
@@ -1482,6 +1747,19 @@ export_destroy(struct spdk_bs_dev *bs_dev)
 		       dev->stats.fetch_retries, dev->stats.hedges_issued,
 		       dev->stats.hedges_won, dev->stats.ranged_resumes,
 		       dev->stats.resumed_bytes);
+	if (dev->peer[0] != '\0') {
+		SPDK_NOTICELOG("Export %s bytes by source: peer %s %" PRIu64 " (%" PRIu64
+		        " pack(s) of %" PRIu64 " asked, %" PRIu64 " miss(es), %"
+		        PRIu64 " digest mismatch(es), %" PRIu64 " fallback(s), %"
+		        PRIu64 " hedged, %" PRIu64 " rescue(s)%s), S3 %" PRIu64 "\n",
+		        dev->m->uuid_str, dev->peer, dev->stats.peer_bytes,
+		        dev->stats.peer_hits, dev->stats.peer_gets,
+		        dev->stats.peer_misses, dev->stats.peer_mismatches,
+		        dev->stats.peer_fallbacks, dev->stats.peer_hedged,
+		        dev->stats.peer_rescues,
+		        dev->peer_disabled ? ", breaker open" : "",
+		        dev->stats.get_bytes);
+	}
 
 	/* No wait for a refetch, deliberately.
 	 *
@@ -2019,6 +2297,22 @@ s3_export_bs_dev_create(struct s3_client *client, struct s3_export_manifest *m,
 
 	*out = &dev->bs_dev;
 	return 0;
+}
+
+void
+s3_export_bs_dev_set_peer(struct spdk_bs_dev *bs_dev, const char *peer)
+{
+	struct s3_export_dev *dev = (struct s3_export_dev *)bs_dev;
+
+	if (!s3_export_bs_dev_is_export(bs_dev)) {
+		return;
+	}
+	snprintf(dev->peer, sizeof(dev->peer), "%s", peer ? peer : "");
+	if (dev->peer[0] != '\0') {
+		SPDK_NOTICELOG("Export %s: peer pull from %s%s\n", dev->m->uuid_str,
+			       dev->peer, dev->m->pack_sha ? "" :
+			       " requested, but the manifest has no pack digests (S3 only)");
+	}
 }
 
 void

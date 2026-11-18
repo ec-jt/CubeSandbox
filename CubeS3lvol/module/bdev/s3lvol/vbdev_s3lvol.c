@@ -28,6 +28,7 @@
 #include "s3lvol/s3_client.h"
 #include "s3lvol/s3_spawner.h"
 
+#include "s3lvol/s3_peer.h"
 #include "vbdev_s3lvol.h"
 
 /* Number of CRT event loop threads. Kept below the reactor core count -- they
@@ -142,6 +143,12 @@ vbdev_s3lvol_init(void)
 		return rc;
 	}
 
+	/* Peer pull server (S3LVOL_PEER_LISTEN). Optional: a failure is logged
+	 * and importers of this node's exports read S3 instead. */
+	if (s3_peer_serve_enabled()) {
+		(void)s3_peer_server_start();
+	}
+
 	g_s3lvol_initialized = true;
 	return 0;
 }
@@ -153,6 +160,7 @@ vbdev_s3lvol_fini(void)
 		return;
 	}
 
+	s3_peer_server_stop();
 	s3_crt_global_fini();
 	s3_spawner_stop();
 	g_s3lvol_initialized = false;

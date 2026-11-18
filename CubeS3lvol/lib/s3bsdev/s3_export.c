@@ -292,6 +292,7 @@ s3_export_manifest_unref(struct s3_export_manifest *m)
 	free(m->src_idx);
 	free(m->zeroes);
 	free(m->pack_loc);
+	free(m->pack_sha);
 	free(m);
 }
 
@@ -394,6 +395,8 @@ s3_export_manifest_clear_packs(struct s3_export_manifest *m)
 	}
 	free(m->pack_loc);
 	m->pack_loc = NULL;
+	free(m->pack_sha);
+	m->pack_sha = NULL;
 	m->pack_chunks = 0;
 	m->pack_count = 0;
 	if (m->version == S3_EXPORT_PACK_VERSION) {
@@ -1153,6 +1156,14 @@ s3_export_manifest_seal(struct s3_export_manifest *m)
 		if (n != 0) {
 			m->crc32c = spdk_crc32c_update(batch, n, m->crc32c);
 		}
+		/* The pack digests, when present: a flipped digest would make a
+		 * peer pull refuse a good pack (harmless) or, with a matching
+		 * flipped pack, accept a bad one. */
+		if (m->pack_sha) {
+			m->crc32c = spdk_crc32c_update(m->pack_sha,
+						       (size_t)m->pack_count * 32,
+						       m->crc32c);
+		}
 	}
 }
 
@@ -1558,6 +1569,20 @@ s3_export_manifest_serialize(struct s3_export_manifest *m, char **out, size_t *o
 			spdk_json_write_named_uint32(w, "pack_chunks", m->pack_chunks);
 			spdk_json_write_named_uint32(w, "pack_count", m->pack_count);
 			spdk_json_write_named_string(w, "pack_loc", pack_b64);
+			if (m->pack_sha) {
+				char *sha_b64 = encode_b64(m->pack_sha,
+							   (size_t)m->pack_count * 32);
+
+				if (!sha_b64) {
+					spdk_json_write_end(w);
+					free(buf.data);
+					buf.data = NULL;
+					rc = -ENOMEM;
+					goto err;
+				}
+				spdk_json_write_named_string(w, "pack_sha256", sha_b64);
+				free(sha_b64);
+			}
 		}
 	}
 	spdk_json_write_object_end(w);
@@ -1677,6 +1702,7 @@ struct manifest_json {
 	uint32_t          pack_chunks;
 	uint32_t          pack_count;
 	char             *pack_loc;
+	char             *pack_sha256;
 };
 
 static int
@@ -1728,6 +1754,9 @@ static const struct spdk_json_object_decoder manifest_decoders[] = {
 	{"pack_chunks", offsetof(struct manifest_json, pack_chunks), spdk_json_decode_uint32, true},
 	{"pack_count",  offsetof(struct manifest_json, pack_count),  spdk_json_decode_uint32, true},
 	{"pack_loc",    offsetof(struct manifest_json, pack_loc),    spdk_json_decode_string, true},
+	/* Version 6, optional even there: only manifests written with
+	 * S3LVOL_PEER_PULL on carry it. */
+	{"pack_sha256", offsetof(struct manifest_json, pack_sha256), spdk_json_decode_string, true},
 };
 
 static void
@@ -1743,6 +1772,7 @@ free_manifest_json(struct manifest_json *j)
 	free(j->base);
 	free(j->zeroes);
 	free(j->pack_loc);
+	free(j->pack_sha256);
 	free(j->src.endpoint);
 	free(j->src.region);
 	free(j->src.bucket);
@@ -2290,6 +2320,19 @@ s3_export_manifest_parse(const void *json, size_t len, struct s3_export_manifest
 				rc = -EINVAL;
 				goto out;
 			}
+			if (j.pack_sha256) {
+				rc = decode_b64_exact(j.pack_sha256, &m->pack_sha,
+						      (size_t)m->pack_count * 32,
+						      "pack digests");
+				if (rc != 0) {
+					goto out;
+				}
+			}
+		} else if (j.pack_sha256) {
+			SPDK_ERRLOG("export manifest version %u carries pack digests\n",
+				    j.version);
+			rc = -EINVAL;
+			goto out;
 		}
 	}
 

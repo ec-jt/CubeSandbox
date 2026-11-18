@@ -658,6 +658,24 @@ ${RCOW_IOBUF_LARGE_BUFSIZE}, large-pool-count ${RCOW_IOBUF_LARGE_POOL})"
 ${RCOW_IOBUF_LARGE_POOL} = ${mib} MiB, so a${RCOW_MAX_IO_SIZE} B host I/O \
 arrives in one piece"
 
+	# Bdev auto-examine off. Every registered lvol bdev was otherwise read by
+	# the gpt and raid examine modules: those are S3 reads on template volumes
+	# that nobody asked for, they stalled for up to the 60 s request deadline
+	# right after a restart, and an examine I/O still outstanding when a bdev
+	# was unregistered at stop is the prime candidate for the
+	# bdev_channel_destroy_resource TAILQ_EMPTY(io_submitted) assertion seen on
+	# app2 (2026-11-18 14:47 and 19:00). Nothing in this stack is discovered by
+	# examine: lvstores are loaded explicitly by rcow_load_lvstore. Not fatal:
+	# an older rpc.py without the flag only keeps the old behaviour.
+	if [ "${RCOW_BDEV_AUTO_EXAMINE:-0}" != "1" ]; then
+		if rcow_srpc bdev_set_options --no-auto-examine >/dev/null 2>&1; then
+			rcow_log "bdev auto-examine disabled"
+		else
+			rcow_warn "bdev_set_options --no-auto-examine failed; \
+auto-examine stays on"
+		fi
+	fi
+
 	# Not "start", despite the name: this is what runs subsystem init, which
 	# --wait-for-rpc held back. It answers only when init is done, so a failure
 	# here is a failure to initialise, not a failure to submit.

@@ -355,6 +355,13 @@ struct s3_export_manifest {
 	uint32_t  pack_count;
 	uint32_t *pack_loc;
 
+	/* Version 6, optional: SHA-256 of every pack object, pack_count x 32
+	 * bytes, NULL when absent. Written only with S3LVOL_PEER_PULL on (an
+	 * older reader refuses the unknown member) and covered by the crc. It is
+	 * what lets an importer take a pack from the source node instead of S3
+	 * (s3_peer.h): a pack without a digest is never read from a peer. */
+	uint8_t  *pack_sha;
+
 	/* Over the bitmap, and for a ref manifest over the full bitmap, the packed
 	 * uuids and the partial-length exceptions too, in that order -- and, from
 	 * version 3, src_idx after those. The stage list follows `version` rather
@@ -1050,7 +1057,21 @@ struct s3_export_bs_dev_stats {
 	uint64_t resumed_bytes;       /* bytes those retries did not fetch again */
 	uint64_t ranged_fetches;      /* objects fetched as more than one range */
 	uint64_t range_retries;       /* retries of a single range */
+	/* Peer pull (s3_peer.h). get_bytes above counts only S3. */
+	uint64_t peer_gets;           /* packs asked of the peer */
+	uint64_t peer_hits;           /* answered and verified */
+	uint64_t peer_bytes;          /* bytes of those */
+	uint64_t peer_misses;         /* failed: down, 404, auth, digest, timeout */
+	uint64_t peer_mismatches;     /* of which the digest did not match */
+	uint64_t peer_fallbacks;      /* failed before the hedge: S3 took over */
+	uint64_t peer_hedged;         /* silent past the hedge: S3 raced it */
+	uint64_t peer_rescues;        /* S3 failed, the peer copy was used */
 };
+
+/** Read packs from \p peer ("ip[:port]") before S3 (s3_peer.h). NULL or ""
+	* turns it off. Only packs whose digest the manifest carries are pulled. Call
+	* on the device's home thread before the first read. */
+void s3_export_bs_dev_set_peer(struct spdk_bs_dev *bs_dev, const char *peer);
 
 /** Ranges an object of \p len bytes is fetched in, at most \p range_bytes
 	* each (S3LVOL_PACK_RANGE_MIB); 1 when it fits in one. */

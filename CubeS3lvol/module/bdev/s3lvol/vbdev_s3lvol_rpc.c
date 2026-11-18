@@ -884,6 +884,9 @@ rpc_derive_lvol(struct spdk_jsonrpc_request *request,
 		rpc_lvol_respond_err(request, 0, "internal: lvol without lvstore");
 		goto cleanup;
 	}
+	if (!snapshot) {
+		s3lvol_lvol_warm_promote(lvs, lvol);
+	}
 
 	ctx = calloc(1, sizeof(*ctx));
 	if (!ctx) {
@@ -2420,6 +2423,9 @@ struct rpc_import_lvol {
 
 	/* Template delta imports only: the local base snapshot to clone. */
 	char    *base_lvol;
+
+	/* Peer pull: the source node's private "ip[:port]" (s3_peer.h). */
+	char    *peer;
 };
 
 static void
@@ -2430,6 +2436,7 @@ free_rpc_import_lvol(struct rpc_import_lvol *req)
 	free(req->export_uuid);
 	free(req->src_namespace);
 	free(req->base_lvol);
+	free(req->peer);
 }
 
 static const struct spdk_json_object_decoder rpc_import_lvol_decoders[] = {
@@ -2441,6 +2448,7 @@ static const struct spdk_json_object_decoder rpc_import_lvol_decoders[] = {
 	{"prefetch",      offsetof(struct rpc_import_lvol, prefetch),      spdk_json_decode_bool,   true},
 	{"prefetch_parallel", offsetof(struct rpc_import_lvol, prefetch_parallel), spdk_json_decode_uint32, true},
 	{"base_lvol", offsetof(struct rpc_import_lvol, base_lvol), spdk_json_decode_string, true},
+	{"peer",      offsetof(struct rpc_import_lvol, peer),      spdk_json_decode_string, true},
 };
 
 /* The lvstore a call means when it did not say. Sends the error response itself
@@ -2568,6 +2576,7 @@ rpc_rcow_import_lvol(struct spdk_jsonrpc_request *request,
 	opts.src_namespace = req.src_namespace;
 	opts.decouple      = req.decouple;
 	opts.base_lvol     = req.base_lvol;
+	opts.peer          = req.peer;
 	opts.prefetch      = req.decouple && req.prefetch;
 	opts.prefetch_window = req.prefetch_parallel ? req.prefetch_parallel :
 			       s3lvol_import_prefetch_window_default();
@@ -2576,9 +2585,10 @@ rpc_rcow_import_lvol(struct spdk_jsonrpc_request *request,
 	}
 
 	SPDK_NOTICELOG("rcow_import_lvol '%s' from export %s requested "
-		       "(decouple=%s prefetch=%s parallel=%u)\n", req.lvol_name,
+		       "(decouple=%s prefetch=%s parallel=%u peer=%s)\n", req.lvol_name,
 		       req.export_uuid, req.decouple ? "true" : "false",
-		       opts.prefetch ? "true" : "false", opts.prefetch_window);
+		       opts.prefetch ? "true" : "false", opts.prefetch_window,
+		       req.peer ? req.peer : "-");
 
 	rc = s3lvol_lvol_import(lvs, &opts, rpc_import_lvol_cb, ctx);
 	if (rc != 0) {
@@ -2965,6 +2975,15 @@ rpc_rcow_import_status(struct spdk_jsonrpc_request *request,
 		spdk_json_write_named_uint64(w, "s3_hedge_get_delay_ms", hs.get_delay_ms);
 		spdk_json_write_named_uint64(w, "s3_hedges_inflight", hs.inflight);
 	}
+	/* Peer pull, additive: bytes by source and what the peer did. */
+	spdk_json_write_named_string(w, "peer", info.peer);
+	spdk_json_write_named_uint64(w, "peer_bytes", info.peer_bytes);
+	spdk_json_write_named_uint64(w, "peer_hits", info.peer_hits);
+	spdk_json_write_named_uint64(w, "peer_misses", info.peer_misses);
+	spdk_json_write_named_uint64(w, "peer_mismatches", info.peer_mismatches);
+	spdk_json_write_named_uint64(w, "peer_fallbacks", info.peer_fallbacks);
+	spdk_json_write_named_uint64(w, "peer_hedged", info.peer_hedged);
+	spdk_json_write_named_uint64(w, "s3_bytes", info.s3_bytes);
 	spdk_json_write_object_end(w);
 	rpc_json_buf_respond(request, w, &buf);
 out:
@@ -3922,6 +3941,7 @@ rpc_rcow_active_bdev(struct spdk_jsonrpc_request *request,
 	}
 
 	SPDK_NOTICELOG("rcow_active_bdev '%s' requested\n", req.device_name);
+	s3lvol_lvol_warm_promote(lvs, lvol);
 
 	/* Already active: report where it is rather than adding a second namespace
 	 * for the same volume. Activation has to be repeatable, because a caller

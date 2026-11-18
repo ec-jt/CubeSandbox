@@ -81,6 +81,9 @@
 #include "s3lvol/s3_chunk_map.h"
 #include "s3lvol/s3_export.h"
 #include "s3lvol/s3_hedge.h"
+#include "spdk/thread.h"
+#include "s3lvol/s3_peer.h"
+#include "s3lvol/s3_spawner.h"
 #include "export_chunk_retry.h"
 
 /* ==========================================================================
@@ -121,6 +124,10 @@ struct pack_job {
 	uint8_t            *buf;
 	struct iovec        iov;
 	char                key[S3_EXPORT_KEY_MAX];
+	/* Peer pull: the thread to come back to after hashing off-reactor. */
+	struct spdk_thread *thread;
+	char                uuid[SPDK_UUID_STRING_LEN];
+	int                 store_rc;
 };
 
 struct pack_writer {
@@ -272,6 +279,59 @@ pack_job_uploaded(void *cb_arg, int status)
 	pack_job_end(j, status);
 }
 
+/* Back on the writer's thread after the off-reactor hash: PUT the pack. */
+static void
+pack_job_hashed(void *arg)
+{
+	struct pack_job *j = arg;
+	int rc;
+
+	if (j->store_rc != 0) {
+		/* Only the peer copy failed: S3 is still the source of truth and
+		 * the digest is still right, so an importer just misses the peer. */
+		SPDK_WARNLOG("Export %s: no local peer copy of pack %u: %s\n",
+			     j->uuid, j->pack, spdk_strerror(-j->store_rc));
+	}
+	rc = pack_job_put(j);
+	if (rc != 0) {
+		pack_job_end(j, rc);
+	}
+}
+
+/* Plain thread: hash the pack into the manifest's digest table and keep the
+ * local copy the peer server serves. Neither may run on a reactor (16 MiB of
+ * SHA-256 and a 16 MiB file write). The digest slot is this job's alone. */
+static void *
+pack_job_hash_thread(void *arg)
+{
+	struct pack_job *j = arg;
+
+	pthread_detach(pthread_self());
+	s3_peer_sha256(j->buf, j->iov.iov_len, j->w->m->pack_sha + (size_t)j->pack * 32);
+	j->store_rc = s3_peer_store_pack(j->uuid, j->pack, j->buf, j->iov.iov_len);
+	if (spdk_thread_send_msg(j->thread, pack_job_hashed, j) != 0) {
+		/* Cannot happen while the writer's thread is alive, and it is:
+		 * it is waiting for this job. */
+		SPDK_ERRLOG("Export %s: pack %u lost its thread\n", j->uuid, j->pack);
+	}
+	return NULL;
+}
+
+static void
+pack_job_hash_spawn_failed(void *ctx, int err)
+{
+	struct pack_job *j = ctx;
+
+	/* Hash inline instead: slower for the reactor, never wrong. */
+	SPDK_WARNLOG("Export %s: pack %u hashed inline (no thread: %s)\n", j->uuid,
+		     j->pack, spdk_strerror(err));
+	s3_peer_sha256(j->buf, j->iov.iov_len, j->w->m->pack_sha + (size_t)j->pack * 32);
+	j->store_rc = -err;
+	if (spdk_thread_send_msg(j->thread, pack_job_hashed, j) != 0) {
+		SPDK_ERRLOG("Export %s: pack %u lost its thread\n", j->uuid, j->pack);
+	}
+}
+
 static void
 pack_job_read_done(void *cb_arg, int bserrno)
 {
@@ -292,6 +352,23 @@ pack_job_read_done(void *cb_arg, int bserrno)
 	}
 	j->iov.iov_base = j->buf;
 	j->iov.iov_len = (size_t)j->nslots * j->w->m->chunk_size;
+	if (j->w->m->pack_sha) {
+		j->thread = spdk_get_thread();
+		snprintf(j->uuid, sizeof(j->uuid), "%s", j->w->m->uuid_str);
+		rc = s3_spawner_is_started() ?
+		     s3_spawner_pthread_create_async(pack_job_hash_thread, j,
+						     pack_job_hash_spawn_failed, j) :
+		     -ENOTSUP;
+		if (rc == 0) {
+			return;
+		}
+		/* No spawner (tests) or a failed submit: hash here. */
+		s3_peer_sha256(j->buf, j->iov.iov_len,
+			       j->w->m->pack_sha + (size_t)j->pack * 32);
+		j->store_rc = s3_peer_store_pack(j->uuid, j->pack, j->buf, j->iov.iov_len);
+		pack_job_hashed(j);
+		return;
+	}
 	rc = pack_job_put(j);
 	if (rc != 0) {
 		pack_job_end(j, rc);
@@ -388,6 +465,16 @@ pack_writer_run(const struct s3_export_ref_opts *opts, struct s3_export_manifest
 	if (rc != 0) {
 		pack_writer_free(w);
 		return rc;
+	}
+	if (s3_peer_pull_enabled()) {
+		/* Filled by each pack job before its PUT; the manifest carrying
+		 * it is published only after every pack is durable. */
+		m->pack_sha = calloc(m->pack_count, 32);
+		if (!m->pack_sha) {
+			s3_export_manifest_clear_packs(m);
+			pack_writer_free(w);
+			return -ENOMEM;
+		}
 	}
 	s3_export_manifest_seal(m);
 	w->m = m;

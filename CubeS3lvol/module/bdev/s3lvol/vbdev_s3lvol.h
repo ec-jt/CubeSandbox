@@ -1251,6 +1251,12 @@ struct s3lvol_import_opts {
 	 * S3LVOL_IMPORT_PREFETCH_PARALLEL, else S3_EXPORT_PREFETCH_DEFAULT).
 	 * Memory is bounded by window x chunk_size. */
 	uint32_t    prefetch_window;
+
+	/* Peer pull: the source node's private address ("ip[:port]"), or NULL.
+	 * Packs of a version 6 manifest carrying digests are read from it before
+	 * S3, each one verified, with S3 as the per-pack fallback (s3_peer.h).
+	 * Ignored unless S3LVOL_PEER_PULL is on. */
+	const char *peer;
 };
 
 /**
@@ -1391,6 +1397,15 @@ struct s3lvol_import_status_info {
 	uint64_t                 pf_retries;
 	uint64_t                 pf_hedges_issued;
 	uint64_t                 pf_hedges_won;
+	/* Bytes by source (peer pull). Live while running, last run after. */
+	char                     peer[64];
+	uint64_t                 peer_bytes;
+	uint64_t                 peer_hits;
+	uint64_t                 peer_misses;
+	uint64_t                 peer_mismatches;
+	uint64_t                 peer_fallbacks;
+	uint64_t                 peer_hedged;
+	uint64_t                 s3_bytes;
 };
 
 const char *s3lvol_import_state_name(enum s3lvol_import_state state);
@@ -1416,6 +1431,9 @@ int s3lvol_lvol_warm_status(struct s3lvol_lvstore *lvs, const char *lvol_name,
 /* Warm every read-only tpl-* snapshot. S3LVOL_WARM_TEMPLATES=0 disables. */
 void s3lvol_lvstore_warm_templates(struct s3lvol_lvstore *lvs);
 void s3lvol_lvol_warm_forget_lvs(struct s3lvol_lvstore *lvs);
+/** Start queued template warm-ups in \p lvol's snapshot chain now (a create
+ * or activation is about to read them). No-op when nothing is queued. */
+void s3lvol_lvol_warm_promote(struct s3lvol_lvstore *lvs, struct spdk_lvol *lvol);
 
 /* S3LVOL_IMPORT_PREFETCH_PARALLEL, else S3_EXPORT_PREFETCH_DEFAULT (64); capped.
  * Both the per-volume window and the per-lvstore cap shared by every

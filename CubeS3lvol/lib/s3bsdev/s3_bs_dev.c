@@ -253,9 +253,18 @@ struct s3_ctx {
 	bool destroying;
 
 	/* Cache warm-ups in flight (s3_bs_dev_warm). Teardown waits for zero: a
-	 * warm-up holds GETs and cache fills that reach ctx and the cache. */
+	 * warm-up holds GETs and cache fills that reach ctx and the cache.
+	 * warm_list links the jobs so teardown can abandon their GETs instead
+	 * of waiting up to the 60 s request deadline for each (B1). */
 	uint32_t warm_jobs;
 	bool teardown_waiting_warm;
+	struct s3_warm_job *warm_list;
+
+	/* Foreground S3 GETs in flight (reads that missed overlay and cache).
+	 * While any is pending, each warm-up keeps at most one GET in flight, so
+	 * a restart's warm-up never queues ahead of the create it exists to help
+	 * (B2). */
+	uint32_t fg_gets;
 	bool source_hold;
 	bool scoped_source_hold;
 
@@ -694,6 +703,9 @@ s3_chunk_read_done(void *cb_arg, uint64_t bytes_read, int status)
 	struct s3_chunk_io *cio = cb_arg;
 	struct s3_ctx *ctx = cio->bs_io->ctx;
 
+	if (ctx->fg_gets > 0) {
+		ctx->fg_gets--;
+	}
 	if (status == -ENOENT && s3_chunk_read_should_reread(cio)) {
 		int rc;
 
@@ -891,6 +903,7 @@ s3_chunk_read_submit(struct s3_chunk_io *cio)
 	if (rc != 0) {
 		return rc;
 	}
+	ctx->fg_gets++;
 	/* the want < length remainder is zero-filled in the completion */
 
 	return 0;
@@ -2198,6 +2211,7 @@ s3_bs_dev_flusher_drained(void *cb_arg, int status)
 }
 
 static void s3_bs_dev_teardown(struct s3_ctx *ctx);
+static void s3_warm_cancel_all(struct s3_ctx *ctx);
 
 /* The cache's last outstanding I/O has completed (or its last frame unwound).
  *
@@ -2248,9 +2262,17 @@ s3_bs_dev_teardown(struct s3_ctx *ctx)
 	 * after it advertised the lvstore as free. s3_deferred_deleted() resumes
 	 * here when the last one lands. */
 	if (ctx->warm_jobs > 0) {
-		SPDK_NOTICELOG("Destroying s3_bs_dev for '%s': waiting for %u cache "
-			       "warm-up(s) to stop\n", ctx->prefix, ctx->warm_jobs);
+		SPDK_NOTICELOG("Destroying s3_bs_dev for '%s': cancelling %u cache "
+			       "warm-up(s)\n", ctx->prefix, ctx->warm_jobs);
 		ctx->teardown_waiting_warm = true;
+		/* Abandon their GETs: a warm-up is only an optimisation, and a GET
+		 * stalled in S3 used to hold the unload for up to the 60 s request
+		 * deadline, past the 30 s unload RPC (B1). The gate makes the abandon
+		 * a fence, so no late body byte lands in a buffer that is about to
+		 * be freed; each GET still completes exactly once. */
+		s3_warm_cancel_all(ctx);
+		/* Completions are bounced to this thread, so none ran inside the
+		 * cancel: the last s3_warm_finish() resumes teardown. */
 		return;
 	}
 
@@ -4264,6 +4286,7 @@ s3_bs_dev_kick_flusher(struct spdk_bs_dev *bs_dev)
 struct s3_warm_slot {
 	struct s3_warm_job *job;
 	void               *buf;
+	struct s3_gate     *gate;   /* fence + cancel handle of the GET in flight */
 	uint64_t            chunk;
 	struct spdk_uuid    uuid;
 	uint32_t            valid_bytes;
@@ -4272,6 +4295,7 @@ struct s3_warm_slot {
 
 struct s3_warm_job {
 	struct s3_ctx         *ctx;
+	struct s3_warm_job    *next_job;   /* ctx->warm_list */
 	uint64_t              *chunks;
 	uint64_t               n;
 	uint64_t               next;
@@ -4294,6 +4318,25 @@ s3_warm_now_us(void)
 
 static void s3_warm_pump(struct s3_warm_job *job);
 
+/* Teardown: stop every warm-up and abandon the GETs they have in flight. Only
+ * flags and cancels; each GET's callback still runs (bounced to this thread,
+ * so never inside this call) and the last one finishes the job. */
+static void
+s3_warm_cancel_all(struct s3_ctx *ctx)
+{
+	struct s3_warm_job *job;
+	uint32_t i;
+
+	for (job = ctx->warm_list; job; job = job->next_job) {
+		job->stopping = true;
+		for (i = 0; i < job->window; i++) {
+			if (job->slots[i].busy && job->slots[i].gate) {
+				s3_gate_abandon(job->slots[i].gate);
+			}
+		}
+	}
+}
+
 static void
 s3_warm_finish(struct s3_warm_job *job)
 {
@@ -4302,8 +4345,15 @@ s3_warm_finish(struct s3_warm_job *job)
 	void *cb_arg = job->cb_arg;
 	struct s3_warm_stats st = job->st;
 	int status = job->status;
+	struct s3_warm_job **pp;
 	uint32_t i;
 
+	for (pp = &ctx->warm_list; *pp; pp = &(*pp)->next_job) {
+		if (*pp == job) {
+			*pp = job->next_job;
+			break;
+		}
+	}
 	st.elapsed_ms = (s3_warm_now_us() - job->start_us) / 1000;
 	for (i = 0; i < job->window; i++) {
 		spdk_dma_free(job->slots[i].buf);
@@ -4361,6 +4411,16 @@ s3_warm_get_done(void *arg, uint64_t bytes_read, int status)
 	uint32_t now_valid = 0;
 	int rc;
 
+	if (slot->gate) {
+		if (s3_gate_is_abandoned(slot->gate) && status == 0) {
+			status = -ECANCELED;   /* bytes may be partial; never cache them */
+		}
+		s3_gate_free(slot->gate);
+		slot->gate = NULL;
+	}
+	if (status != 0 && job->stopping) {
+		status = -ECANCELED;
+	}
 	if (status == 0 && bytes_read < slot->valid_bytes) {
 		status = -EIO;
 	}
@@ -4395,7 +4455,10 @@ s3_warm_pump(struct s3_warm_job *job)
 	if (ctx->destroying || !ctx->cache) {
 		job->stopping = true;
 	}
-	while (!job->stopping && job->next < job->n && job->inflight < job->window) {
+	/* Foreground reads are waiting on S3: keep one GET per warm-up so the
+	 * warm-up still makes progress but never crowds them out (B2). */
+	while (!job->stopping && job->next < job->n && job->inflight < job->window &&
+	       !(ctx->fg_gets > 0 && job->inflight >= 1)) {
 		struct s3_warm_slot *slot = NULL;
 		uint64_t chunk = job->chunks[job->next++];
 		struct spdk_uuid uuid;
@@ -4429,9 +4492,12 @@ s3_warm_pump(struct s3_warm_job *job)
 		job->st.fetched++;
 
 		s3_data_key(ctx, &uuid, key, sizeof(key));
-		rc = s3_get_range(ctx->client, key, 0, valid, slot->buf,
-				  s3_warm_get_done, slot);
+		slot->gate = s3_gate_new();   /* NULL: plain GET, just not cancellable */
+		rc = s3_get_range_gated(ctx->client, key, 0, valid, slot->buf,
+					slot->gate, s3_warm_get_done, slot);
 		if (rc != 0) {
+			s3_gate_free(slot->gate);
+			slot->gate = NULL;
 			job->st.fetched--;
 			s3_warm_slot_done(slot, rc);
 			return;   /* s3_warm_slot_done re-entered the pump */
@@ -4517,6 +4583,8 @@ s3_bs_dev_warm(struct spdk_bs_dev *bs_dev, const uint64_t *chunks, uint64_t n,
 	}
 
 	ctx->warm_jobs++;
+	job->next_job = ctx->warm_list;
+	ctx->warm_list = job;
 	s3_warm_pump(job);
 	return 0;
 }

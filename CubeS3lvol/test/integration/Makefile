@@ -75,7 +75,7 @@ APPS = s3_client_test s3_spawner_test s3_thread_bounce_test s3_bs_dev_test \
        s3_statefile_test s3_local_dev_test s3_checkpoint_test s3_export_swap_test s3_export_prefetch_test \
        s3_copy_xml_test s3_pending_persist_test s3_recovery_test \
        s3_put_etag_test s3_put_etag_request_test s3_b16_ctl_test s3_hedge_test \
-       s3_warm_select_test s3_export_chunk_retry_test s3_export_pack_test
+       s3_warm_select_test s3_export_chunk_retry_test s3_export_pack_test s3_peer_test
 
 # (a) minimal library set for the stubbed path
 STUB_SRCS      = spdk_thread_stub.c
@@ -343,6 +343,16 @@ s3_export_pack_test: s3_export_pack_test.c $(S3BSDEV_DIR)/libs3bsdev.a
 	    $(BLOB_DPDK_ARGS) \
 	    $(SYS_LIBS) $(TEST_SYS_LIBS) -o $@
 
+# Peer pull: the real peer server on loopback against the export device and an
+# in-memory S3. Same link as the pack test.
+s3_peer_test: s3_peer_test.c $(S3BSDEV_DIR)/libs3bsdev.a
+	$(CC) $(COMMON_CFLAGS) s3_peer_test.c \
+	    $(S3BSDEV_DIR)/libs3bsdev.a \
+	    $(AWS_LIBS) \
+	    -Wl,--start-group $(BLOB_SPDK_LIBS) -Wl,--end-group \
+	    $(BLOB_DPDK_ARGS) \
+	    $(SYS_LIBS) $(TEST_SYS_LIBS) -o $@
+
 s3_export_prefetch_test: s3_export_prefetch_test.c $(S3BSDEV_DIR)/libs3bsdev.a
 	$(CC) $(COMMON_CFLAGS) s3_export_prefetch_test.c \
 	    $(S3BSDEV_DIR)/libs3bsdev.a \
@@ -379,7 +389,8 @@ check: s3_spawner_test s3_thread_bounce_test s3_journal_test s3_wal_test s3_wal_
        s3_flush_test s3_export_test s3_statefile_test s3_local_dev_test \
        s3_checkpoint_test s3_export_swap_test s3_export_prefetch_test s3_copy_xml_test \
        s3_pending_persist_test s3_recovery_test s3_put_etag_test s3_put_etag_request_test \
-       s3_b16_ctl_test s3_hedge_test s3_warm_select_test s3_export_chunk_retry_test s3_export_pack_test
+       s3_b16_ctl_test s3_hedge_test s3_warm_select_test s3_export_chunk_retry_test s3_export_pack_test \
+       s3_peer_test
 	./s3_spawner_test
 	./s3_thread_bounce_test
 	./s3_journal_test
@@ -398,6 +409,7 @@ check: s3_spawner_test s3_thread_bounce_test s3_journal_test s3_wal_test s3_wal_
 	./s3_warm_select_test
 	./s3_export_chunk_retry_test
 	./s3_export_pack_test
+	./s3_peer_test
 	./s3_put_etag_test
 	./s3_put_etag_request_test
 	./s3_pending_persist_test

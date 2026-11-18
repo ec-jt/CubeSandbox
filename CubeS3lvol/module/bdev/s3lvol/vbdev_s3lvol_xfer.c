@@ -49,6 +49,7 @@
 
 #include "s3lvol/s3_export.h"
 #include "s3lvol/s3_client.h"
+#include "s3lvol/s3_peer.h"
 
 #include "vbdev_s3lvol.h"
 #include "source_control_ticket.h"
@@ -1882,6 +1883,61 @@ warm_q_pump(void)
 	}
 }
 
+/* A create or activation is about to read \p lvol and, through its snapshot
+ * chain, the template it was derived from. Any of those still waiting in the
+ * warm-up queue starts now, ahead of the queue and past the concurrency cap:
+ * after a restart the first create used to wait behind every smaller template
+ * (B2). Volumes already warming or done are left alone. */
+void
+s3lvol_lvol_warm_promote(struct s3lvol_lvstore *lvs, struct spdk_lvol *lvol)
+{
+	struct spdk_lvol_store *store = s3lvol_lvstore_get_lvs(lvs);
+	uint32_t window = warm_env_u32("S3LVOL_WARM_WINDOW", 8, 1, 128);
+	struct spdk_blob *blob;
+	unsigned depth = 0;
+
+	if (!store || !lvol || !lvol->blob || g_warm_q_next >= g_warm_q_n) {
+		return;
+	}
+	for (blob = lvol->blob; blob && depth < 64; depth++) {
+		spdk_blob_id id = spdk_blob_get_id(blob), pid;
+		struct spdk_lvol *l, *hit = NULL;
+		size_t i;
+
+		TAILQ_FOREACH(l, &store->lvols, link) {
+			if (l->blob_id == id) {
+				hit = l;
+				break;
+			}
+		}
+		for (i = g_warm_q_next; hit && i < g_warm_q_n; i++) {
+			struct lvol_warm *w;
+
+			if (g_warm_q[i].lvs != lvs || strcmp(g_warm_q[i].name, hit->name) != 0) {
+				continue;
+			}
+			memmove(&g_warm_q[i], &g_warm_q[i + 1],
+				(g_warm_q_n - i - 1) * sizeof(*g_warm_q));
+			g_warm_q_n--;
+			SPDK_NOTICELOG("cache warm-up of '%s' promoted: '%s' is waiting "
+				       "for it\n", hit->name, lvol->name);
+			if (s3lvol_lvol_warm(lvs, hit, window) == 0) {
+				w = lvol_warm_find(lvs, hit->name);
+				if (w && w->state == S3LVOL_IMPORT_RUNNING && !w->queued) {
+					w->queued = true;
+					g_warm_q_running++;
+				}
+			}
+			break;
+		}
+		pid = spdk_blob_get_parent_snapshot(store->blobstore, id);
+		if (pid == SPDK_BLOBID_INVALID) {
+			break;
+		}
+		blob = blob_by_id(store, pid);
+	}
+}
+
 /* Template snapshots are the volumes every restore reads, and their names say so
  * (tpl-tpl-<id>-rootfs, -memory-snap, versioned base snapshots, and the
  * s3-meta-tpl-<id> package metadata disk). Warm them
@@ -3360,6 +3416,7 @@ struct import_ctx {
 	uint32_t                   prefetch_window;
 	struct spdk_lvol          *created_lvol;
 	char                       base_lvol[SPDK_LVOL_NAME_MAX];
+	char                       peer[64];
 
 	s3lvol_lvol_op_cb          cb_fn;
 	void                      *cb_arg;
@@ -3976,6 +4033,9 @@ s3lvol_lvol_import_admitted(struct s3lvol_lvstore *lvs, const struct s3lvol_impo
 	if (opts->base_lvol) {
 		snprintf(ctx->base_lvol, sizeof(ctx->base_lvol), "%s", opts->base_lvol);
 	}
+	if (opts->peer) {
+		snprintf(ctx->peer, sizeof(ctx->peer), "%s", opts->peer);
+	}
 	snprintf(ctx->lvol_name, sizeof(ctx->lvol_name), "%s", opts->lvol_name);
 	snprintf(ctx->uuid_str, sizeof(ctx->uuid_str), "%s", opts->export_uuid);
 
@@ -4175,6 +4235,9 @@ struct import_status {
 	uint64_t                   pf_retries;
 	uint64_t                   pf_hedges_issued;
 	uint64_t                   pf_hedges_won;
+	struct s3_export_bs_dev_stats src_stats;   /* peer pull: bytes by source */
+	char                       peer[64];
+	struct spdk_bs_dev        *live_src;       /* overlay's export dev while it runs */
 	TAILQ_ENTRY(import_status) link;
 };
 
@@ -4225,6 +4288,9 @@ import_status_begin(struct s3lvol_lvstore *lvs, const char *lvol_name,
 	st->pf_retries = 0;
 	st->pf_hedges_issued = 0;
 	st->pf_hedges_won = 0;
+	memset(&st->src_stats, 0, sizeof(st->src_stats));
+	st->peer[0] = '\0';
+	st->live_src = NULL;
 	return st;
 }
 
@@ -5852,6 +5918,27 @@ s3lvol_decouple_get(const struct s3lvol_decouple *d, struct s3lvol_decouple_info
 	out->clusters_done  = d->done;
 }
 
+/* Bytes by source of an import record: live from the export device while the
+ * overlay runs, the last run's counters after. */
+static void
+import_status_fill_sources(const struct import_status *st,
+			   struct s3lvol_import_status_info *out)
+{
+	struct s3_export_bs_dev_stats es = st->src_stats;
+
+	if (st->live_src) {
+		(void)s3_export_bs_dev_get_stats(st->live_src, &es);
+	}
+	snprintf(out->peer, sizeof(out->peer), "%s", st->peer);
+	out->peer_bytes = es.peer_bytes;
+	out->peer_hits = es.peer_hits;
+	out->peer_misses = es.peer_misses;
+	out->peer_mismatches = es.peer_mismatches;
+	out->peer_fallbacks = es.peer_fallbacks;
+	out->peer_hedged = es.peer_hedged;
+	out->s3_bytes = es.get_bytes;
+}
+
 int
 s3lvol_import_status_get(struct s3lvol_lvstore *lvs, struct spdk_lvol *lvol,
 			 bool start_if_idle, uint32_t window,
@@ -5907,6 +5994,7 @@ s3lvol_import_status_get(struct s3lvol_lvstore *lvs, struct spdk_lvol *lvol,
 				out->pf_retries = st->pf_retries;
 				out->pf_hedges_issued = st->pf_hedges_issued;
 				out->pf_hedges_won = st->pf_hedges_won;
+				import_status_fill_sources(st, out);
 				if (out->state == S3LVOL_IMPORT_DONE) {
 					/* The mark outlived a completed run: the sync
 					 * that clears it failed. Not local. */
@@ -5931,6 +6019,7 @@ s3lvol_import_status_get(struct s3lvol_lvstore *lvs, struct spdk_lvol *lvol,
 			out->clusters_done = st->clusters_total;
 			out->prefetch = st->prefetch;
 			out->window = st->window;
+			import_status_fill_sources(st, out);
 		}
 		out->local_chunks = out->present_chunks;
 		out->state = S3LVOL_IMPORT_DONE;
@@ -5981,6 +6070,7 @@ s3lvol_import_status_get(struct s3lvol_lvstore *lvs, struct spdk_lvol *lvol,
 		out->pf_retries = st->pf_retries;
 		out->pf_hedges_issued = st->pf_hedges_issued;
 		out->pf_hedges_won = st->pf_hedges_won;
+		import_status_fill_sources(st, out);
 		/* A failed or cancelled run leaves the volume an esnap clone. A new
 		 * start clears it, so only report done when the blob says so. */
 		out->done = false;
@@ -6055,6 +6145,7 @@ struct delta_overlay {
 	uint32_t                     finish_msgs;  /* finish messages queued */
 	bool                         finishing;
 	bool                         pumping;      /* delta_overlay_next on the stack */
+	char                         peer[64];
 };
 
 static void delta_overlay_next(struct delta_overlay *o);
@@ -6086,6 +6177,18 @@ delta_overlay_free(struct delta_overlay *o)
 		s3_export_prefetcher_destroy(o->pf);
 	}
 	lvs_pf_budget_put(o->budget);
+	if (o->src) {
+		struct s3_export_bs_dev_stats es;
+
+		/* Bytes by source, for rcow_import_status after the run. */
+		if (s3_export_bs_dev_get_stats(o->src, &es) == 0 && o->st) {
+			o->st->src_stats = es;
+			snprintf(o->st->peer, sizeof(o->st->peer), "%s", o->peer);
+		}
+		if (o->st) {
+			o->st->live_src = NULL;
+		}
+	}
 	if (o->src_ch) {
 		o->src->destroy_channel(o->src, o->src_ch);
 	}
@@ -6491,6 +6594,16 @@ delta_overlay_begin(struct import_ctx *ctx, struct spdk_lvol *lvol)
 	if (rc != 0) {
 		s3_client_put(client);
 		goto err;
+	}
+	if (ctx->peer[0] != '\0' && s3_peer_pull_enabled()) {
+		snprintf(o->peer, sizeof(o->peer), "%s", ctx->peer);
+		s3_export_bs_dev_set_peer(o->src, o->peer);
+		if (o->st) {
+			snprintf(o->st->peer, sizeof(o->st->peer), "%s", o->peer);
+		}
+	}
+	if (o->st) {
+		o->st->live_src = o->src;
 	}
 	o->src_ch = o->src->create_channel(o->src);
 	o->blob_ch = spdk_bs_alloc_io_channel(store->blobstore);
