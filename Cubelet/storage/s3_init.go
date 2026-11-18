@@ -36,6 +36,7 @@ var ensureS3MetadataReadyFn = EnsureS3MetadataReady
 var (
 	resumePendingSnapshotExportsFn = ResumePendingSnapshotExports
 	startSnapshotExportWorkerFn    = StartSnapshotExportWorker
+	startStaleS3MountSweeperFn     = startStaleS3MountSweeperOnce
 )
 
 // s3CowOverride lets the init loop run EnsureS3MetadataReady before
@@ -115,6 +116,9 @@ func (l *local) runS3CowInitLoop(ctx context.Context) {
 		// Async S3 export (B15) is the exception: packages sealed before a
 		// restart whose roles are not all DONE are requeued from native state.
 		startSnapshotExportWorkerFn()
+		// Stale metadata mounts left by an s3lvol restart are dropped and
+		// remounted now, and again every staleMountSweepInterval.
+		startStaleS3MountSweeperFn(ctx)
 		go func() {
 			n, err := resumePendingSnapshotExportsFn(ctx)
 			if err != nil {

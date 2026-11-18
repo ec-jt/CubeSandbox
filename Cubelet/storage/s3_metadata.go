@@ -765,6 +765,17 @@ func mountS3MetadataLockedTimeout(snapshotID, devicePath, mountPath string,
 		return fmt.Errorf("mkdir s3 metadata mount %s: %w", mountPath, err)
 	}
 	if s3MetadataIsMounted(mountPath) {
+		// A mount whose device vanished (s3lvol restarted with the
+		// initiator disconnected, or the namespace was renumbered) reads
+		// EIO forever. Never reuse it: drop it lazily and mount again.
+		if reason := s3MetadataMountStale(mountPath); reason != "" {
+			if err := dropStaleMountLocked(mountPath, reason); err != nil {
+				return fmt.Errorf("s3 metadata mount %s is stale (%s) and could not be dropped: %w",
+					mountPath, reason, err)
+			}
+		}
+	}
+	if s3MetadataIsMounted(mountPath) {
 		src := s3MetadataMountSource(mountPath)
 		want := filepath.Clean(strings.TrimSpace(devicePath))
 		if src != "" && (src == want || filepath.Base(src) == filepath.Base(want)) {
@@ -807,7 +818,7 @@ func mountS3MetadataLockedTimeout(snapshotID, devicePath, mountPath string,
 		CubeLog.Warnf("mount s3 metadata %s at %s attempt %d/%d failed, retrying: %v",
 			devicePath, mountPath, attempt, attempts, lastErr)
 		// A mount that timed out may still have completed in the kernel.
-		if s3MetadataIsMounted(mountPath) {
+		if s3MetadataIsMounted(mountPath) && s3MetadataMountStale(mountPath) == "" {
 			src := s3MetadataMountSource(mountPath)
 			want := filepath.Clean(strings.TrimSpace(devicePath))
 			if src != "" && (src == want || filepath.Base(src) == filepath.Base(want)) {
