@@ -82,6 +82,7 @@ pub mod memory_manager;
 pub mod migration;
 pub mod pagemap_anon;
 mod pci_segment;
+pub mod restore_phase;
 pub mod seccomp_filters;
 mod serial_manager;
 mod sigwinch_listener;
@@ -781,6 +782,7 @@ impl Vmm {
             .try_clone()
             .map_err(VmError::EventFdClone)?;
 
+        restore_phase::mark(&self.sandbox_id, restore_phase::VM_RESTORE_MEMORY);
         let mut vm = Vm::new_from_snapshot(
             &snapshot,
             vm_config.clone(),
@@ -799,7 +801,9 @@ impl Vmm {
         )?;
 
         // Now we can restore the rest of the VM.
+        restore_phase::mark(&self.sandbox_id, restore_phase::VM_RESTORE_DEVICES);
         vm.restore(snapshot).map_err(VmError::Restore)?;
+        restore_phase::mark(&self.sandbox_id, restore_phase::VM_RESUME);
         vm.resume().map_err(VmError::Resume)?;
 
         self.vm_config = Some(vm_config.clone());

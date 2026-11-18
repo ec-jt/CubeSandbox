@@ -9,6 +9,8 @@ import (
 	"encoding/json"
 	"net"
 	"net/http"
+	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
@@ -30,9 +32,31 @@ import (
 const (
 	RestorePhaseImporting   = "importing"
 	RestorePhaseRestoringVM = "restoring_vm"
-	RestorePhaseDone        = "done"
-	RestorePhaseFailed      = "failed"
+	// VM sub-phases, reported by the VMM inside the shim through
+	// restorePhaseRoot (see hypervisor/vmm/src/restore_phase.rs).
+	RestorePhaseVMRestoreMemory  = "vm_restore_memory"
+	RestorePhaseVMRestoreDevices = "vm_restore_devices"
+	RestorePhaseVMResume         = "vm_resume"
+	RestorePhaseAgentReady       = "agent_ready"
+	RestorePhaseDone             = "done"
+	RestorePhaseFailed           = "failed"
 )
+
+// restorePhaseRank orders the non-final phases. A sub-phase read from the
+// VMM only ever moves a restore forward.
+var restorePhaseRank = map[string]int{
+	RestorePhaseImporting:        1,
+	RestorePhaseRestoringVM:      2,
+	RestorePhaseVMRestoreMemory:  3,
+	RestorePhaseVMRestoreDevices: 4,
+	RestorePhaseVMResume:         5,
+	RestorePhaseAgentReady:       6,
+}
+
+// restorePhaseRoot is where Cubelet asks the VMM for sub-phases: the VMM
+// writes <root>/<sandbox>/phase only when <root>/<sandbox>/ exists. Swapped
+// in tests.
+var restorePhaseRoot = "/run/cube-restore-phase"
 
 // RestoreProgressPath is the Cubelet HTTP path; ?sandbox_id=<id>.
 const RestoreProgressPath = "/v1/storage/restore-progress"
@@ -110,6 +134,71 @@ func (t *restoreTracker) begin(sandboxID string, jobs []importJob) {
 	t.gcLocked(now)
 	t.entries[sandboxID] = e
 	t.mu.Unlock()
+	requestVMPhases(sandboxID)
+}
+
+// requestVMPhases creates the per-sandbox directory that asks the VMM to
+// record its restore sub-phases. Best effort: without it the bar just stays
+// at restoring_vm.
+func requestVMPhases(sandboxID string) {
+	if !validPhaseSandboxID(sandboxID) {
+		return
+	}
+	dir := filepath.Join(restorePhaseRoot, sandboxID)
+	_ = os.MkdirAll(restorePhaseRoot, 0o700)
+	_ = os.RemoveAll(dir)
+	_ = os.Mkdir(dir, 0o700)
+}
+
+func releaseVMPhases(sandboxID string) {
+	if !validPhaseSandboxID(sandboxID) {
+		return
+	}
+	_ = os.RemoveAll(filepath.Join(restorePhaseRoot, sandboxID))
+}
+
+func validPhaseSandboxID(id string) bool {
+	if id == "" || len(id) > 128 {
+		return false
+	}
+	for _, c := range id {
+		if !(c == '-' || c == '_' || (c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')) {
+			return false
+		}
+	}
+	return true
+}
+
+// readVMPhase returns the sub-phase the VMM last recorded, or "".
+func readVMPhase(sandboxID string) string {
+	if !validPhaseSandboxID(sandboxID) {
+		return ""
+	}
+	raw, err := os.ReadFile(filepath.Join(restorePhaseRoot, sandboxID, "phase"))
+	if err != nil || len(raw) > 64 {
+		return ""
+	}
+	p := strings.TrimSpace(string(raw))
+	switch p {
+	case RestorePhaseVMRestoreMemory, RestorePhaseVMRestoreDevices, RestorePhaseVMResume, RestorePhaseAgentReady:
+		return p
+	}
+	return ""
+}
+
+// advanceFromVMLocked moves a running restore to the VMM's sub-phase when
+// that is further along. Only after the import: before it the VMM has not
+// started, and a stale file must not skip the import phase.
+func (e *restoreEntry) advanceFromVMLocked(now time.Time) {
+	if !e.finished.IsZero() || restorePhaseRank[e.phase] < restorePhaseRank[RestorePhaseRestoringVM] {
+		return
+	}
+	p := readVMPhase(e.sandboxID)
+	if p == "" || restorePhaseRank[p] <= restorePhaseRank[e.phase] {
+		return
+	}
+	e.phase = p
+	e.lastProgress = now
 }
 
 // update records one rcow_import_status reading. Progress "moves" when any
@@ -156,15 +245,26 @@ func (t *restoreTracker) setPhase(sandboxID, phase string, err error) {
 		return
 	}
 	now := restoreProgressNow()
+	// Pick up what the VMM reported first: a failure then names the step it
+	// failed in, and a late restoring_vm cannot move the bar backwards.
+	e.advanceFromVMLocked(now)
+	final := phase == RestorePhaseDone || phase == RestorePhaseFailed
+	if !final && restorePhaseRank[phase] < restorePhaseRank[e.phase] {
+		return
+	}
+	if err != nil {
+		e.err = err.Error()
+		if phase == RestorePhaseFailed && restorePhaseRank[e.phase] > restorePhaseRank[RestorePhaseRestoringVM] {
+			e.err = e.phase + ": " + e.err
+		}
+	}
 	if e.phase != phase {
 		e.lastProgress = now
 	}
 	e.phase = phase
-	if err != nil {
-		e.err = err.Error()
-	}
-	if phase == RestorePhaseDone || phase == RestorePhaseFailed {
+	if final {
 		e.finished = now
+		releaseVMPhases(sandboxID)
 	}
 }
 
@@ -180,6 +280,7 @@ func (t *restoreTracker) get(sandboxID string) (*RestoreProgress, bool) {
 	if e == nil {
 		return nil, false
 	}
+	e.advanceFromVMLocked(now)
 	p := &RestoreProgress{
 		SandboxID:      e.sandboxID,
 		Phase:          e.phase,

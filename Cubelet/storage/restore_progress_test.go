@@ -10,6 +10,8 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -23,11 +25,76 @@ func (c *fakeClock) add(d time.Duration) { c.t = c.t.Add(d) }
 func useFakeRestoreClock(t *testing.T) *fakeClock {
 	t.Helper()
 	c := &fakeClock{t: time.Date(2026, 11, 18, 12, 0, 0, 0, time.UTC)}
-	prevNow, prevTracker := restoreProgressNow, restoreProgress
+	prevNow, prevTracker, prevRoot := restoreProgressNow, restoreProgress, restorePhaseRoot
 	restoreProgressNow = c.now
 	restoreProgress = &restoreTracker{entries: map[string]*restoreEntry{}}
-	t.Cleanup(func() { restoreProgressNow, restoreProgress = prevNow, prevTracker })
+	restorePhaseRoot = filepath.Join(t.TempDir(), "phase")
+	t.Cleanup(func() { restoreProgressNow, restoreProgress, restorePhaseRoot = prevNow, prevTracker, prevRoot })
 	return c
+}
+
+// vmmMark does what hypervisor/vmm/src/restore_phase.rs does.
+func vmmMark(t *testing.T, id, phase string) {
+	t.Helper()
+	dir := filepath.Join(restorePhaseRoot, id)
+	if _, err := os.Stat(dir); err != nil {
+		return // not requested: the VMM writes nothing
+	}
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "phase.tmp"), []byte(phase+"\n"), 0o600))
+	require.NoError(t, os.Rename(filepath.Join(dir, "phase.tmp"), filepath.Join(dir, "phase")))
+}
+
+func TestRestoreProgressVMSubPhases(t *testing.T) {
+	c := useFakeRestoreClock(t)
+	restoreProgress.begin("sb1", threeJobs("sb1"))
+	require.DirExists(t, filepath.Join(restorePhaseRoot, "sb1"), "begin asks the VMM for sub-phases")
+
+	// A stale file must not skip the import phase.
+	vmmMark(t, "sb1", RestorePhaseVMResume)
+	p, _ := GetRestoreProgress("sb1")
+	require.Equal(t, RestorePhaseImporting, p.Phase)
+	require.NoError(t, os.Remove(filepath.Join(restorePhaseRoot, "sb1", "phase")))
+
+	MarkRestorePhase("sb1", RestorePhaseRestoringVM, nil)
+	for _, ph := range []string{RestorePhaseVMRestoreMemory, RestorePhaseVMRestoreDevices, RestorePhaseVMResume, RestorePhaseAgentReady} {
+		c.add(3 * time.Second)
+		vmmMark(t, "sb1", ph)
+		p, _ = GetRestoreProgress("sb1")
+		require.Equal(t, ph, p.Phase)
+		require.Zero(t, p.StalledSeconds, "a new sub-phase is progress")
+	}
+	// restoring_vm reported late never moves the bar back.
+	MarkRestorePhase("sb1", RestorePhaseRestoringVM, nil)
+	p, _ = GetRestoreProgress("sb1")
+	require.Equal(t, RestorePhaseAgentReady, p.Phase)
+
+	MarkRestorePhase("sb1", RestorePhaseDone, nil)
+	p, _ = GetRestoreProgress("sb1")
+	require.Equal(t, RestorePhaseDone, p.Phase)
+	require.NoDirExists(t, filepath.Join(restorePhaseRoot, "sb1"), "finished restores clean up")
+}
+
+func TestRestoreProgressFailureNamesVMStep(t *testing.T) {
+	useFakeRestoreClock(t)
+	restoreProgress.begin("sb2", threeJobs("sb2"))
+	MarkRestorePhase("sb2", RestorePhaseRestoringVM, nil)
+	vmmMark(t, "sb2", RestorePhaseVMRestoreDevices)
+	MarkRestorePhase("sb2", RestorePhaseFailed, errors.New("Restore vm failed"))
+	p, _ := GetRestoreProgress("sb2")
+	require.Equal(t, RestorePhaseFailed, p.Phase)
+	require.Equal(t, "vm_restore_devices: Restore vm failed", p.Error)
+	require.NoDirExists(t, filepath.Join(restorePhaseRoot, "sb2"))
+}
+
+func TestRestoreProgressIgnoresGarbagePhaseFile(t *testing.T) {
+	useFakeRestoreClock(t)
+	restoreProgress.begin("sb3", threeJobs("sb3"))
+	MarkRestorePhase("sb3", RestorePhaseRestoringVM, nil)
+	vmmMark(t, "sb3", "done")
+	p, _ := GetRestoreProgress("sb3")
+	require.Equal(t, RestorePhaseRestoringVM, p.Phase)
+	requestVMPhases("../evil")
+	require.NoDirExists(t, filepath.Join(filepath.Dir(restorePhaseRoot), "evil"))
 }
 
 func threeJobs(id string) []importJob {

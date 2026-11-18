@@ -4,6 +4,7 @@ pub mod vmm_config;
 pub use event_notifier::NotifyEvent;
 pub use vmm::api::*;
 pub use vmm::config;
+pub use vmm::restore_phase;
 pub use vmm::seccomp_filters::*;
 pub use vmm::vm_config;
 pub use vmm::{SnapshotConfig, SnapshotType};

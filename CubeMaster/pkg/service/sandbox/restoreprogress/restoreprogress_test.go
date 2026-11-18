@@ -16,6 +16,9 @@ import (
 	"time"
 )
 
+// fakePhase is the phase every fake Cubelet reports.
+var fakePhase = "importing"
+
 // fakeCubelet serves the Cubelet endpoint on 127.0.0.<n> so several "nodes"
 // can share one port.
 func fakeCubelet(t *testing.T, ip string, port int, has map[string]bool, hits *int32) {
@@ -35,7 +38,7 @@ func fakeCubelet(t *testing.T, ip string, port int, has map[string]bool, hits *i
 			w.WriteHeader(http.StatusNotFound)
 			return
 		}
-		_ = json.NewEncoder(w).Encode(map[string]any{"sandbox_id": id, "phase": "importing", "local_chunks": 3, "total_chunks": 9})
+		_ = json.NewEncoder(w).Encode(map[string]any{"sandbox_id": id, "phase": fakePhase, "local_chunks": 3, "total_chunks": 9})
 	})}
 	go func() { _ = srv.Serve(l) }()
 	t.Cleanup(func() { _ = srv.Close() })
@@ -76,6 +79,27 @@ func TestFindUsesRecordedTargetFirst(t *testing.T) {
 	if atomic.LoadInt32(&hitsB) != 0 {
 		t.Fatalf("fan-out ran although the recorded target answered")
 	}
+}
+
+// Master forwards Cubelet's phase verbatim, so new VM sub-phases need no
+// Master change.
+func TestFindPassesVMSubPhasesThrough(t *testing.T) {
+	for _, ph := range []string{"vm_restore_memory", "vm_restore_devices", "vm_resume", "agent_ready"} {
+		reset(t)
+		fakePhase = ph
+		port := freePort(t)
+		var hits int32
+		fakeCubelet(t, "127.0.0.2", port, map[string]bool{"sb1": true}, &hits)
+		f := &Finder{Port: port, Nodes: func() []string { return []string{"127.0.0.2"} }}
+		doc, err := f.Find(context.Background(), "sb1")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if doc["phase"] != ph {
+			t.Fatalf("phase %v, want %s", doc["phase"], ph)
+		}
+	}
+	fakePhase = "importing"
 }
 
 func TestFindFansOutWithoutRecord(t *testing.T) {

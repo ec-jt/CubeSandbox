@@ -530,6 +530,7 @@ impl SandBox {
 
         if snapshot {
             self.reset_guest().await?;
+            cube_hypervisor::restore_phase::mark(&self.id, cube_hypervisor::restore_phase::AGENT_READY);
         }
 
         //add vfio device
