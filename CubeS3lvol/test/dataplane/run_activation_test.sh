@@ -428,6 +428,87 @@ COUNT="$(python3 -c "import json,sys; print(len(json.loads(sys.argv[1])))" "${AL
 info "listed${COUNT} active volume(s)"
 [ "${COUNT}" -ge 2 ] && pass "the listing form works" || fail "listing returned ${COUNT}"
 
+# --------------------------------------------------------------------------
+echo ""
+echo "=== [11] a recorded activation whose namespace is gone is re-attached"
+# What a restart leaves behind when the replay is skipped or fooled: the
+# registry still lists the volume, the live subsystem has no namespace for it.
+# Live 2026-11-17 22:50 (app2) and 01:45 (app1): rcow_active_bdev answered
+# "already active" from the registry and Cubelet got an empty device path.
+# Removing the namespace behind the module's back reproduces exactly that.
+ns_uuid_at() {	# nqn nsid -> uuid of the live namespace, or empty
+	${SPDK_RPC} nvmf_get_subsystems 2>/dev/null | python3 -c '
+import json, sys
+nqn, nsid = sys.argv[1], int(sys.argv[2])
+for s in json.load(sys.stdin):
+    if s["nqn"] == nqn:
+        for ns in s.get("namespaces", []):
+            if ns["nsid"] == nsid:
+                print(ns.get("uuid", ""))' "$1" "$2"
+}
+A_NQN="$(printf 'nqn.2026-08.io.spdk:rcow-%02d' "${A_SUB}")"
+${SPDK_RPC} nvmf_subsystem_remove_ns "${A_NQN}" "${A_NSID}" >/dev/null 2>&1 \
+	|| fail "could not remove disk-a's namespace behind the module"
+[ -z "$(ns_uuid_at "${A_NQN}" "${A_NSID}")" ] \
+	&& pass "disk-a's namespace is gone while the registry still lists it" \
+	|| fail "the namespace is still there"
+
+ST_JSON="$("${RPC}" rcow_active_bdev '{"device_name":"disk-a"}')" \
+	|| fail "activation of a stale record failed: ${ST_JSON}"
+if python3 -c "import json,sys; d=json.loads(sys.argv[1]); sys.exit(1 if d.get('already_active') else 0)" \
+		"${ST_JSON}"; then
+	pass "a stale record is not reported as already active"
+else
+	fail "a stale record was reported as already active: ${ST_JSON}"
+fi
+[ "$(jget "${ST_JSON}" nsid)" = "${A_NSID}" ] && [ "$(jget "${ST_JSON}" subsys)" = "${A_SUB}" ] \
+	&& pass "re-attached at the recorded slot ${A_SUB}/${A_NSID}" \
+	|| fail "re-attached elsewhere: ${ST_JSON}"
+[ "$(ns_uuid_at "${A_NQN}" "${A_NSID}")" = "${A_UUID}" ] \
+	&& pass "the live namespace carries disk-a's uuid again" \
+	|| fail "the live namespace is not disk-a"
+ST_DEV="$(jget "$("${RPC}" rcow_get_bdev '{"device_name":"disk-a"}')" device_path)"
+[ -n "${ST_DEV}" ] && [ -b "${ST_DEV}" ] \
+	&& pass "get_bdev resolves the re-attached volume (${ST_DEV})" \
+	|| fail "get_bdev after re-attach gave '${ST_DEV}'"
+
+# Deactivating a stale record must succeed and drop it, not fail on the empty
+# slot and keep the record forever.
+${SPDK_RPC} nvmf_subsystem_remove_ns "${A_NQN}" "${A_NSID}" >/dev/null 2>&1
+"${RPC}" rcow_deactive_bdev '{"device_name":"disk-a"}' >/dev/null 2>&1 \
+	&& pass "deactivating a stale record succeeds" \
+	|| fail "deactivating a stale record failed"
+python3 -c "
+import json,os,sys
+p='${ACTIVE_FILE}'
+d=json.load(open(p)) if os.path.exists(p) and os.path.getsize(p) else {}
+sys.exit(0 if 'disk-a' not in d else 1)" \
+	&& pass "the stale record was dropped" || fail "the stale record is still there"
+
+# rcow_verify_namespaces, the script check the replay runs, reads the live
+# namespaces independently of the module.
+"${RPC}" rcow_active_bdev '{"device_name":"disk-a"}' >/dev/null 2>&1 || fail "re-activate disk-a"
+VERIFY="$(
+	# shellcheck source=../../scripts/rcow_common.sh
+	RCOW_ACTIVE_FILE="${ACTIVE_FILE}" RCOW_RPC_SOCK=/var/run/s3lvol.sock \
+	RCOW_SPDK_RPC_PY="${SPDK_RPC_PY}" RCOW_RUN_DIR=/tmp \
+	bash -c '. "$1/scripts/rcow_common.sh" >/dev/null 2>&1; rcow_verify_namespaces; echo "rc=$?"' _ "${ROOT}"
+)"
+case "${VERIFY}" in *rc=0) pass "rcow_verify_namespaces accepts a healthy registry" ;;
+	*) fail "rcow_verify_namespaces on a healthy registry: ${VERIFY}" ;; esac
+A_NSID2="$(python3 -c "import json; print(json.load(open('${ACTIVE_FILE}'))['disk-a']['nsid'])")"
+A_SUB2="$(python3 -c "import json; print(json.load(open('${ACTIVE_FILE}'))['disk-a']['subsys'])")"
+${SPDK_RPC} nvmf_subsystem_remove_ns "$(printf 'nqn.2026-08.io.spdk:rcow-%02d' "${A_SUB2}")" \
+	"${A_NSID2}" >/dev/null 2>&1
+VERIFY="$(
+	RCOW_ACTIVE_FILE="${ACTIVE_FILE}" RCOW_RPC_SOCK=/var/run/s3lvol.sock \
+	RCOW_SPDK_RPC_PY="${SPDK_RPC_PY}" RCOW_RUN_DIR=/tmp \
+	bash -c '. "$1/scripts/rcow_common.sh" >/dev/null 2>&1; rcow_verify_namespaces; echo "rc=$?"' _ "${ROOT}"
+)"
+case "${VERIFY}" in *"disk-a: no namespace"*rc=1) pass "rcow_verify_namespaces names the missing namespace" ;;
+	*) fail "rcow_verify_namespaces missed it: ${VERIFY}" ;; esac
+"${RPC}" rcow_active_bdev '{"device_name":"disk-a"}' >/dev/null 2>&1 || fail "repair disk-a"
+
 echo ""
 echo "=== target log check"
 if grep -qE "Assertion|SIGSEGV|stays paused" /tmp/actprobe_tgt.log; then

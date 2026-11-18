@@ -24,6 +24,8 @@
  */
 
 #include "spdk/stdinc.h"
+#include "spdk/bdev.h"
+#include "spdk/uuid.h"
 #include "spdk/log.h"
 #include "spdk/nvmf.h"
 #include "spdk/string.h"
@@ -331,6 +333,33 @@ s3lvol_nvmf_remove_ns(const char *nqn, uint32_t nsid, s3lvol_nvmf_op_cb cb_fn,
 		return -EINVAL;
 	}
 	return nvmf_op_start(nqn, NULL, nsid, true, cb_fn, cb_arg);
+}
+
+int
+s3lvol_nvmf_ns_state(const char *nqn, uint32_t nsid, const char *uuid_str)
+{
+	struct spdk_nvmf_subsystem *subsystem;
+	struct spdk_nvmf_ns *ns;
+	struct spdk_bdev *bdev;
+	char have[SPDK_UUID_STRING_LEN];
+
+	if (!nqn || nsid == 0 || !uuid_str) {
+		return -EINVAL;
+	}
+	subsystem = nvmf_find_subsystem(nqn);
+	if (!subsystem) {
+		return -ENODEV;
+	}
+	ns = spdk_nvmf_subsystem_get_ns(subsystem, nsid);
+	if (!ns) {
+		return S3LVOL_NS_ABSENT;
+	}
+	bdev = spdk_nvmf_ns_get_bdev(ns);
+	if (!bdev) {
+		return S3LVOL_NS_OTHER;
+	}
+	spdk_uuid_fmt_lower(have, sizeof(have), spdk_bdev_get_uuid(bdev));
+	return strcasecmp(have, uuid_str) == 0 ? S3LVOL_NS_PRESENT : S3LVOL_NS_OTHER;
 }
 
 bool

@@ -1294,12 +1294,96 @@ ${nsid}: ${out}"
 	rcow_log "replay: ${done_n} restored, ${refused_n} refused, \
 ${failed_n} failed"
 
+	# Read every namespace back from the target. A replay call that answered
+	# success without attaching anything is exactly the failure this exists
+	# for; one more activation per missing entry repairs it (the target
+	# re-attaches a recorded volume whose namespace is gone).
+	local missing name_only
+	if ! missing="$(rcow_verify_namespaces)"; then
+		rcow_warn "after replay, recorded volume(s) have no live namespace; \
+re-activating:"
+		printf '%s\n' "${missing}" | sed 's/^/    /' >&2
+		while IFS= read -r name_only; do
+			name_only="${name_only%%:*}"
+			[ -n "${name_only}" ] || continue
+			rcow_rpc rcow_active_bdev \
+				"$(printf '{"device_name":"%s"}' "${name_only}")" \
+				>/dev/null 2>&1 ||
+				rcow_warn "re-activation of '${name_only}' failed"
+		done <<<"${missing}"
+		if ! missing="$(rcow_verify_namespaces)"; then
+			rcow_err "still missing after re-activation:"
+			printf '%s\n' "${missing}" | sed 's/^/    /' >&2
+			return 1
+		fi
+	fi
+	rcow_log "replay verified: every recorded volume has its namespace"
+
 	if [ "${failed_n}" -gt 0 ]; then
 		rcow_err "${failed_n} volume(s) could not be restored; they are still \
 listed in ${plan} and will be retried by the next start or by rcow_recovery.sh"
 		return 1
 	fi
 	return 0
+}
+
+# Every entry in the active registry must be a live namespace on the target:
+# the right subsystem, the right nsid, and the bdev with the recorded uuid.
+#
+# This is what the replay's own success count cannot prove. rcow_active_bdev
+# used to answer "already active" from the registry alone, and the registry
+# could be loaded by an unrelated RPC (Cubelet's startup probe) before the
+# replay moved the file aside -- so every replay call reported success and no
+# namespace existed (app2 22:50, app1 01:45 on 2026-11-17/18). The target now
+# checks the live slot itself; this check reads the namespaces back through
+# SPDK's own nvmf_get_subsystems, independently of that code.
+#
+# Prints one line per missing entry. Returns 0 when every entry is live.
+rcow_verify_namespaces()
+{
+	local subs rc
+
+	[ -s "${RCOW_ACTIVE_FILE}" ] || return 0
+	# Through a file: 32 subsystems x 64 namespaces does not fit in argv.
+	subs="$(mktemp "${RCOW_RUN_DIR}/subsys.XXXXXX")" || return 1
+	if ! rcow_srpc nvmf_get_subsystems >"${subs}" 2>/dev/null; then
+		rm -f "${subs}"
+		echo "nvmf_get_subsystems failed; cannot verify namespaces"
+		return 1
+	fi
+	rc=0
+	RCOW_NQN_PREFIX="${RCOW_NQN_PREFIX}" python3 - "${subs}" \
+		"${RCOW_ACTIVE_FILE}" <<'PY' || rc=1
+import json, os, sys
+subs = json.load(open(sys.argv[1]))
+try:
+    reg = json.load(open(sys.argv[2]))
+except ValueError:
+    print("registry does not parse")
+    sys.exit(1)
+live = {}
+for s in subs:
+    for ns in s.get("namespaces", []) or []:
+        live[(s.get("nqn"), int(ns.get("nsid", 0)))] = (ns.get("uuid") or "").lower()
+prefix = os.environ["RCOW_NQN_PREFIX"]
+bad = 0
+for name, e in reg.items():
+    if not isinstance(e, dict):
+        continue
+    nqn = "%s%02d" % (prefix, int(e.get("subsys", -1)))
+    nsid = int(e.get("nsid", 0))
+    want = (e.get("uuid") or "").lower()
+    have = live.get((nqn, nsid))
+    if have is None:
+        print("%s: no namespace at %s nsid %d" % (name, nqn, nsid))
+        bad += 1
+    elif have != want:
+        print("%s: %s nsid %d carries uuid %s, not %s" % (name, nqn, nsid, have, want))
+        bad += 1
+sys.exit(1 if bad else 0)
+PY
+	rm -f "${subs}"
+	return "${rc}"
 }
 
 # Every recorded volume has to resolve to a block device that can actually be

@@ -505,6 +505,24 @@ void s3lvol_nvmf_subsys_nqn(uint32_t index, char *out, size_t out_len);
 /** True when that subsystem has been created on the target. */
 bool s3lvol_nvmf_subsys_exists(uint32_t index);
 
+/** What the live target holds at one namespace slot. */
+enum {
+	S3LVOL_NS_ABSENT  = 0,	/* the slot is empty */
+	S3LVOL_NS_PRESENT = 1,	/* it carries the bdev with this uuid */
+	S3LVOL_NS_OTHER   = 2,	/* it carries some other bdev */
+};
+
+/**
+ * Look at namespace \c nsid of \c nqn in the running target and say whether it
+ * carries the bdev whose uuid is \c uuid_str. The active registry is a file and
+ * survives a restart; the namespace does not. This is how a caller tells a
+ * recorded activation from a live one.
+ *
+ * \return one of the S3LVOL_NS_* values, or a negative errno (-ENODEV when the
+ * subsystem does not exist).
+ */
+int s3lvol_nvmf_ns_state(const char *nqn, uint32_t nsid, const char *uuid_str);
+
 /**
  * Expose \c bdev_name as namespace \c nsid of \c nqn.
  *

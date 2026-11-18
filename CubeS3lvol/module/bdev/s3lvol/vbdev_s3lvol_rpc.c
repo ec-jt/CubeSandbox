@@ -3968,11 +3968,49 @@ rpc_rcow_active_bdev(struct spdk_jsonrpc_request *request,
 			goto cleanup;
 		}
 
-		SPDK_NOTICELOG("rcow_active_bdev '%s' already active as %s nsid "
-			       "%" PRIu32 "\n", existing->name, nqn, existing->nsid);
-		rpc_active_respond(request, existing->name, existing->uuid, nqn,
-				   existing->subsys, existing->nsid, true);
-		goto cleanup;
+		/* The registry is a file and outlives the process; the namespace
+		 * does not. After a restart the entry can describe a namespace
+		 * that no longer exists -- the replay saw exactly that when a
+		 * probe RPC loaded the registry before the replay moved it aside,
+		 * and every volume was reported active with nothing attached, so
+		 * Cubelet got an empty device path. So "recorded" is not
+		 * "attached": look at the live slot. */
+		switch (s3lvol_nvmf_ns_state(nqn, existing->nsid, existing->uuid)) {
+		case S3LVOL_NS_PRESENT:
+			SPDK_NOTICELOG("rcow_active_bdev '%s' already active as %s "
+				       "nsid %" PRIu32 "\n", existing->name, nqn,
+				       existing->nsid);
+			rpc_active_respond(request, existing->name, existing->uuid,
+					   nqn, existing->subsys, existing->nsid,
+					   true);
+			goto cleanup;
+		case S3LVOL_NS_ABSENT:
+			/* Re-attach at the recorded slot, which keeps the host-side
+			 * layout. The record is rewritten in place on success. */
+			SPDK_WARNLOG("rcow_active_bdev '%s' is recorded at %s nsid "
+				     "%" PRIu32 " but that namespace does not exist; "
+				     "attaching it again there\n", existing->name,
+				     nqn, existing->nsid);
+			subsys = existing->subsys;
+			nsid = existing->nsid;
+			goto attach;
+		case S3LVOL_NS_OTHER:
+			SPDK_WARNLOG("rcow_active_bdev '%s' refused: %s nsid %" PRIu32
+				     " carries a different bdev\n", existing->name,
+				     nqn, existing->nsid);
+			rpc_lvol_respond_errf(request,
+				"'%s' is recorded at %s nsid %" PRIu32 " but that "
+				"namespace carries a different bdev; deactivate the "
+				"stale entry first", existing->name, nqn,
+				existing->nsid);
+			goto cleanup;
+		default:
+			rpc_lvol_respond_errf(request,
+				"'%s' is recorded at %s nsid %" PRIu32 " but the "
+				"subsystem could not be inspected", existing->name,
+				nqn, existing->nsid);
+			goto cleanup;
+		}
 	}
 
 	subsys = (req.subsys != RCOW_SUBSYS_UNSET) ? req.subsys
@@ -4022,6 +4060,7 @@ rpc_rcow_active_bdev(struct spdk_jsonrpc_request *request,
 		}
 	}
 
+attach:
 	rc = snprintf(bdev_name, sizeof(bdev_name), "%s/%s",
 		      s3lvol_lvstore_get_name(lvs), lvol->name);
 	if (rc < 0 || (size_t)rc >= sizeof(bdev_name)) {
@@ -4145,6 +4184,25 @@ rpc_rcow_deactive_bdev(struct spdk_jsonrpc_request *request,
 
 	s3lvol_nvmf_subsys_nqn(entry->subsys, nqn, sizeof(nqn));
 	nsid = entry->nsid;
+
+	/* A stale record -- the namespace went with the previous process -- has
+	 * nothing to detach, and remove_ns would fail on the empty slot and keep
+	 * the record forever. Not attached is the end state asked for. */
+	if (s3lvol_nvmf_ns_state(nqn, nsid, entry->uuid) == S3LVOL_NS_ABSENT) {
+		rc = s3lvol_active_remove(req.device_name);
+		if (rc != 0 && rc != -ENOENT) {
+			rpc_lvol_respond_errf(request,
+				"'%s' has no namespace but its registry entry "
+				"could not be removed: %s", req.device_name,
+				spdk_strerror(-rc));
+			goto cleanup;
+		}
+		SPDK_WARNLOG("rcow_deactive_bdev '%s': recorded at %s nsid %" PRIu32
+			     " but no such namespace; dropped the stale entry\n",
+			     req.device_name, nqn, nsid);
+		rpc_lvol_respond_ok(request, req.device_name);
+		goto cleanup;
+	}
 
 	ctx = calloc(1, sizeof(*ctx));
 	if (!ctx) {
