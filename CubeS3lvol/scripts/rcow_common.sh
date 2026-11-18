@@ -336,6 +336,8 @@ mkdir -p "$(dirname "${RCOW_ACTIVE_FILE}")"
 # The replay plan: a copy of the registry taken before it is cleared. Owned by
 # these scripts, not by the module.
 RCOW_REPLAY_FILE="${RCOW_REPLAY_FILE:-${RCOW_ACTIVE_FILE}.replay}"
+# How many registry entries rcow_replay_registry activates at once (1..64).
+RCOW_REPLAY_PARALLEL="${RCOW_REPLAY_PARALLEL:-8}"
 
 RCOW_STOP_TIMEOUT="${RCOW_STOP_TIMEOUT:-120}"
 RCOW_RPC_TIMEOUT="${RCOW_RPC_TIMEOUT:-300}"
@@ -1226,6 +1228,62 @@ PY
 	return 0
 }
 
+# fsync one file and its directory, never the whole host. See the comment in
+# rcow_replay_registry for why a global sync is not allowed during a start.
+rcow_fsync_path()
+{
+	python3 - "$1" <<'PY' 2>/dev/null || true
+import os, sys
+p = sys.argv[1]
+for path, flags in ((p, os.O_RDONLY), (os.path.dirname(os.path.abspath(p)), os.O_RDONLY)):
+    try:
+        fd = os.open(path, flags)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+    except OSError:
+        pass
+PY
+}
+
+# 0 for a template volume (read by every create from that template), 1 for
+# anything else (a sandbox's own disks). Same names the target warms:
+# tpl-tpl-*, s3-meta-tpl-*, the template-base snapshots tpl-*-b<hash>-*, and
+# Cubelet's metadata base.
+rcow_replay_class()
+{
+	case "$1" in
+	*-build-*) echo 1 ;;
+	tpl-tpl-*|s3-meta-tpl-*|cubelet-s3-metadata-base*) echo 0 ;;
+	tpl-*-b[0-9a-f][0-9a-f][0-9a-f][0-9a-f]*) echo 0 ;;
+	*) echo 1 ;;
+	esac
+}
+
+# Read "name<TAB>subsys<TAB>nsid" lines, activate them RCOW_REPLAY_PARALLEL at
+# a time, print "ok|fail<TAB>name<TAB>detail" per line. Each activation is its
+# own RPC on the target's socket, which serializes them in the reactor; the
+# parallelism removes the per-call python start-up (about 60 ms) and lets one
+# slow activation not hold up the others.
+rcow_replay_wave()
+{
+	local p="${RCOW_REPLAY_PARALLEL}"
+	case "${p}" in ''|*[!0-9]*|0) p=8 ;; esac
+	# shellcheck disable=SC2016
+	xargs -r -d '\n' -P "${p}" -n 1 bash -c '
+		IFS=$'"'"'\t'"'"' read -r name subsys nsid <<<"$1"
+		if out="$(python3 "'"${RCOW_RPC_PY}"'" --sock "'"${RCOW_RPC_SOCK}"'" \
+				--timeout "'"${RCOW_RPC_TIMEOUT}"'" rcow_active_bdev \
+				"$(printf "{\"device_name\":\"%s\",\"subsys\":%s,\"nsid\":%s}" \
+					"$name" "$subsys" "$nsid")" 2>&1)"; then
+			printf "ok\t%s\t\n" "$name"
+		else
+			printf "fail\t%s\tsubsys %s nsid %s: %s\n" "$name" "$subsys" "$nsid" \
+				"$(printf %s "$out" | tr "\n\t" "  ")"
+		fi' _
+}
+
 # Re-attach every volume the previous process had exposed, at exactly the
 # subsystem and nsid it was on.
 #
@@ -1265,7 +1323,15 @@ refusing to touch ${RCOW_ACTIVE_FILE}"
 			rm -f "${plan}.tmp"
 			return 1
 		fi
-		sync
+		# The plan file and its directory only. A bare `sync` here
+		# flushed every filesystem on the host, including the ext4
+		# mounts on this target's own NVMe/TCP namespaces -- which have
+		# no listener until after the replay. The flush then waited for
+		# I/O that could only complete once the replay was done, until
+		# the kernel gave up on the controllers at ctrl_loss_tmo (600 s)
+		# and removed them, taking every running VM's disk with them.
+		# Live: app2 2026-11-18 01:59 -> 02:09 and 14:47 -> 14:58.
+		rcow_fsync_path "${plan}"
 	else
 		rcow_log "nothing was recorded as active; no replay needed"
 		return 0
@@ -1281,6 +1347,13 @@ by hand once you have decided what it should have said"
 
 	uuid_map="$(mktemp "${RCOW_RUN_DIR}/uuids.XXXXXX")" || return 1
 	rcow_volume_uuids >"${uuid_map}"
+
+	# Classify every entry first (refused ones are dropped, as before), then
+	# activate in two ordered waves, each RCOW_REPLAY_PARALLEL at a time:
+	# template volumes (what every create reads) before sandbox disks.
+	local work results line status
+	work="$(mktemp "${RCOW_RUN_DIR}/replay.XXXXXX")" || { rm -f "${uuid_map}"; return 1; }
+	results="$(mktemp "${RCOW_RUN_DIR}/replay-res.XXXXXX")" || { rm -f "${uuid_map}" "${work}"; return 1; }
 
 	while IFS=$'\t' read -r name subsys nsid want_uuid; do
 		[ -n "${name}" ] || continue
@@ -1303,23 +1376,36 @@ name; not restored, because the host would mount it believing it was the old one
 			refused_n=$((refused_n + 1))
 			continue
 		fi
-
-		# subsys and nsid are given explicitly. Letting them be recomputed
-		# would put a volume that had been moved somewhere else, and the whole
-		# point of the registry is that the layout comes back unchanged.
-		if out="$(rcow_rpc rcow_active_bdev \
-			"$(printf '{"device_name":"%s","subsys":%s,"nsid":%s}' \
-				"${name}" "${subsys}" "${nsid}")" 2>&1)"; then
-			done_n=$((done_n + 1))
-		else
-			rcow_warn "could not restore '${name}' at subsys ${subsys} nsid \
-${nsid}: ${out}"
-			pending+=("${name}")
-			failed_n=$((failed_n + 1))
-		fi
+		printf '%s\t%s\t%s\t%s\n' "$(rcow_replay_class "${name}")" \
+			"${name}" "${subsys}" "${nsid}" >>"${work}"
 	done < <(rcow_registry_tsv "${plan}")
 
 	rm -f "${uuid_map}"
+
+	# subsys and nsid are given explicitly. Letting them be recomputed
+	# would put a volume that had been moved somewhere else, and the whole
+	# point of the registry is that the layout comes back unchanged.
+	local wave t0
+	for wave in 0 1; do
+		t0=${SECONDS}
+		awk -F'\t' -v w="${wave}" '$1 == w { print $2 "\t" $3 "\t" $4 }' \
+			"${work}" | rcow_replay_wave >>"${results}"
+		rcow_log "replay wave ${wave} ($([ "${wave}" = 0 ] && echo templates || echo sandbox disks)): \
+$(awk -F'\t' -v w="${wave}" '$1 == w' "${work}" | wc -l) volume(s) in \
+$((SECONDS - t0))s, ${RCOW_REPLAY_PARALLEL} at a time"
+	done
+
+	while IFS=$'\t' read -r status name line; do
+		[ -n "${name}" ] || continue
+		if [ "${status}" = ok ]; then
+			done_n=$((done_n + 1))
+		else
+			rcow_warn "could not restore '${name}': ${line}"
+			pending+=("${name}")
+			failed_n=$((failed_n + 1))
+		fi
+	done <"${results}"
+	rm -f "${work}" "${results}"
 
 	if [ "${#pending[@]}" -eq 0 ]; then
 		rcow_registry_keep "${plan}"

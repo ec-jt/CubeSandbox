@@ -1617,6 +1617,7 @@ struct lvol_warm {
 	enum s3lvol_import_state state;
 	int                    error;
 	struct s3_warm_stats   st;
+	bool                   queued;   /* started by the attach queue */
 	TAILQ_ENTRY(lvol_warm) link;
 };
 
@@ -1707,6 +1708,46 @@ lvol_warm_collect(struct s3lvol_lvstore *lvs, struct spdk_blob *blob,
 	return 0;
 }
 
+/* Template warm-up queue.
+ *
+ * Every template snapshot used to be warmed at once at attach, each with a
+ * window of 32 whole-object GETs: 39 snapshots on app2 put about 1250 GETs on
+ * the wire right as the node came back. Foreground reads -- the creates and
+ * restores the warm-up exists to speed up -- then waited 40 s per GET behind
+ * them, NVMe keep-alives timed out on the busy reactor, and the first create
+ * after a restart took 10 minutes (app2 2026-11-18 16:08). Now the attach
+ * queues them, smallest first (metadata and rootfs before multi-GiB memory
+ * images), and at most S3LVOL_WARM_MAX_VOLUMES (default 2) run at a time with
+ * S3LVOL_WARM_WINDOW (default 8) GETs each. */
+struct warm_q_entry {
+	struct s3lvol_lvstore *lvs;
+	char                   name[SPDK_LVOL_NAME_MAX];
+	uint64_t               clusters;
+};
+
+static struct warm_q_entry *g_warm_q;
+static size_t g_warm_q_n, g_warm_q_next;
+static uint32_t g_warm_q_running;
+
+static uint32_t
+warm_env_u32(const char *name, uint32_t def, uint32_t lo, uint32_t hi)
+{
+	const char *v = getenv(name);
+	char *end = NULL;
+	unsigned long x;
+
+	if (!v || !*v) {
+		return def;
+	}
+	x = strtoul(v, &end, 10);
+	if (!end || *end || x < lo || x > hi) {
+		return def;
+	}
+	return (uint32_t)x;
+}
+
+static void warm_q_pump(void);
+
 static void
 lvol_warm_done(void *arg, int status, const struct s3_warm_stats *st)
 {
@@ -1722,6 +1763,13 @@ lvol_warm_done(void *arg, int status, const struct s3_warm_stats *st)
 		       PRIu64 " ms\n", w->lvol_name, status == 0 ? "done" : spdk_strerror(-status),
 		       st->requested, st->fetched, st->warmed, st->already, st->holes,
 		       st->failed, st->bytes, st->elapsed_ms);
+	if (w->queued) {
+		w->queued = false;
+		if (g_warm_q_running > 0) {
+			g_warm_q_running--;
+		}
+		warm_q_pump();
+	}
 }
 
 int
@@ -1795,18 +1843,60 @@ s3lvol_lvol_warm_status(struct s3lvol_lvstore *lvs, const char *lvol_name,
 	return 0;
 }
 
+static int
+warm_q_cmp(const void *a, const void *b)
+{
+	const struct warm_q_entry *x = a, *y = b;
+
+	return x->clusters < y->clusters ? -1 : x->clusters > y->clusters ? 1 : 0;
+}
+
+static void
+warm_q_pump(void)
+{
+	uint32_t max_vols = warm_env_u32("S3LVOL_WARM_MAX_VOLUMES", 2, 1, 64);
+	uint32_t window = warm_env_u32("S3LVOL_WARM_WINDOW", 8, 1, 128);
+
+	while (g_warm_q_running < max_vols && g_warm_q_next < g_warm_q_n) {
+		struct warm_q_entry *e = &g_warm_q[g_warm_q_next++];
+		struct spdk_lvol *lvol = s3lvol_lvol_find(e->lvs, e->name);
+		struct lvol_warm *w;
+
+		if (!lvol || !lvol->blob) {
+			continue;   /* deleted or closed while queued */
+		}
+		if (s3lvol_lvol_warm(e->lvs, lvol, window) != 0) {
+			continue;
+		}
+		w = lvol_warm_find(e->lvs, e->name);
+		if (w && w->state == S3LVOL_IMPORT_RUNNING && !w->queued) {
+			w->queued = true;
+			g_warm_q_running++;
+		}
+	}
+	if (g_warm_q_next >= g_warm_q_n && g_warm_q_running == 0 && g_warm_q) {
+		SPDK_NOTICELOG("template warm-up queue drained (%zu volume(s))\n", g_warm_q_n);
+		free(g_warm_q);
+		g_warm_q = NULL;
+		g_warm_q_n = g_warm_q_next = 0;
+	}
+}
+
 /* Template snapshots are the volumes every restore reads, and their names say so
  * (tpl-tpl-<id>-rootfs, -memory-snap, versioned base snapshots, and the
  * s3-meta-tpl-<id> package metadata disk). Warm them
  * once the lvstore is attached, so a target restart does not leave the next
- * restores reading S3 one small request at a time. */
+ * restores reading S3 one small request at a time -- through a bounded
+ * queue, smallest first, so the warm-up never starves the foreground reads
+ * it is there to help. */
 void
 s3lvol_lvstore_warm_templates(struct s3lvol_lvstore *lvs)
 {
 	struct spdk_lvol_store *store = s3lvol_lvstore_get_lvs(lvs);
 	struct spdk_lvol *lvol;
 	const char *off = getenv("S3LVOL_WARM_TEMPLATES");
-	uint32_t started = 0;
+	struct warm_q_entry *q;
+	size_t n = 0, cap = 0;
 
 	if (!store || (off && (strcmp(off, "0") == 0 || strcasecmp(off, "false") == 0))) {
 		return;
@@ -1815,23 +1905,59 @@ s3lvol_lvstore_warm_templates(struct s3lvol_lvstore *lvs)
 	 * metadata disks); see lvol_warm_select.h for what is and is not warmed
 	 * and why. */
 	TAILQ_FOREACH(lvol, &store->lvols, link) {
+		if (lvol->blob && s3lvol_warm_template_name(lvol->name)) {
+			cap++;
+		}
+	}
+	if (cap == 0) {
+		return;
+	}
+	q = realloc(g_warm_q, (g_warm_q_n + cap) * sizeof(*q));
+	if (!q) {
+		return;
+	}
+	g_warm_q = q;
+	TAILQ_FOREACH(lvol, &store->lvols, link) {
+		struct warm_q_entry *e;
+
 		if (!lvol->blob || !s3lvol_warm_template_name(lvol->name)) {
 			continue;
 		}
-		if (s3lvol_lvol_warm(lvs, lvol, 0) == 0) {
-			started++;
-		}
+		e = &g_warm_q[g_warm_q_n + n++];
+		e->lvs = lvs;
+		snprintf(e->name, sizeof(e->name), "%s", lvol->name);
+		e->clusters = spdk_blob_get_num_allocated_clusters(lvol->blob);
 	}
-	if (started) {
-		SPDK_NOTICELOG("lvstore '%s': warming %u template snapshot(s) into the "
-			       "local cache\n", s3lvol_lvstore_get_name(lvs), started);
-	}
+	/* Sort only the part not yet started. */
+	qsort(&g_warm_q[g_warm_q_next], g_warm_q_n + n - g_warm_q_next,
+	      sizeof(*g_warm_q), warm_q_cmp);
+	g_warm_q_n += n;
+	SPDK_NOTICELOG("lvstore '%s': queued %zu template snapshot(s) for cache "
+		       "warm-up, smallest first, %u at a time with %u GETs each\n",
+		       s3lvol_lvstore_get_name(lvs), n,
+		       warm_env_u32("S3LVOL_WARM_MAX_VOLUMES", 2, 1, 64),
+		       warm_env_u32("S3LVOL_WARM_WINDOW", 8, 1, 128));
+	warm_q_pump();
 }
 
 void
 s3lvol_lvol_warm_forget_lvs(struct s3lvol_lvstore *lvs)
 {
 	struct lvol_warm *w, *tmp;
+	size_t i, j = 0;
+
+	/* Drop this lvstore's queued (not yet started) entries. */
+	for (i = 0; i < g_warm_q_n; i++) {
+		if (i < g_warm_q_next || g_warm_q[i].lvs != lvs) {
+			g_warm_q[j++] = g_warm_q[i];
+		} else {
+			continue;
+		}
+	}
+	g_warm_q_n = j;
+	if (g_warm_q_next > g_warm_q_n) {
+		g_warm_q_next = g_warm_q_n;
+	}
 
 	TAILQ_FOREACH_SAFE(w, &g_lvol_warms, link, tmp) {
 		if (w->lvs == lvs && w->state != S3LVOL_IMPORT_RUNNING) {

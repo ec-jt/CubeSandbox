@@ -152,8 +152,8 @@ func requireS3Cow() (*S3Cow, error) {
 	if localStorage == nil || localStorage.s3CowManager == nil {
 		return nil, ErrS3NotReady
 	}
-	if starting, _ := s3lvolStarting(); starting {
-		return nil, ErrS3NotReady
+	if err := waitS3lvolStarted(context.Background()); err != nil {
+		return nil, err
 	}
 	store, ok := localStorage.s3CowManager.(*S3Cow)
 	if !ok || store == nil {

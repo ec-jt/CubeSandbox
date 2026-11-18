@@ -53,11 +53,19 @@ func TestProcessAliveRejectsOtherProcesses(t *testing.T) {
 	require.False(t, processAlive(-1))
 }
 
-// While s3lvol is starting, backend=s3 requests fail fast with ErrS3NotReady
-// even though the handle is published; afterwards they are served again with
-// nothing restarted.
+func withStartWait(t *testing.T, wait time.Duration) {
+	t.Helper()
+	prevW, prevP := s3lvolStartWait, s3lvolStartPoll
+	s3lvolStartWait, s3lvolStartPoll = wait, 2*time.Millisecond
+	t.Cleanup(func() { s3lvolStartWait, s3lvolStartPoll = prevW, prevP })
+}
+
+// With the wait disabled (0), backend=s3 requests fail fast with
+// ErrS3NotReady while s3lvol is starting; afterwards they are served again
+// with nothing restarted.
 func TestStoreForBackendWaitsForS3lvolStart(t *testing.T) {
 	p := withStartingFile(t, func(int) bool { return true })
+	withStartWait(t, 0)
 	engine := &fakeCowEngine{}
 	useTestCowStorageAt(t, engine)
 
@@ -75,6 +83,41 @@ func TestStoreForBackendWaitsForS3lvolStart(t *testing.T) {
 	store, err = localStorage.storeForBackend(cow.BackendS3)
 	require.NoError(t, err)
 	require.NotNil(t, store)
+}
+
+// A request that arrives during a start waits for it and is then served.
+func TestStoreForBackendBlocksUntilStartEnds(t *testing.T) {
+	p := withStartingFile(t, func(int) bool { return true })
+	withStartWait(t, 5*time.Second)
+	useTestCowStorageAt(t, &fakeCowEngine{})
+	require.NoError(t, os.WriteFile(p, []byte("99"), 0o644))
+
+	go func() {
+		time.Sleep(40 * time.Millisecond)
+		_ = os.Remove(p)
+	}()
+	t0 := time.Now()
+	store, err := localStorage.storeForBackend(cow.BackendS3)
+	require.NoError(t, err)
+	require.NotNil(t, store)
+	require.GreaterOrEqual(t, time.Since(t0), 30*time.Millisecond)
+}
+
+// A start that outlasts the bound fails with a clear, typed error that still
+// matches ErrS3NotReady.
+func TestStoreForBackendStartWaitIsBounded(t *testing.T) {
+	p := withStartingFile(t, func(int) bool { return true })
+	withStartWait(t, 30*time.Millisecond)
+	useTestCowStorageAt(t, &fakeCowEngine{})
+	require.NoError(t, os.WriteFile(p, []byte("99"), 0o644))
+
+	_, err := localStorage.storeForBackend(cow.BackendS3)
+	require.ErrorIs(t, err, ErrS3NotReady)
+	var te *ErrS3lvolStartTimeout
+	require.ErrorAs(t, err, &te)
+	require.Contains(t, err.Error(), "still starting after waiting")
+	_, err = requireS3Cow()
+	require.ErrorIs(t, err, ErrS3NotReady)
 }
 
 // The init loop never calls s3lvol while a start is in progress, and never

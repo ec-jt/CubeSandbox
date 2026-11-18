@@ -6,6 +6,7 @@ package storage
 
 import (
 	"bytes"
+	"context"
 	"os"
 	"strconv"
 	"strings"
@@ -70,6 +71,64 @@ func s3lvolStarting() (bool, time.Time) {
 		return false, time.Time{}
 	}
 	return true, st.ModTime()
+}
+
+// s3lvolStartWait bounds how long a backend=s3 request waits for an s3lvol
+// start in progress before it fails. The start itself (attach, replay of the
+// active registry, listeners) takes well under a minute once the replay does
+// not flush the host; failing fast instead turned every create in that window
+// into an error the caller had to retry. Env S3LVOL_START_WAIT_SECONDS,
+// default 90, 0 restores the old fail-fast behaviour.
+var s3lvolStartWait = func() time.Duration {
+	if v := strings.TrimSpace(os.Getenv("S3LVOL_START_WAIT_SECONDS")); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 0 && n <= 1800 {
+			return time.Duration(n) * time.Second
+		}
+	}
+	return 90 * time.Second
+}()
+
+var s3lvolStartPoll = 500 * time.Millisecond
+
+// ErrS3lvolStartTimeout is returned when s3lvol was still starting after
+// s3lvolStartWait. It wraps ErrS3NotReady so existing callers still match.
+type ErrS3lvolStartTimeout struct {
+	Waited time.Duration
+	Since  time.Time
+}
+
+func (e *ErrS3lvolStartTimeout) Error() string {
+	return "s3lvol is still starting after waiting " + e.Waited.Round(time.Second).String() +
+		" (start began " + time.Since(e.Since).Round(time.Second).String() +
+		" ago); " + ErrS3NotReady.Error()
+}
+
+func (e *ErrS3lvolStartTimeout) Unwrap() error { return ErrS3NotReady }
+
+// waitS3lvolStarted blocks while an s3lvol start is in progress, for at most
+// s3lvolStartWait. Returns nil once the start is done (or none was running).
+func waitS3lvolStarted(ctx context.Context) error {
+	starting, since := s3lvolStarting()
+	if !starting {
+		return nil
+	}
+	if s3lvolStartWait <= 0 {
+		return ErrS3NotReady
+	}
+	t0 := time.Now()
+	deadline := t0.Add(s3lvolStartWait)
+	for {
+		if ctx != nil && ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if time.Now().After(deadline) {
+			return &ErrS3lvolStartTimeout{Waited: time.Since(t0), Since: since}
+		}
+		time.Sleep(s3lvolStartPoll)
+		if starting, _ = s3lvolStarting(); !starting {
+			return nil
+		}
+	}
 }
 
 // s3InitBackoff is the wait before init attempt n+1 after n failures:
