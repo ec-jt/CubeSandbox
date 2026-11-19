@@ -1874,6 +1874,12 @@ s3_wal_get_used_bytes(const struct s3_wal *wal)
 }
 
 uint64_t
+s3_wal_get_capacity_bytes(const struct s3_wal *wal)
+{
+	return wal ? wal_capacity(wal) : 0;
+}
+
+uint64_t
 s3_wal_get_next_seq(const struct s3_wal *wal)
 {
 	return wal ? wal_make_seq(wal, wal->seq_next) : 0;

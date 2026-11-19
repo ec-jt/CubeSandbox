@@ -554,6 +554,21 @@ test_throttle(void)
 		prev = r;
 	}
 	check("rate never rises as the backlog grows", monotone);
+	{
+		const uint64_t W = 32 * G;   /* WAL capacity */
+
+		check("WAL leg: healthy steady state (5 GiB of 32) is unthrottled",
+		      s3_throttle_rate2(10ULL << 20, cap, 5 * G, W) == S3_THROTTLE_UNLIMITED);
+		check("WAL leg: slope starts before the 85% wall",
+		      s3_throttle_rate2(10ULL << 20, cap, W / 100 * 41, W) <= S3_THROTTLE_RATE_HI &&
+		      s3_throttle_rate2(10ULL << 20, cap, W / 100 * 41, W) > S3_THROTTLE_RATE_LO);
+		check("WAL leg: at 80% the floor, never zero",
+		      s3_throttle_rate2(10ULL << 20, cap, W / 100 * 80, W) == S3_THROTTLE_RATE_FLOOR);
+		check("the slower leg wins",
+		      s3_throttle_rate2(cap, cap, 0, W) == S3_THROTTLE_RATE_FLOOR);
+		check("cap 0 turns both legs off",
+		      s3_throttle_rate2(100 * G, 0, W, W) == S3_THROTTLE_UNLIMITED);
+	}
 	/* The bound the throttle exists for: with S3 fully stalled, how far
 	 * past the cap can a writer push the backlog in an hour? */
 	check("stalled S3: backlog grows <= 7.1 GiB/h past the cap",

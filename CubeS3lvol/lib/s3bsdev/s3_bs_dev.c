@@ -1249,7 +1249,8 @@ s3_throttle_backlog(struct s3_ctx *ctx)
 	 * yet put in S3. WAL used bytes are not a backlog measure: the WAL tail
 	 * only moves at checkpoint truncation, so flushed but not yet
 	 * checkpointed records keep it large with S3 perfectly healthy (seen
-	 * live: throttling at 11 MiB of real backlog). */
+	 * live: throttling at 11 MiB of real backlog). WAL fullness has its own
+	 * leg, relative to the WAL's capacity: s3_throttle_rate2(). */
 	return s3_overlay_get_bytes(ctx->overlay);
 }
 
@@ -1291,7 +1292,10 @@ s3_throttle_refill(struct s3_ctx *ctx, uint64_t rate)
 static bool
 s3_throttle_admit(struct s3_ctx *ctx, uint64_t bytes)
 {
-	uint64_t rate = s3_throttle_rate(s3_throttle_backlog(ctx), s3_throttle_cap_eff(ctx));
+	uint64_t rate = s3_throttle_rate2(s3_throttle_backlog(ctx),
+					      s3_throttle_cap_eff(ctx),
+					      ctx->wal ? s3_wal_get_used_bytes(ctx->wal) : 0,
+					      ctx->wal ? s3_wal_get_capacity_bytes(ctx->wal) : 0);
 
 	if (rate == UINT64_MAX) {
 		ctx->throttle_last_tsc = 0;

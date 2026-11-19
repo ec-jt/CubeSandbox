@@ -323,6 +323,7 @@ void s3_wal_sync_super(struct s3_wal *wal, uint64_t ckpt_seq,
 bool s3_wal_is_backpressured(const struct s3_wal *wal);
 
 uint64_t s3_wal_get_used_bytes(const struct s3_wal *wal);
+uint64_t s3_wal_get_capacity_bytes(const struct s3_wal *wal);
 uint64_t s3_wal_get_next_seq(const struct s3_wal *wal);
 uint64_t s3_wal_get_epoch(const struct s3_wal *wal);
 

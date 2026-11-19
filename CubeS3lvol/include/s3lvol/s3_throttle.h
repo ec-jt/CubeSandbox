@@ -50,4 +50,25 @@ s3_throttle_rate(uint64_t backlog, uint64_t cap)
 	       (cap - half);
 }
 
+/* The WAL leg of the throttle, as a percentage of WAL capacity. The WAL's own
+ * backpressure (S3_WAL_BACKPRESSURE_ON_PCT, 85%) stops writes dead, which the
+ * guests see as I/O stalls and NVMe keep-alive timeouts (live: one chunk whose
+ * PUT kept timing out pinned the WAL tail and three fsync writers filled 32 GiB
+ * in about three minutes). The slope runs from half of this to this, so writers
+ * slow down well before the wall. Steady state with S3 healthy sits far below
+ * the start of the slope (a few GiB: the tail moves a whole segment at a time). */
+#define S3_THROTTLE_WAL_PCT 80
+
+/* Admitted bytes/s given both backlogs: the slower of the two legs. */
+static inline uint64_t
+s3_throttle_rate2(uint64_t dirty, uint64_t dirty_cap, uint64_t wal_used,
+		  uint64_t wal_capacity)
+{
+	uint64_t a = s3_throttle_rate(dirty, dirty_cap);
+	uint64_t b = (dirty_cap == 0 || wal_capacity == 0) ? S3_THROTTLE_UNLIMITED :
+		     s3_throttle_rate(wal_used, wal_capacity / 100 * S3_THROTTLE_WAL_PCT);
+
+	return a < b ? a : b;
+}
+
 #endif /* S3LVOL_THROTTLE_H */
