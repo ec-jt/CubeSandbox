@@ -140,3 +140,16 @@ func TestLifecycleUnresolvedRuntimeBlocksRetry(t *testing.T) {
 	require.False(t, RuntimeCleanupProven(ctx))
 	require.Error(t, CheckCreateRuntimeOwnership(id))
 }
+
+// A stale-epoch cleanup that proved the runtime gone, removed the record and
+// then failed in a later step must not leave every following queued job
+// refused: the in-process proof lets them finish. A start invalidates it.
+func TestRuntimeGoneInThisProcess(t *testing.T) {
+	id := "gone-in-process"
+	require.False(t, RuntimeGoneInThisProcess(id))
+	ctx := BeginSandboxLifecycle(context.Background(), id)
+	MarkRuntimeGone(ctx)
+	require.True(t, RuntimeGoneInThisProcess(id))
+	MarkRuntimeStarting(ctx)
+	require.False(t, RuntimeGoneInThisProcess(id))
+}

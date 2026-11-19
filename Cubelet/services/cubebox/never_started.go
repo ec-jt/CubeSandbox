@@ -365,7 +365,31 @@ func (l *local) verifyStaleCleanup(ctx context.Context, id string) (bool, string
 		return false, ""
 	}
 	sb, err := l.cubeboxManger.Get(ctx, id)
-	if err != nil || sb == nil {
+	if (err == nil && sb == nil) || errors.Is(err, utils.ErrorKeyNotFound) || errors.Is(err, utils.ErrorBucketNotFound) {
+		// A missing record alone proves nothing. It does when a cleanup in
+		// this process already proved the runtime gone, removed the record
+		// and then failed in a later step (storage, network): the queued
+		// jobs must be able to finish those steps instead of retrying
+		// forever. Any start since then clears the proof.
+		if workflow.RuntimeGoneInThisProcess(id) {
+			return true, "record removed after runtime absence was proven in this process"
+		}
+		// After a restart that in-process proof is gone. The host can
+		// still prove it: no containerd container, task or shim and no
+		// live process naming the id. A paused sandbox keeps its record
+		// (tombstone), so a missing record is never a paused one.
+		ns, ok := namespaces.Namespace(ctx)
+		if !ok || ns == "" {
+			ns = namespaces.Default
+		}
+		if why, clean := l.noRuntimeArtifactsForID(ctx, ns, id); clean {
+			return true, "record removed and no containerd container, task, shim or host process remains"
+		} else {
+			log.G(ctx).Warnf("sandbox %s: stale cleanup for a removed record kept: %s", id, why)
+		}
+		return false, ""
+	}
+	if err != nil {
 		return false, ""
 	}
 	ok, reason := l.provablyNeverStarted(ctx, sb)
@@ -671,4 +695,30 @@ func exitedRecordOwnsStorage(sb *cubeboxstore.CubeBox) bool {
 		return false
 	}
 	return !c.IsPauseResume() || c.IsCrossNodeRestore()
+}
+
+// noRuntimeArtifactsForID is noRuntimeArtifacts for an id whose record is
+// gone: it checks containerd container, task and shim, and the host process
+// scan, for the sandbox id only (shim and VMM are named by it).
+func (l *local) noRuntimeArtifactsForID(ctx context.Context, ns, id string) (string, bool) {
+	ctx = namespaces.WithNamespace(ctx, ns)
+	probe := l.runtimeEvidenceProbe()
+	for _, c := range []struct {
+		what string
+		fn   func(context.Context, string) (bool, error)
+	}{
+		{"containerd container", probe.ContainerExists},
+		{"containerd task", probe.TaskExists},
+		{"shim", probe.ShimExists},
+		{"host process", probe.ProcessExists},
+	} {
+		exists, err := c.fn(ctx, id)
+		if err != nil {
+			return fmt.Sprintf("cannot query %s for %s: %v", c.what, id, err), false
+		}
+		if exists {
+			return fmt.Sprintf("%s exists for %s", c.what, id), false
+		}
+	}
+	return "", true
 }

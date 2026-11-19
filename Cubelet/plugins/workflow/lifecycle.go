@@ -128,3 +128,16 @@ func CheckCreateRuntimeOwnership(id string) error {
 	}
 	return nil
 }
+
+// RuntimeGoneInThisProcess reports whether this process proved the runtime
+// of id gone and has not attempted a start since. MarkRuntimeStarting clears
+// RuntimeGone, and Create's new epoch copies it, so a later start always
+// invalidates the proof.
+func RuntimeGoneInThisProcess(id string) bool {
+	v, ok := lifecycleEpochs.Load(id)
+	if !ok {
+		return false
+	}
+	e := v.(*LifecycleCleanup)
+	return e.RuntimeGone && !e.RuntimeMayExist
+}

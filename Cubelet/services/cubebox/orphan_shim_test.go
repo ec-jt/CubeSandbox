@@ -168,3 +168,31 @@ func TestExitedRecordOwnsStorage(t *testing.T) {
 	require.True(t, exitedRecordOwnsStorage(crossNodeRecord("own-xnode")))
 	require.False(t, exitedRecordOwnsStorage(nil))
 }
+
+// After a cleanup removed the record and failed in a later step, the
+// following stale-epoch jobs finish when this process proved the runtime
+// gone, and stay refused otherwise.
+func TestVerifyStaleCleanupMissingRecord(t *testing.T) {
+	id := "sb-missing-record"
+	// Host still shows a runtime trace: refused.
+	l := &local{cubeboxManger: &deletingCubeboxAPI{}, probe: &fakeRuntimeProbe{procs: map[string]bool{id: true}}}
+	ok, _ := l.verifyStaleCleanup(context.Background(), id)
+	require.False(t, ok)
+	// Probe failure: refused.
+	l.probe = &fakeRuntimeProbe{err: context.DeadlineExceeded}
+	ok, _ = l.verifyStaleCleanup(context.Background(), id)
+	require.False(t, ok)
+	// No trace on the host (the case after a Cubelet restart): accepted.
+	l.probe = &fakeRuntimeProbe{}
+	ok, why0 := l.verifyStaleCleanup(context.Background(), id)
+	require.True(t, ok, why0)
+	// In-process proof works even while a probe cannot answer.
+	l.probe = &fakeRuntimeProbe{err: context.DeadlineExceeded}
+	ctx := workflow.BeginSandboxLifecycle(context.Background(), id)
+	workflow.MarkRuntimeGone(ctx)
+	ok, why := l.verifyStaleCleanup(context.Background(), id)
+	require.True(t, ok, why)
+	workflow.MarkRuntimeStarting(ctx)
+	ok, _ = l.verifyStaleCleanup(context.Background(), id)
+	require.False(t, ok)
+}
