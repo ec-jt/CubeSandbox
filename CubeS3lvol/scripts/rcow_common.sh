@@ -351,6 +351,12 @@ RCOW_QUIESCE_TIMEOUT="${RCOW_QUIESCE_TIMEOUT:-20}"
 RCOW_KEEPCONN_UNLOAD_TIMEOUT="${RCOW_KEEPCONN_UNLOAD_TIMEOUT:-4}"
 RCOW_KEEPCONN_TERM_TIMEOUT="${RCOW_KEEPCONN_TERM_TIMEOUT:-2}"
 RCOW_RPC_TIMEOUT="${RCOW_RPC_TIMEOUT:-300}"
+# The attach replays the WAL tail and loads blobstore metadata; under a
+# degraded object store with a large unflushed WAL it took 24 min live
+# (app2, 2026-11-19). A 300 s RPC timeout made the start fail, kill the
+# target and start over, losing the progress every time. The attach gets
+# its own, much longer budget.
+RCOW_ATTACH_RPC_TIMEOUT="${RCOW_ATTACH_RPC_TIMEOUT:-3600}"
 
 # --------------------------------------------------------------------------
 # Output
@@ -742,9 +748,14 @@ rcow_kill_target()
 	rcow_warn "pid ${pid} ignored SIGTERM for ${timeout}s; sending SIGKILL. \
 The WAL tail will be replayed by the next attach"
 	kill -KILL "${pid}" 2>/dev/null
-	sleep 1
-	kill -0 "${pid}" 2>/dev/null && return 1
-	return 0
+	# A target with ~17 GiB resident takes more than a second to be reaped
+	# (observed live): wait up to 15 s before declaring it stuck.
+	deadline=$((SECONDS + 15))
+	while [ "${SECONDS}" -lt "${deadline}" ]; do
+		kill -0 "${pid}" 2>/dev/null || return 0
+		sleep 0.2
+	done
+	return 1
 }
 
 rcow_log_tail()

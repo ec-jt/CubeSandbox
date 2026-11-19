@@ -145,6 +145,16 @@ stopped again; nothing it held needs draining"
 	exit 1
 }
 
+# The attach replays the WAL and loads blobstore metadata; it gets the long
+# RCOW_ATTACH_RPC_TIMEOUT. Every other RPC keeps RCOW_RPC_TIMEOUT.
+rpc_timeout_for()
+{
+	case "$1" in
+	rcow_attach_lvstore) printf '%s' "${RCOW_ATTACH_RPC_TIMEOUT}" ;;
+	*)                   printf '%s' "${RCOW_RPC_TIMEOUT}" ;;
+	esac
+}
+
 # retry_after_stale_owner <verb> <rpc> <params-without-force> <log_mark> <ns>
 #
 # After a refused attach/create: if the marker is provably this node's dead pid,
@@ -173,14 +183,16 @@ to a free tombstone (conditional on the holder named) and retrying"
 			return 2
 		fi
 		rcow_log "${out}"
-		RETRY_OUT="$(rcow_rpc "${rpc}" "${params},\"force\":false}" 2>&1)" ||
+		RETRY_OUT="$(RCOW_RPC_TIMEOUT="$(rpc_timeout_for "${rpc}")" \
+			rcow_rpc "${rpc}" "${params},\"force\":false}" 2>&1)" ||
 			return 2
 		return 0
 	fi
 
 	rcow_warn "the ${verb} was refused because an owner marker is still in S3: \
 ${OWNER_REASON}. Retrying with force=true"
-	RETRY_OUT="$(rcow_rpc "${rpc}" "${params},\"force\":true}" 2>&1)" || return 2
+	RETRY_OUT="$(RCOW_RPC_TIMEOUT="$(rpc_timeout_for "${rpc}")" \
+		rcow_rpc "${rpc}" "${params},\"force\":true}" 2>&1)" || return 2
 	return 0
 }
 
@@ -388,7 +400,7 @@ which replays the journal and the WAL"
 		"${RCOW_CKPT_INTERVAL_SEC}")"
 
 	LOG_MARK="$(rcow_log_size)"
-	if ! ATTACH_OUT="$(rcow_rpc rcow_attach_lvstore \
+	if ! ATTACH_OUT="$(RCOW_RPC_TIMEOUT="${RCOW_ATTACH_RPC_TIMEOUT}" rcow_rpc rcow_attach_lvstore \
 			"${ATTACH_PARAMS},\"force\":${FORCE_JSON}}" 2>&1)"; then
 		# -EBUSY here is almost always the owner marker left behind by a
 		# process that died, which is the one case the marker cannot settle by
