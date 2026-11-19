@@ -369,10 +369,29 @@ func (l *local) verifyStaleCleanup(ctx context.Context, id string) (bool, string
 		return false, ""
 	}
 	ok, reason := l.provablyNeverStarted(ctx, sb)
-	if !ok || !recordRollbackReleasesStorage(sb) {
+	if ok && recordRollbackReleasesStorage(sb) {
+		return true, "record provably never started: " + reason
+	}
+	// A record that ran and exited before this process started has only
+	// stale queued cleanups; without this they retry forever. Reap an
+	// orphaned shim first (it is unreachable through containerd), then
+	// require the full exited proof. Paused records and publication holds
+	// fail inside provablyExited, so their storage is never released here.
+	// The engine releases storage on this path. A record created from a
+	// template owns its clones, exactly as an explicit DELETE would release
+	// them. A pause resume or cold recreate record points at retained disks
+	// of a paused sandbox; those keep the refusal.
+	if !exitedRecordOwnsStorage(sb) {
 		return false, ""
 	}
-	return true, "record provably never started: " + reason
+	if _, err := l.reapOrphanShims(ctx, sb); err != nil {
+		log.G(ctx).Warnf("sandbox %s: %v", id, err)
+		return false, ""
+	}
+	if exited, why := l.provablyExited(ctx, sb); exited {
+		return true, "record provably exited: " + why
+	}
+	return false, ""
 }
 
 func sandboxIDOf(sb *cubeboxstore.CubeBox) string {
@@ -635,4 +654,21 @@ func (l *local) reapOrphanShims(ctx context.Context, sb *cubeboxstore.CubeBox) (
 		}
 	}
 	return pids, nil
+}
+
+// exitedRecordOwnsStorage reports whether releasing the storage of an exited
+// record can only remove disks that record created: not a same-node pause
+// resume and not a cold recreate, both of which reuse retained disks.
+func exitedRecordOwnsStorage(sb *cubeboxstore.CubeBox) bool {
+	if sb == nil {
+		return false
+	}
+	c := &workflow.CreateContext{ReqInfo: &cubebox.RunCubeSandboxRequest{
+		Annotations:  sb.Annotations,
+		InstanceType: sb.InstanceType,
+	}}
+	if c.IsColdRecreate() {
+		return false
+	}
+	return !c.IsPauseResume() || c.IsCrossNodeRestore()
 }

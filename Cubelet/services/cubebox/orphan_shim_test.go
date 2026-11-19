@@ -14,8 +14,12 @@ import (
 
 	"github.com/stretchr/testify/require"
 
+	"github.com/tencentcloud/CubeSandbox/Cubelet/pkg/constants"
+	"github.com/tencentcloud/CubeSandbox/Cubelet/pkg/semaphore"
 	cubeboxstore "github.com/tencentcloud/CubeSandbox/Cubelet/pkg/store/cubebox"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/plugins/workflow"
+	CubeLog "github.com/tencentcloud/CubeSandbox/pkgs/CubeLog"
+	"github.com/tencentcloud/CubeSandbox/pkgs/proto/services/cubebox/v1"
 )
 
 // fakeProc writes a /proc-like entry: cmdline args and a cwd symlink.
@@ -116,4 +120,51 @@ func TestProvablyExitedIgnoresStaleRuntimeMayExist(t *testing.T) {
 	l.probe = &fakeRuntimeProbe{procs: map[string]bool{id: true}}
 	ok, _ = l.provablyExited(ctx, exitedOrphanRecord(id))
 	require.False(t, ok)
+}
+
+// Records that ran and exited before this Cubelet process started are only
+// ever reached by queued cleanups carrying a previous-process epoch. Those
+// cleanups now proceed on the exited proof (after reaping an orphan shim);
+// a paused record keeps the refusal.
+func TestEngineCleanUpStaleEpochUsesExitedProof(t *testing.T) {
+	root, killed := withFakeProcAndKill(t)
+	id := "sb-gc-exited"
+	fakeProc(t, root, "99999997", []string{shimBin, "-id", id}, "/state/."+id+" (deleted)")
+	api := &deletingCubeboxAPI{fakeCubeboxAPI: fakeCubeboxAPI{cb: exitedOrphanRecord(id)}}
+	l := &local{cubeboxManger: api, cbriManager: noopCbri{}, probe: &fakeRuntimeProbe{containers: map[string]bool{id: true}}}
+	prev := workflow.StaleCleanupVerifier
+	workflow.StaleCleanupVerifier = l.verifyStaleCleanup
+	t.Cleanup(func() { workflow.StaleCleanupVerifier = prev })
+	st := &storageFlow{}
+	e := &workflow.Engine{}
+	e.AddFlow("cleanup", &workflow.Workflow{Name: "cleanup", Limiter: semaphore.NewLimiter(1),
+		Steps: []*workflow.Step{{Actions: []workflow.Flow{st}}}})
+	stale := &workflow.LifecycleCleanup{Epoch: "previous-process"}
+	ctx := CubeLog.WithRequestTrace(context.Background(), &CubeLog.RequestTrace{RequestID: "gc-exited"})
+	require.NoError(t, e.CleanUp(ctx, &workflow.CleanContext{
+		BaseWorkflowInfo: workflow.BaseWorkflowInfo{SandboxID: id}, CleanupEvidence: stale}))
+	require.Equal(t, 1, st.destroyed)
+	require.Equal(t, []int{99999997}, *killed)
+
+	api.cb = newCubeboxWithStatusForTest(id, cubeboxstore.Status{FinishedAt: 1, PausedAt: 1})
+	require.Error(t, e.CleanUp(ctx, &workflow.CleanContext{
+		BaseWorkflowInfo: workflow.BaseWorkflowInfo{SandboxID: id}, CleanupEvidence: stale}))
+	require.Equal(t, 1, st.destroyed)
+}
+
+func TestExitedRecordOwnsStorage(t *testing.T) {
+	tpl := exitedOrphanRecord("own-tpl")
+	tpl.InstanceType = cubebox.InstanceType_cubebox.String()
+	tpl.Annotations = map[string]string{constants.MasterAnnotationAppSnapshotTemplateID: "tpl-x"}
+	require.True(t, exitedRecordOwnsStorage(tpl))
+
+	resume := exitedOrphanRecord("own-resume")
+	resume.InstanceType = cubebox.InstanceType_cubebox.String()
+	resume.Annotations = map[string]string{
+		constants.MasterAnnotationPauseSnapshotID:   "snap-x",
+		constants.MasterAnnotationRuntimeSnapshotID: "snap-x",
+	}
+	require.False(t, exitedRecordOwnsStorage(resume))
+	require.True(t, exitedRecordOwnsStorage(crossNodeRecord("own-xnode")))
+	require.False(t, exitedRecordOwnsStorage(nil))
 }
