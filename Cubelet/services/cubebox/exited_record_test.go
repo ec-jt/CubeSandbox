@@ -84,10 +84,15 @@ func TestProvablyExited(t *testing.T) {
 		})
 	}
 
-	// An unresolved runtime start in this process is never overridden.
+	// A failed start earlier in this process leaves RuntimeMayExist set. For
+	// an EXITED record that flag alone is not a runtime: the host checks
+	// decide (see TestProvablyExitedIgnoresStaleRuntimeMayExist).
 	l := &local{probe: &fakeRuntimeProbe{}}
 	ctx := workflow.WithLifecycleCleanup(context.Background(), &workflow.LifecycleCleanup{RuntimeMayExist: true})
-	ok, _ := l.provablyExited(ctx, exitedRecord("sb-exited"))
+	ok, why := l.provablyExited(ctx, exitedRecord("sb-exited"))
+	require.True(t, ok, why)
+	l.probe = &fakeRuntimeProbe{shims: map[string]bool{"sb-exited": true}}
+	ok, _ = l.provablyExited(ctx, exitedRecord("sb-exited"))
 	require.False(t, ok)
 }
 

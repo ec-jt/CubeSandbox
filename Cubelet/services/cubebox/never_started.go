@@ -21,7 +21,10 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
+	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/containerd/containerd/api/services/tasks/v1"
@@ -257,9 +260,12 @@ func (l *local) provablyExited(ctx context.Context, sb *cubeboxstore.CubeBox) (b
 	if sb.GetStatus() == nil {
 		return false, "record has no status"
 	}
-	if e := workflow.LifecycleCleanupFrom(ctx); e != nil && e.RuntimeMayExist && !e.RuntimeGone {
-		return false, "a runtime start was attempted in this process and is unresolved"
-	}
+	// A start attempted earlier in this process leaves RuntimeMayExist set
+	// on every later lifecycle of the id, even after the attempt failed and
+	// failover marked the record exited. That flag alone is not a runtime:
+	// the caller holds the lifecycle lock (no start can be in flight) and the
+	// checks below include the host process scan, which sees any shim or VMM
+	// the attempt spawned. So it does not block the exited proof.
 	main := sb.GetStatus().Get()
 	if main.PausedAt != 0 || main.PausingAt != 0 {
 		return false, fmt.Sprintf("record is paused (state %s)", main.State())
@@ -315,6 +321,12 @@ func (l *local) requireRuntimeCleanupEvidenceFor(ctx context.Context, sb *cubebo
 	id := sb.ID
 	ok, reason := l.provablyNeverStarted(ctx, sb)
 	if !ok {
+		if reaped, err := l.reapOrphanShims(ctx, sb); err != nil {
+			log.G(ctx).Warnf("sandbox %s: %v", id, err)
+			return requireRuntimeCleanupEvidence(ctx, id)
+		} else if len(reaped) > 0 {
+			log.G(ctx).Warnf("sandbox %s: orphan shim pids %v reaped", id, reaped)
+		}
 		// A record that ran and exited, recovered without pids after a
 		// restart, can still prove its runtime is gone. Storage policy is
 		// the ordinary Destroy policy: PreserveStorage is left as it is.
@@ -327,7 +339,7 @@ func (l *local) requireRuntimeCleanupEvidenceFor(ctx context.Context, sb *cubebo
 		} else {
 			reason = reason + "; " + why
 		}
-		log.G(ctx).Infof("sandbox %s: runtime absence not provable: %s", id, reason)
+		log.G(ctx).Warnf("sandbox %s: runtime absence not provable: %s", id, reason)
 		return requireRuntimeCleanupEvidence(ctx, id)
 	}
 	if !recordRollbackReleasesStorage(sb) {
@@ -515,4 +527,112 @@ func (s *service) releaseFailedCrossNodeRestore(ctx context.Context, sid string)
 		return
 	}
 	log.G(ctx).Warnf("cross-node restore %s failed before any runtime started; released imported storage", sid)
+}
+
+// Orphan shim reaping (Phase 3, item 5).
+//
+// A create that failed after the shim spawned can leave this state behind:
+// failover marked the record EXITED and containerd deleted the task and the
+// shim bundle, but the shim process (which hosts the VMM) kept running with
+// its working directory on the deleted bundle and the guest NVMe fds open.
+// Destroy then finds no recorded pid and no bundle pid file, the process
+// scan correctly sees the shim, and the record is refused forever.
+//
+// Such a shim is unreachable: containerd has no task for it and its bundle
+// is gone, so no API can stop it. reapOrphanShims kills it and waits for it
+// to exit, which turns the record into a provably exited one. It acts only
+// when every condition holds, under the lifecycle lock:
+//   - no snapshot publication hold; record EXITED, not paused or pausing;
+//   - containerd has no task for the sandbox or any of its containers;
+//   - the process is a containerd shim whose "-id" argument is exactly one
+//     of those ids and whose cwd is a deleted directory.
+
+// shimKill is a variable so tests can observe kills without signalling.
+var shimKill = func(pid int) error { return syscall.Kill(pid, syscall.SIGKILL) }
+
+// orphanShimPIDs returns pids under root of containerd shims for id whose
+// working directory was deleted.
+func orphanShimPIDs(root, id string) []int {
+	entries, err := os.ReadDir(root)
+	if err != nil || strings.TrimSpace(id) == "" {
+		return nil
+	}
+	var pids []int
+	for _, e := range entries {
+		pid, err := strconv.Atoi(e.Name())
+		if err != nil || pid <= 1 || pid == os.Getpid() {
+			continue
+		}
+		raw, err := os.ReadFile(filepath.Join(root, e.Name(), "cmdline"))
+		if err != nil || len(raw) == 0 {
+			continue
+		}
+		args := strings.Split(strings.TrimRight(string(raw), "\x00"), "\x00")
+		if !strings.HasPrefix(filepath.Base(args[0]), "containerd-shim") {
+			continue
+		}
+		match := false
+		for i := 1; i+1 < len(args); i++ {
+			if args[i] == "-id" && args[i+1] == id {
+				match = true
+				break
+			}
+		}
+		if !match {
+			continue
+		}
+		cwd, err := os.Readlink(filepath.Join(root, e.Name(), "cwd"))
+		if err != nil || !strings.HasSuffix(cwd, " (deleted)") {
+			continue
+		}
+		pids = append(pids, pid)
+	}
+	sort.Ints(pids)
+	return pids
+}
+
+// reapOrphanShims kills orphaned shims of an exited record and waits for
+// them to exit. It returns the reaped pids; nil means nothing qualified.
+func (l *local) reapOrphanShims(ctx context.Context, sb *cubeboxstore.CubeBox) ([]int, error) {
+	if sb == nil || sb.GetPublicationHold() != nil || sb.GetStatus() == nil {
+		return nil, nil
+	}
+	st := sb.GetStatus().Get()
+	if st.FinishedAt == 0 || st.PausedAt != 0 || st.PausingAt != 0 {
+		return nil, nil
+	}
+	ns := sb.Namespace
+	if ns == "" {
+		ns = namespaces.Default
+	}
+	qctx := namespaces.WithNamespace(ctx, ns)
+	probe := l.runtimeEvidenceProbe()
+	ids := sandboxShimLookupIDs(sb)
+	for _, id := range ids {
+		exists, err := probe.TaskExists(qctx, id)
+		if err != nil || exists {
+			return nil, nil
+		}
+	}
+	var pids []int
+	for _, id := range ids {
+		pids = append(pids, orphanShimPIDs(procRoot, id)...)
+	}
+	if len(pids) == 0 {
+		return nil, nil
+	}
+	log.G(ctx).Warnf("sandbox %s: exited record, no containerd task, shim pids %v run on a deleted bundle; killing orphaned runtime", sb.ID, pids)
+	for _, pid := range pids {
+		if err := shimKill(pid); err != nil && !errors.Is(err, syscall.ESRCH) {
+			return pids, fmt.Errorf("kill orphan shim %d: %w", pid, err)
+		}
+	}
+	wctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	for _, pid := range pids {
+		if err := utils.WaitProcessGone(wctx, pid); err != nil {
+			return pids, fmt.Errorf("orphan shim %d did not exit: %w", pid, err)
+		}
+	}
+	return pids, nil
 }
