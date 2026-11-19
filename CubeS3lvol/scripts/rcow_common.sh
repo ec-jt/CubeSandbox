@@ -343,6 +343,13 @@ RCOW_STOP_TIMEOUT="${RCOW_STOP_TIMEOUT:-120}"
 # Budget for rcow_quiesce_nvmf inside a stop (seconds). Stalled S3 GETs are
 # expired every 500 ms while it waits, so this is a ceiling, not a typical time.
 RCOW_QUIESCE_TIMEOUT="${RCOW_QUIESCE_TIMEOUT:-20}"
+# Keep-connected restarts (B3 live): once the quiesce has drained every qpair,
+# all acknowledged writes are in the WAL, which the next attach replays. The
+# drain to S3 is then an optimisation, not a safety step, and under degraded
+# S3 it costs 30 s plus a SIGTERM path that retries the same uploads. These
+# bound it so a restart stays under ~10 s whatever S3 does.
+RCOW_KEEPCONN_UNLOAD_TIMEOUT="${RCOW_KEEPCONN_UNLOAD_TIMEOUT:-4}"
+RCOW_KEEPCONN_TERM_TIMEOUT="${RCOW_KEEPCONN_TERM_TIMEOUT:-2}"
 RCOW_RPC_TIMEOUT="${RCOW_RPC_TIMEOUT:-300}"
 
 # --------------------------------------------------------------------------

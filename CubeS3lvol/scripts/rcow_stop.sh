@@ -158,9 +158,11 @@ else
 	# reconnects to the next process on the same NQN/NSID.
 	rcow_step "quiescing NVMf subsystems"
 	QUIESCE_MS=$(( RCOW_QUIESCE_TIMEOUT * 1000 ))
+	QUIESCED=0
 	if QOUT="$(RCOW_RPC_TIMEOUT=$(( RCOW_QUIESCE_TIMEOUT + 5 )) \
 		rcow_rpc rcow_quiesce_nvmf "$(printf '{"timeout_ms":%s}' "${QUIESCE_MS}")" 2>&1)"; then
 		rcow_log "quiesced: ${QOUT}"
+		QUIESCED=1
 	else
 		# Not fatal, but the unload below is what aborts if a namespace is
 		# still carrying I/O; say so loudly.
@@ -176,6 +178,14 @@ else
 	# quicker, but the budget has to cover the case where the unload failed.
 	UNLOAD_BUDGET=$(( $(remaining) - 60 ))
 	[ "${UNLOAD_BUDGET}" -lt 10 ] && UNLOAD_BUDGET=10
+	FAST_STOP=0
+	if [ "${KEEP_CONNECTED}" -eq 1 ] && [ "${QUIESCED}" -eq 1 ]; then
+		# Every qpair is drained, so every acknowledged write is in the
+		# WAL and the next attach (seconds from now) replays it. Try the
+		# clean unload briefly; if S3 is slow do not wait for it.
+		FAST_STOP=1
+		UNLOAD_BUDGET="${RCOW_KEEPCONN_UNLOAD_TIMEOUT}"
+	fi
 
 	UNLOAD_OUT="$(RCOW_RPC_TIMEOUT="${UNLOAD_BUDGET}" \
 		rcow_rpc rcow_unload_lvstore \
@@ -198,6 +208,13 @@ rcow_step "stopping the target"
 
 TERM_BUDGET="$(remaining)"
 [ "${TERM_BUDGET}" -lt 5 ] && TERM_BUDGET=5
+if [ "${FAST_STOP:-0}" -eq 1 ] && [ "${UNLOAD_RC:-1}" -ne 0 ]; then
+	# A target whose unload did not finish retries the same S3 uploads in
+	# its SIGTERM path (89 s observed under degraded S3). The WAL already
+	# holds the data; SIGKILL after a short grace.
+	TERM_BUDGET="${RCOW_KEEPCONN_TERM_TIMEOUT}"
+	rcow_log "keep-connected fast stop: quiesced, WAL holds every acknowledged write; SIGKILL after ${TERM_BUDGET}s"
+fi
 
 if rcow_kill_target "${TGT_PID}" "${TERM_BUDGET}"; then
 	rcow_log "target stopped"
