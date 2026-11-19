@@ -231,6 +231,31 @@ test_deadline(void)
 		check("race: fired <=> exactly one cancel", mismatch == 0);
 	}
 
+	/* Teardown: expire_all cancels long-deadline requests at once. */
+	{
+		struct fake_target a, b;
+
+		ft_init(&a);
+		ft_init(&b);
+		struct s3_deadline *da = s3_deadline_new(60000);
+		struct s3_deadline *db = s3_deadline_new(60000);
+
+		s3_deadline_arm(da, &a, &g_ops);
+		s3_deadline_arm(db, &b, &g_ops);
+		sleep_ms(30);
+		check("60 s deadlines not yet fired", atomic_load(&a.cancels) == 0 &&
+		      atomic_load(&b.cancels) == 0);
+		s3_deadline_expire_all();
+		wait_cancel(&a, 3000);
+		wait_cancel(&b, 3000);
+		check("expire_all: both cancelled within 3 s",
+		      atomic_load(&a.cancels) == 1 && atomic_load(&b.cancels) == 1);
+		check("expire_all: finish reports fired",
+		      s3_deadline_finish(da) && s3_deadline_finish(db));
+		check("expire_all: refs balanced",
+		      atomic_load(&a.refs) == 1 && atomic_load(&b.refs) == 1);
+	}
+
 	check("nothing left pending", s3_deadline_pending() == 0);
 	s3_deadline_shutdown();
 	check("watchdog restarts after shutdown", (d = s3_deadline_new(5)) != NULL);

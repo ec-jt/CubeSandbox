@@ -321,6 +321,24 @@ s3_deadline_fired_total(void)
 }
 
 void
+s3_deadline_expire_all(void)
+{
+	struct s3_deadline *d;
+	uint64_t now = deadline_now_ms();
+
+	pthread_mutex_lock(&g_lock);
+	TAILQ_FOREACH(d, &g_list, link) {
+		if (d->deadline_ms > now) {
+			d->deadline_ms = now;
+		}
+	}
+	if (g_running) {
+		pthread_cond_signal(&g_cond);
+	}
+	pthread_mutex_unlock(&g_lock);
+}
+
+void
 s3_deadline_shutdown(void)
 {
 	pthread_t t;

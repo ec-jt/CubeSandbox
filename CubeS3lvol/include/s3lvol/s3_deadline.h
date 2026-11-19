@@ -82,6 +82,14 @@ uint64_t s3_deadline_pending(void);
 uint64_t s3_deadline_fired_total(void);
 
 /**
+ * Process teardown: move every pending deadline to now, so the watchdog
+ * cancels all requests still in flight instead of letting each run out its
+ * own limit. A GET stalled in S3 kept s3lvol_tgt alive for up to 60 s after
+ * SIGTERM (app1 2026-11-19 01:21: unload done in 3 s, exit 55 s later).
+ */
+void s3_deadline_expire_all(void);
+
+/**
  * Stop the watchdog thread. Entries still registered are not cancelled; it is
  * restarted by the next s3_deadline_new(). For process teardown and tests.
  */

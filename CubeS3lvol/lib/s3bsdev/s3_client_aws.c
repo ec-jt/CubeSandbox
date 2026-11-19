@@ -1243,6 +1243,11 @@ s3_crt_global_fini_body(void)
 		return;
 	}
 
+	/* The process is going away: nothing still in flight can be waited for
+	 * usefully. Without this the client releases below wait for every
+	 * stalled request to run out its own deadline (up to 60 s). */
+	s3_deadline_expire_all();
+
 	/* Anything still here was never released by its owner. Release it, but do not
 	 * free it: s3_client_shutdown_complete() does that, and it will run before
 	 * aws_event_loop_group_release() below joins the CRT threads. Freeing here
