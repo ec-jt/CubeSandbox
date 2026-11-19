@@ -51,7 +51,9 @@
  *     S3LVOL_PEER_DIR          /data/s3lvol-peer
  *     S3LVOL_PEER_CACHE_MB     16384  local pack copies kept, oldest evicted
  *     S3LVOL_PEER_PORT         17310  port used when a peer has none
- *     S3LVOL_PEER_CONNECT_MS   1000   connect timeout
+ *     S3LVOL_PEER_CONNECT_MS   3000   connect timeout (above the 1 s first SYN
+ *                                     retransmit: a dropped first SYN after idle
+ *                                     failed every connect of a batch at 1000)
  *     S3LVOL_PEER_IO_MS        10000  whole-request timeout after connect
  *     S3LVOL_PEER_HEDGE_MS     2000   S3 is started if the peer has not
  *                                     answered by then (the peer may still win)

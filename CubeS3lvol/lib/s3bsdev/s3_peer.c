@@ -160,7 +160,7 @@ cfg(void)
 		g_cfg.cache_bytes = env_u64("S3LVOL_PEER_CACHE_MB", 16384, 0, 1u << 24) << 20;
 		g_cfg.default_port = (uint16_t)env_u64("S3LVOL_PEER_PORT",
 						       S3_PEER_DEFAULT_PORT, 1, 65535);
-		g_cfg.connect_ms = (uint32_t)env_u64("S3LVOL_PEER_CONNECT_MS", 1000, 10, 60000);
+		g_cfg.connect_ms = (uint32_t)env_u64("S3LVOL_PEER_CONNECT_MS", 3000, 10, 60000);
 		g_cfg.io_ms = (uint32_t)env_u64("S3LVOL_PEER_IO_MS", 10000, 100, 600000);
 		g_cfg.hedge_ms = (uint32_t)env_u64("S3LVOL_PEER_HEDGE_MS", 2000, 1, 600000);
 		g_cfg.threads = (uint32_t)env_u64("S3LVOL_PEER_THREADS", 8, 1, 64);
