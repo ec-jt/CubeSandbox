@@ -12,6 +12,10 @@
 #
 #  While CONTROL_FILE exists no byte is forwarded in either direction and every
 #  socket stays open. Removing the file resumes forwarding.
+#
+#  Degraded mode: if CONTROL_FILE holds a number N > 0, bytes do flow but every
+#  forwarded segment (up to 64 KiB) is delayed by N milliseconds -- a slow
+#  object store rather than a dead one (app2: ~70 s per 1 MiB PUT).
 
 import os
 import select
@@ -21,18 +25,39 @@ import threading
 import time
 
 
+def delay_ms(ctl):
+    try:
+        with open(ctl) as f:
+            v = f.read().strip()
+        return int(v) if v else -1
+    except FileNotFoundError:
+        return 0
+    except ValueError:
+        return -1
+
+
+def wait_gate(ctl):
+    """-1 (file present, no number): stall. N > 0: sleep N ms once."""
+    while True:
+        d = delay_ms(ctl)
+        if d >= 0:
+            if d > 0:
+                time.sleep(d / 1000.0)
+            return
+        time.sleep(0.05)
+
+
 def pump(a, b, ctl):
     try:
         while True:
-            while os.path.exists(ctl):
-                time.sleep(0.05)
+            wait_gate(ctl)
             r, _, _ = select.select([a], [], [], 0.2)
             if not r:
                 continue
             data = a.recv(65536)
             if not data:
                 break
-            while os.path.exists(ctl):
+            while delay_ms(ctl) < 0:
                 time.sleep(0.05)
             b.sendall(data)
     except OSError:

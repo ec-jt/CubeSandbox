@@ -374,6 +374,12 @@ struct s3_bs_dev_stats {
 	uint64_t cache_slots_total;
 	uint64_t cache_slots_resident;
 	uint64_t cache_bytes_resident;
+
+	/* Write throttle (S3LVOL_WAL_MAX_DIRTY_GB). */
+	uint64_t throttle_cap_bytes;
+	uint64_t throttled_writes;
+	uint32_t throttle_queued;
+	uint32_t deferred_delete_queued;
 };
 
 /**
@@ -414,6 +420,49 @@ typedef void (*s3_bs_dev_warm_cb)(void *cb_arg, int status,
  */
 int s3_bs_dev_warm(struct spdk_bs_dev *bs_dev, const uint64_t *chunks, uint64_t n,
 		   uint32_t window, s3_bs_dev_warm_cb cb_fn, void *cb_arg);
+
+/* ==========================================================================
+ * Degraded-S3 controls (attach hold, write throttle, metadata cache index)
+ * ========================================================================== */
+
+/**
+ * Hold background S3 work while \p hold is true: no new flusher upload (a
+ * drain or a backpressured WAL still forces them) and no superseded-object
+ * DELETE. Set during attach so the metadata reads the attach waits on are not
+ * queued behind uploads; released once the lvstore is up.
+ */
+void s3_bs_dev_set_bg_hold(struct spdk_bs_dev *bs_dev, bool hold);
+
+uint64_t s3_bs_dev_throttled_writes(struct spdk_bs_dev *bs_dev);
+
+struct s3_bs_dev_md_index_stats {
+	uint64_t entries;
+	uint64_t adopted;
+	uint64_t stale;         /* chunk map names another object now */
+	uint64_t crc_mismatch;  /* slot bytes changed since the save */
+	uint64_t skipped;
+	uint64_t elapsed_ms;
+};
+
+typedef void (*s3_bs_dev_md_index_cb)(void *cb_arg, int status,
+				      const struct s3_bs_dev_md_index_stats *st);
+
+/** Where the metadata cache index lives, and which chunks it covers
+ * ([0, max_chunk)). NULL disables it. */
+void s3_bs_dev_md_index_configure(struct spdk_bs_dev *bs_dev, const char *path,
+				  uint64_t max_chunk);
+
+/** Save now (synchronous, small). Also done on checkpoint publication and at
+ * teardown. */
+int s3_bs_dev_md_index_save(struct spdk_bs_dev *bs_dev);
+
+/**
+ * Re-adopt the saved metadata chunks from the local cache, each verified by
+ * CRC. \return 0 with \p cb_fn to follow, or a negative errno (no file, a
+ * different cache geometry, a corrupt file) with no callback.
+ */
+int s3_bs_dev_md_index_load(struct spdk_bs_dev *bs_dev, s3_bs_dev_md_index_cb cb_fn,
+			    void *cb_arg);
 
 /* ==========================================================================
  * Read-only s3_export_bs_dev (the parent of a cross-node external snapshot)

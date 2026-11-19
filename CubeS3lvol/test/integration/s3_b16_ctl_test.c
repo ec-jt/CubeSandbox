@@ -31,6 +31,7 @@
 
 #include "s3lvol/s3_deadline.h"
 #include "export_b16_ctl.h"
+#include "s3lvol/s3_throttle.h"
 
 static int g_pass;
 static int g_fail;
@@ -271,14 +272,14 @@ static void
 test_drain(void)
 {
 	struct export_drain_progress p = {0};
-	const uint64_t W = EXPORT_DRAIN_NO_PROGRESS_MS, CAP = EXPORT_DRAIN_PROGRESS_CAP_MS;
+	const uint64_t W = EXPORT_DRAIN_NO_PROGRESS_MS, CAP = 15ULL * 60 * 1000;
 	uint64_t t = 1000, flushed = 10;
 	bool moved;
 	int again = 0;
 
 	printf("\n[2] progress-based export drain\n");
-	check("no-progress window 60 s", W == 60000);
-	check("overall cap 15 min", CAP == 15 * 60 * 1000);
+	check("no-progress window 5 min", W == 5 * 60 * 1000);
+	check("no overall cap by default", EXPORT_DRAIN_PROGRESS_CAP_MS == 0);
 
 	export_drain_ctl_start(&p, t, flushed);
 	/* Every 30 s drain timeout, the flusher completed some uploads. */
@@ -293,16 +294,20 @@ test_drain(void)
 	check("extended on every progressing timeout (20/20)", again == 20);
 	check("extensions counted", p.extensions == 20);
 
-	/* One timeout without progress is still inside the window. */
-	t += 30000;
-	check("no progress for 30 s: drain again",
-	      export_drain_ctl_next(&p, t, flushed, W, CAP, &moved) == EXPORT_DRAIN_AGAIN &&
-	      !moved);
-	t += 30000;
-	check("no progress for 60 s: fail",
-	      export_drain_ctl_next(&p, t, flushed, W, CAP, &moved) == EXPORT_DRAIN_FAIL);
+	/* Timeouts without progress stay inside the window until it is spent. */
+	{
+		uint64_t stall_start = t;
+		enum export_drain_verdict v = EXPORT_DRAIN_AGAIN;
 
-	/* Cap reached even though progress continues. */
+		while (v == EXPORT_DRAIN_AGAIN && t - stall_start < 2 * W) {
+			t += 30000;
+			v = export_drain_ctl_next(&p, t, flushed, W, CAP, &moved);
+		}
+		check("no progress: fail exactly at the window", v == EXPORT_DRAIN_FAIL &&
+		      t - stall_start == W);
+	}
+
+	/* An explicit cap still stops a progressing drain. */
 	memset(&p, 0, sizeof(p));
 	t = 0;
 	flushed = 0;
@@ -317,8 +322,29 @@ test_drain(void)
 			v = export_drain_ctl_next(&p, t, flushed, W, CAP, NULL);
 			n++;
 		}
-		check("progressing drain stops at the cap", v == EXPORT_DRAIN_FAIL);
+		check("progressing drain stops at an explicit cap", v == EXPORT_DRAIN_FAIL);
 		check("cap hit at 15 min", t == CAP);
+	}
+
+	/* Default (cap 0): a slow but progressing drain is never failed. Models
+	 * the degraded bucket: one upload per ~70 s, for six hours. */
+	memset(&p, 0, sizeof(p));
+	t = 0;
+	flushed = 0;
+	export_drain_ctl_start(&p, t, flushed);
+	{
+		enum export_drain_verdict v = EXPORT_DRAIN_AGAIN;
+
+		while (v == EXPORT_DRAIN_AGAIN && t < 6ULL * 3600 * 1000) {
+			t += 30000;
+			if ((t / 30000) % 3 == 0) {
+				flushed++;
+			}
+			v = export_drain_ctl_next(&p, t, flushed, W, EXPORT_DRAIN_PROGRESS_CAP_MS,
+						  NULL);
+		}
+		check("no default cap: slow progressing drain survives 6 h",
+		      v == EXPORT_DRAIN_AGAIN);
 	}
 
 	/* Lazily started (first call is a timeout). */
@@ -494,12 +520,53 @@ test_reconcile_route(void)
 	check("unknown future version: refused", export_reconcile_ctl_route(&f) == -ENOTSUP);
 }
 
+/* ==========================================================================
+ * [T] WAL backlog throttle curve (S3LVOL_WAL_MAX_DIRTY_GB)
+ * ========================================================================== */
+
+static void
+test_throttle(void)
+{
+	const uint64_t G = 1ULL << 30, cap = 8 * G;
+	uint64_t prev = S3_THROTTLE_UNLIMITED, b;
+	bool monotone = true;
+
+	printf("\n[T] WAL backlog throttle curve\n");
+	check("cap 0 means off", s3_throttle_rate(100 * G, 0) == S3_THROTTLE_UNLIMITED);
+	check("below half the cap: unthrottled",
+	      s3_throttle_rate(cap / 2 - 1, cap) == S3_THROTTLE_UNLIMITED);
+	check("at half the cap: the high rate",
+	      s3_throttle_rate(cap / 2, cap) == S3_THROTTLE_RATE_HI);
+	check("just below the cap: close to the low rate",
+	      s3_throttle_rate(cap - 1, cap) >= S3_THROTTLE_RATE_LO &&
+	      s3_throttle_rate(cap - 1, cap) < S3_THROTTLE_RATE_LO + (1 << 20));
+	check("at the cap: floor, never zero",
+	      s3_throttle_rate(cap, cap) == S3_THROTTLE_RATE_FLOOR &&
+	      S3_THROTTLE_RATE_FLOOR > 0);
+	check("far past the cap: still the floor (writers slowed, not refused)",
+	      s3_throttle_rate(40 * G, cap) == S3_THROTTLE_RATE_FLOOR);
+	for (b = 0; b <= 2 * cap; b += cap / 64) {
+		uint64_t r = s3_throttle_rate(b, cap);
+
+		if (r > prev) {
+			monotone = false;
+		}
+		prev = r;
+	}
+	check("rate never rises as the backlog grows", monotone);
+	/* The bound the throttle exists for: with S3 fully stalled, how far
+	 * past the cap can a writer push the backlog in an hour? */
+	check("stalled S3: backlog grows <= 7.1 GiB/h past the cap",
+	      S3_THROTTLE_RATE_FLOOR * 3600 <= (uint64_t)(7.1 * (double)G));
+}
+
 int
 main(void)
 {
 	printf("=== B16 export / deadline unit test ===\n");
 	test_deadline();
 	test_drain();
+	test_throttle();
 	test_reservation();
 	test_abandon();
 	test_reconcile_route();

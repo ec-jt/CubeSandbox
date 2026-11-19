@@ -2399,6 +2399,28 @@ export_drain_retry(void *arg)
 	return SPDK_POLLER_BUSY;
 }
 
+static uint64_t
+export_drain_env_ms(const char *name, uint64_t dflt)
+{
+	const char *v = getenv(name);
+
+	return (v && *v) ? strtoull(v, NULL, 10) * 1000ULL : dflt;
+}
+
+/* S3LVOL_EXPORT_DRAIN_NO_PROGRESS_S / S3LVOL_EXPORT_DRAIN_CAP_S (0 = no cap). */
+static uint64_t
+export_drain_no_progress_ms(void)
+{
+	return export_drain_env_ms("S3LVOL_EXPORT_DRAIN_NO_PROGRESS_S",
+				   EXPORT_DRAIN_NO_PROGRESS_MS);
+}
+
+static uint64_t
+export_drain_cap_ms(void)
+{
+	return export_drain_env_ms("S3LVOL_EXPORT_DRAIN_CAP_S", EXPORT_DRAIN_PROGRESS_CAP_MS);
+}
+
 static void
 export_drained(void *cb_arg, int status)
 {
@@ -2455,8 +2477,8 @@ export_drained(void *cb_arg, int status)
 
 		s3_bs_dev_get_stats(s3lvol_lvstore_get_bs_dev(ctx->lvs), &st);
 		if (export_drain_ctl_next(&ctx->drain_progress, now, st.chunks_flushed,
-					  EXPORT_DRAIN_NO_PROGRESS_MS,
-					  EXPORT_DRAIN_PROGRESS_CAP_MS, &moved) ==
+					  export_drain_no_progress_ms(),
+					  export_drain_cap_ms(), &moved) ==
 		    EXPORT_DRAIN_AGAIN) {
 			/* At most one line per 30 s per export. */
 			if (ctx->drain_last_log_ms == 0 ||
@@ -2489,8 +2511,8 @@ export_drained(void *cb_arg, int status)
 				    "%u extension(s); giving up\n", ctx->info.export_uuid,
 				    s3lvol_lvstore_get_name(ctx->lvs),
 				    now - ctx->drain_progress.last_progress_ms,
-				    (unsigned long long)EXPORT_DRAIN_NO_PROGRESS_MS,
-				    (unsigned long long)EXPORT_DRAIN_PROGRESS_CAP_MS,
+				    (unsigned long long)export_drain_no_progress_ms(),
+				    (unsigned long long)export_drain_cap_ms(),
 				    ctx->drain_progress.extensions);
 		}
 	}

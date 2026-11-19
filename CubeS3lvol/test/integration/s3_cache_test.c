@@ -1091,6 +1091,82 @@ main(int argc, char **argv)
 		g_q_rd = NULL;
 	}
 
+	printf("\n[15] persistent index: export, restart, CRC-verified adopt\n");
+	{
+		struct s3_cache_opts o2 = {
+			.desc = desc, .ch = ch, .region_offset = TEST_REGION_OFF,
+			.region_size = TEST_REGION_SIZE, .chunk_size = TEST_CHUNK_SIZE,
+			.block_size = AIO_BLOCK_SIZE, .num_chunks = TEST_NUM_CHUNKS,
+		};
+		struct s3_cache *c1 = NULL, *c2 = NULL;
+		struct s3_cache_index_entry ents[8];
+		struct spdk_uuid u5, u6;
+		struct async_ctx a = {0}, b = {0}, rd = {0};
+		struct q_ctx q1 = {0}, q2 = {0};
+		uint64_t n;
+		int arc;
+
+		/* The main cache has already been quiesced above and is idle;
+		 * build a fresh pair over the same region. */
+		check_u64("cache #1", (uint64_t)-s3_cache_create(&o2, &c1), 0);
+		spdk_uuid_generate(&u5);
+		spdk_uuid_generate(&u6);
+		fill_pattern(src, 5, TEST_CHUNK_SIZE, 21);
+		populate_sync(c1, 5, &u5, src, TEST_CHUNK_SIZE);
+		fill_pattern(src, 6, TEST_CHUNK_SIZE, 22);
+		populate_sync(c1, 6, &u6, src, TEST_CHUNK_SIZE);
+		/* A partial populate has no whole-object CRC: not exported. */
+		fill_pattern(src, 7, TEST_CHUNK_SIZE, 23);
+		s3_cache_populate(c1, 7, &u6, AIO_BLOCK_SIZE, src, AIO_BLOCK_SIZE,
+				  TEST_CHUNK_SIZE);
+		poll_until_populate_settled(c1);
+		n = s3_cache_index_export(c1, TEST_NUM_CHUNKS, ents, 8);
+		check_u64("export lists the two whole objects", n, 2);
+		check_u64("export honours max_chunk",
+			  s3_cache_index_export(c1, 6, ents + 4, 4), 1);
+		if (s3_cache_quiesce(c1, q_done_cb, &q1) == -EINPROGRESS) {
+			poll_until(&q1.done);
+		}
+		s3_cache_destroy(c1);
+
+		/* "Restart": a cold cache over the same device region. */
+		check_u64("cache #2", (uint64_t)-s3_cache_create(&o2, &c2), 0);
+		check_true("cold cache misses", !s3_cache_lookup(c2, 5, &u5), NULL);
+		arc = s3_cache_adopt(c2, &ents[0], dst, async_int_cb, &a);
+		check_u64("adopt #1 submitted", (uint64_t)-arc, 0);
+		poll_until(&a.done);
+		check_u64("adopt #1 verified", (uint64_t)-a.status, 0);
+		check_true("adopted object resident", s3_cache_lookup(c2, ents[0].chunk_index,
+			   &ents[0].uuid), NULL);
+		rc = s3_cache_read(c2, ents[0].chunk_index, &ents[0].uuid, 0,
+				   TEST_CHUNK_SIZE, dst, read_cb, &rd);
+		check_u64("read of adopted object hits", (uint64_t)-rc, 0);
+		poll_until(&rd.done);
+		check_true("adopted bytes are the populated bytes",
+			   pattern_matches(dst, ents[0].chunk_index, 0, TEST_CHUNK_SIZE,
+					   ents[0].chunk_index == 5 ? 21 : 22), NULL);
+		check_u64("adopting the same chunk again is refused",
+			  (uint64_t)-s3_cache_adopt(c2, &ents[0], dst, async_int_cb, &a),
+			  EBUSY);
+
+		/* A wrong CRC (slot reused or torn since the save) must miss. */
+		ents[1].crc ^= 0x5a5a5a5a;
+		check_u64("adopt #2 submitted",
+			  (uint64_t)-s3_cache_adopt(c2, &ents[1], dst, async_int_cb, &b), 0);
+		poll_until(&b.done);
+		check_u64("adopt #2 rejected on CRC", (uint64_t)-b.status, EILSEQ);
+		check_true("rejected object not resident",
+			   !s3_cache_lookup(c2, ents[1].chunk_index, &ents[1].uuid), NULL);
+		check_u64("bad slot index rejected",
+			  (uint64_t)-s3_cache_adopt(c2, &(struct s3_cache_index_entry){
+				  .chunk_index = 1, .valid_bytes = 4096,
+				  .slot = TEST_N_SLOTS }, dst, async_int_cb, &b), EINVAL);
+		if (s3_cache_quiesce(c2, q_done_cb, &q2) == -EINPROGRESS) {
+			poll_until(&q2.done);
+		}
+		s3_cache_destroy(c2);
+	}
+
 	printf("\n=== %d passed, %d failed ===\n", g_pass, g_fail);
 
 out_cache:

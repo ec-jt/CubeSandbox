@@ -34,10 +34,19 @@
  * 1. Progress-based drain
  * ========================================================================== */
 
-/* Fail once the flusher has completed no upload for this long... */
-#define EXPORT_DRAIN_NO_PROGRESS_MS (60ULL * 1000)
-/* ...or once the export has spent this long draining in total. */
-#define EXPORT_DRAIN_PROGRESS_CAP_MS (15ULL * 60 * 1000)
+/* Fail once the flusher has completed no upload for this long...
+ *
+ * 5 minutes rather than 1: on a degraded bucket a single 1 MiB PUT took ~70 s,
+ * so a window of one minute could expire between two completed uploads while
+ * the backlog was still draining. */
+#define EXPORT_DRAIN_NO_PROGRESS_MS (5ULL * 60 * 1000)
+/* ...and no overall cap by default (0). A drain that keeps completing uploads
+ * is making the snapshot publishable; failing it after 15 minutes (the old
+ * fixed cap) only threw that work away and left the snapshot at
+ * remote_status=inprogress with nothing still trying. While the drain runs the
+ * snapshot stays resumable on its own node, so there is nothing to protect by
+ * giving up. S3LVOL_EXPORT_DRAIN_CAP_S restores a cap if wanted. */
+#define EXPORT_DRAIN_PROGRESS_CAP_MS 0ULL
 
 struct export_drain_progress {
 	bool     started;
@@ -87,7 +96,7 @@ export_drain_ctl_next(struct export_drain_progress *p, uint64_t now_ms,
 	if (progressed) {
 		*progressed = moved;
 	}
-	if (now_ms - p->start_ms >= cap_ms) {
+	if (cap_ms != 0 && now_ms - p->start_ms >= cap_ms) {
 		return EXPORT_DRAIN_FAIL;
 	}
 	if (now_ms - p->last_progress_ms >= no_progress_ms) {

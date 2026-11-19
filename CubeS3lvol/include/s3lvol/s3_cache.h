@@ -312,4 +312,50 @@ int s3_cache_quiesce(struct s3_cache *cache, s3_cache_quiesce_cb cb_fn,
 
 void s3_cache_get_stats(struct s3_cache *cache, struct s3_cache_stats *stats);
 
+/* ==========================================================================
+ * Persistent index (metadata chunks)
+ *
+ * The slot index above is RAM only, so a restart comes up cold and every
+ * blobstore metadata read goes to S3 -- which is what made an attach depend on
+ * S3 latency. The bytes themselves survive on the local device, though. These
+ * two calls let the owner save "slot i holds object (chunk, uuid), CRC c" for
+ * the chunks it cares about and, after a restart, re-adopt a slot only after
+ * re-reading it and checking the CRC. A slot that was reused, half-written or
+ * torn simply fails the check and is a miss. Objects are immutable per uuid
+ * (see above), so a verified slot cannot be stale; the caller additionally
+ * only adopts entries whose uuid the chunk map still names.
+ * ========================================================================== */
+
+struct s3_cache_index_entry {
+	uint64_t         chunk_index;
+	struct spdk_uuid uuid;
+	uint32_t         valid_bytes;
+	uint32_t         slot;
+	uint32_t         crc;
+	uint32_t         reserved;
+};
+
+/**
+ * List whole, CRC-known resident objects with chunk_index < \p max_chunk.
+ * \return number of entries written to \p out (at most \p max).
+ */
+uint64_t s3_cache_index_export(struct s3_cache *cache, uint64_t max_chunk,
+			       struct s3_cache_index_entry *out, uint64_t max);
+
+/* Geometry the index is only valid for. */
+void s3_cache_geometry(const struct s3_cache *cache, uint64_t *n_slots,
+		       uint64_t *region_offset, uint32_t *chunk_size);
+
+/**
+ * Re-adopt one saved slot: read it back into \p dma_buf (chunk_size bytes,
+ * DMA-capable), check the CRC and, on a match, make the object resident again.
+ *
+ * \return 0 with \p cb_fn to follow (status 0 adopted, -EILSEQ CRC mismatch,
+ *         -EBUSY slot or chunk taken meanwhile, -EIO read error); -EBUSY when
+ *         the slot is not free now; -EINVAL on a bad entry; -ESHUTDOWN when
+ *         quiescing. No callback on a non-zero return.
+ */
+int s3_cache_adopt(struct s3_cache *cache, const struct s3_cache_index_entry *e,
+		   void *dma_buf, s3_cache_fill_cb cb_fn, void *cb_arg);
+
 #endif /* S3LVOL_CACHE_H */

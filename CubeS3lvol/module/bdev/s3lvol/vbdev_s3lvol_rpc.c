@@ -2025,6 +2025,14 @@ rpc_rcow_get_lvstores(struct spdk_jsonrpc_request *request,
 				spdk_json_write_named_uint64(w, "cache_bytes_resident",
 							     stats.cache_bytes_resident);
 			}
+			spdk_json_write_named_uint64(w, "throttle_cap_bytes",
+						     stats.throttle_cap_bytes);
+			spdk_json_write_named_uint64(w, "throttled_writes",
+						     stats.throttled_writes);
+			spdk_json_write_named_uint32(w, "throttle_queued",
+						     stats.throttle_queued);
+			spdk_json_write_named_uint32(w, "deferred_delete_queued",
+						     stats.deferred_delete_queued);
 			spdk_json_write_object_end(w);
 
 		}

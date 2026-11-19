@@ -293,6 +293,17 @@ export_lease_note_absent(struct s3lvol_export *exp, uint64_t submitted_at)
 	exp->lease_renew_s = 0;
 }
 
+/* Lease checks in flight across every export of this process.
+ *
+ * Each export polls its lease every 20 s. With ~200 exports that is a burst of
+ * ~200 HEADs right after attach (most of them 404: no importer), and on a slow
+ * bucket they occupied the client's connections while guests waited on reads
+ * (~1,100 HEADs around the app2 restart). A check is pure bookkeeping -- the
+ * safe direction while one is pending is "still pinned" -- so it gets a small
+ * fixed share of the bucket and waits for its lvstore to be up. */
+#define EXPORT_LEASE_INFLIGHT_MAX 4
+static uint32_t g_lease_inflight;
+
 static void
 export_lease_get_done(struct export_lease_get_ctx *ctx)
 {
@@ -300,6 +311,8 @@ export_lease_get_done(struct export_lease_get_ctx *ctx)
 		assert(ctx->exp->lease_fetch == ctx);
 		ctx->exp->lease_fetch = NULL;
 	}
+	assert(g_lease_inflight > 0);
+	g_lease_inflight--;
 	free(ctx->body);
 	free(ctx);
 }
@@ -464,6 +477,13 @@ export_lease_renew(void *arg)
 	if (exp->lease_fetch) {
 		return SPDK_POLLER_IDLE;
 	}
+	/* Not before the lvstore is up (the attach is using the bucket), and
+	 * never more than EXPORT_LEASE_INFLIGHT_MAX at once. Skipping a tick
+	 * only delays the check; the export stays pinned meanwhile. */
+	if (!s3lvol_lvstore_is_up(exp->lvs) ||
+	    g_lease_inflight >= EXPORT_LEASE_INFLIGHT_MAX) {
+		return SPDK_POLLER_IDLE;
+	}
 
 	ctx = calloc(1, sizeof(*ctx));
 	if (!ctx) {
@@ -473,6 +493,7 @@ export_lease_renew(void *arg)
 	ctx->submitted_at = (uint64_t)time(NULL);
 	s3lvol_export_lease_key(exp, ctx->key, sizeof(ctx->key));
 	exp->lease_fetch = ctx;
+	g_lease_inflight++;
 
 	rc = s3_head(s3lvol_lvstore_get_client(exp->lvs), ctx->key, &ctx->size,
 		     export_lease_head_done, ctx);

@@ -118,6 +118,10 @@ struct s3lvol_lvstore {
 	 * a completed unload frees the lvstore. */
 	bool                    unload_in_progress;
 	bool                    exports_ready;
+	/* Set once create/attach has reported success. Background S3 work
+	 * (lease checks, superseded deletes, uploads) waits for it so the attach
+	 * gets the bucket to itself. */
+	bool                    up;
 	/* False until create or a complete attach establishes the dependency view.
 	 * Failed opens leave durable blobs outside lvols; never infer completeness
 	 * from lvol_count or clear this after an unrelated successful operation. */
@@ -346,6 +350,21 @@ s3lvol_source_drain(struct s3lvol_lvstore *lvs,
 }
 
 #include "source_scoped.h"
+
+/* Persistent metadata cache index file of an lvstore (see
+ * s3_bs_dev_md_index_configure). Next to bstore.json by default. */
+#define LVS_MD_INDEX_MAX_CHUNK (1ULL << 17)
+
+static void
+lvs_md_index_configure(struct s3lvol_lvstore *lvs)
+{
+	const char *d = getenv("S3LVOL_MDCACHE_DIR");
+	char path[PATH_MAX];
+
+	snprintf(path, sizeof(path), "%s/mdcache.%s.idx", (d && *d) ? d : "/data/cubelet/rcow",
+		 lvs->name);
+	s3_bs_dev_md_index_configure(lvs->bs_dev, path, LVS_MD_INDEX_MAX_CHUNK);
+}
 
 static TAILQ_HEAD(, s3lvol_lvstore) g_lvstores = TAILQ_HEAD_INITIALIZER(g_lvstores);
 
@@ -1321,6 +1340,12 @@ s3lvol_lvstore_exports_ready(const struct s3lvol_lvstore *lvs)
 	return lvs && lvs->exports_ready;
 }
 
+bool
+s3lvol_lvstore_is_up(const struct s3lvol_lvstore *lvs)
+{
+	return lvs && lvs->up;
+}
+
 void
 s3lvol_lvstore_exports_set_ready(struct s3lvol_lvstore *lvs, bool ready)
 {
@@ -1666,6 +1691,12 @@ lvs_setup_report(struct lvs_setup_ctx *ctx)
 
 	TAILQ_INSERT_TAIL(&g_lvstores, lvs, link);
 
+	/* Up: let background S3 work run (held since the bs_dev was created). */
+	lvs->up = true;
+	if (lvs->bs_dev) {
+		s3_bs_dev_set_bg_hold(lvs->bs_dev, false);
+	}
+
 	/* Deletes that were asked for before the last restart and could not be
 	 * carried out. Started here rather than earlier in the chain because the
 	 * queue is keyed by lvstore uuid, which only exists once blobstore is up,
@@ -1923,6 +1954,7 @@ lvs_create_start_blobstore(struct lvs_setup_ctx *ctx)
 		 * means reads go to S3, which is how this worked before the cache
 		 * existed. It is not a reason to fail creating the lvstore. */
 		(void)s3_bs_dev_attach_cache(lvs->bs_dev);
+		lvs_md_index_configure(lvs);
 	}
 
 	if (lvs->wal) {
@@ -3281,6 +3313,29 @@ lvs_md_warm_sb_read(struct spdk_io_channel *channel, void *cb_arg, int bserrno)
 }
 
 static void
+lvs_md_warm_read_sb(struct lvs_md_warm *w)
+{
+	struct spdk_bs_dev *dev = w->ctx->lvs->bs_dev;
+
+	w->cb_args.cb_fn = lvs_md_warm_sb_read;
+	w->cb_args.cb_arg = w;
+	w->cb_args.channel = w->ch;
+	dev->read(dev, w->ch, w->sb, 0, LVS_MD_PAGE / dev->blocklen, &w->cb_args);
+}
+
+static void
+lvs_md_index_loaded(void *cb_arg, int status, const struct s3_bs_dev_md_index_stats *st)
+{
+	struct lvs_md_warm *w = cb_arg;
+
+	(void)status;
+	(void)st;
+	/* The S3 warm-up still runs: it skips everything now resident and
+	 * fetches only what the index did not cover. */
+	lvs_md_warm_read_sb(w);
+}
+
+static void
 lvs_attach_warm_md(struct lvs_setup_ctx *ctx)
 {
 	struct spdk_bs_dev *dev = ctx->lvs->bs_dev;
@@ -3309,10 +3364,23 @@ lvs_attach_warm_md(struct lvs_setup_ctx *ctx)
 	}
 	w->ctx = ctx;
 	w->start_us = lvs_md_warm_now_us();
-	w->cb_args.cb_fn = lvs_md_warm_sb_read;
-	w->cb_args.cb_arg = w;
-	w->cb_args.channel = w->ch;
-	dev->read(dev, w->ch, w->sb, 0, LVS_MD_PAGE / dev->blocklen, &w->cb_args);
+
+	/* Local first: re-adopt the metadata chunks the previous process had in
+	 * the local cache (CRC verified), so the super block read and the S3
+	 * warm-up below find them resident and fetch nothing. With S3 down
+	 * this is what lets the load finish at all. */
+	{
+		int rc;
+
+		lvs_md_index_configure(ctx->lvs);
+		rc = s3_bs_dev_md_index_load(dev, lvs_md_index_loaded, w);
+		if (rc == 0) {
+			return;
+		}
+		SPDK_NOTICELOG("lvstore '%s': no usable metadata cache index (%s); "
+			       "warming from S3\n", ctx->lvs->name, spdk_strerror(-rc));
+	}
+	lvs_md_warm_read_sb(w);
 }
 
 static void
@@ -3400,6 +3468,10 @@ lvs_attach_journal_replayed(void *cb_arg, int status)
 		lvs_setup_fail(ctx, rc);
 		return;
 	}
+	/* Until the lvstore is up, uploads and deletes would only compete with
+	 * the metadata reads the attach is waiting on. The data stays durable
+	 * in the WAL; lvs_setup_report() releases the hold. */
+	s3_bs_dev_set_bg_hold(lvs->bs_dev, true);
 
 	s3_wal_replay(lvs->wal, (s3_wal_replay_cb)s3_bs_dev_wal_apply, lvs->bs_dev,
 		      lvs_attach_wal_replayed, ctx);

@@ -268,7 +268,7 @@ s3_warm_select_test: s3_warm_select_test.c $(MODULE_DIR)/lvol_warm_select.h
 s3_export_chunk_retry_test: s3_export_chunk_retry_test.c $(S3BSDEV_DIR)/export_chunk_retry.h
 	$(CC) $(COMMON_CFLAGS) -I$(S3BSDEV_DIR) s3_export_chunk_retry_test.c -o $@
 
-s3_b16_ctl_test: s3_b16_ctl_test.c $(S3BSDEV_DIR)/s3_deadline.c $(MODULE_DIR)/export_b16_ctl.h
+s3_b16_ctl_test: s3_b16_ctl_test.c $(S3BSDEV_DIR)/s3_deadline.c $(MODULE_DIR)/export_b16_ctl.h ../../include/s3lvol/s3_throttle.h
 	$(CC) $(COMMON_CFLAGS) -I$(MODULE_DIR) s3_b16_ctl_test.c \
 	    $(S3BSDEV_DIR)/s3_deadline.c -lpthread -o $@
 

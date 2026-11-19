@@ -181,4 +181,16 @@ void s3_flusher_drain(struct s3_flusher *f, uint64_t timeout_us,
 
 void s3_flusher_get_stats(const struct s3_flusher *f, struct s3_flusher_stats *out);
 
+/**
+ * Hold new uploads back while \p paused is true; uploads already in flight are
+ * not touched. A drain still forces uploads (it is an explicit request), so a
+ * pause can never turn a drain into a hang.
+ *
+ * Used by the lvstore attach: until the lvstore is up, the S3 connections are
+ * wanted for the metadata reads the attach is waiting on, and an upload that
+ * starts now only competes with them -- the data is durable in the WAL either
+ * way.
+ */
+void s3_flusher_set_paused(struct s3_flusher *f, bool paused);
+
 #endif /* S3LVOL_FLUSHER_H */

@@ -1590,6 +1590,7 @@ struct s3lvol_export;
 
 /* Reactor-thread lifecycle gates. Unknown/incomplete registries are not empty. */
 bool s3lvol_lvstore_exports_ready(const struct s3lvol_lvstore *lvs);
+bool s3lvol_lvstore_is_up(const struct s3lvol_lvstore *lvs);
 void s3lvol_lvstore_exports_set_ready(struct s3lvol_lvstore *lvs, bool ready);
 bool s3lvol_lvstore_xfer_allowed(const struct s3lvol_lvstore *lvs);
 bool s3lvol_lvstore_dependency_view_complete(const struct s3lvol_lvstore *lvs);

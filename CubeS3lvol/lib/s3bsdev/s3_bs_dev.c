@@ -61,6 +61,7 @@
 
 #include "spdk/stdinc.h"
 #include "spdk/blob.h"
+#include "spdk/crc32.h"
 #include "spdk/env.h"
 #include "spdk/log.h"
 #include "spdk/queue.h"
@@ -78,6 +79,7 @@
 #include "s3lvol/s3_hedge.h"
 #include "s3lvol/s3_flusher.h"
 #include "s3lvol/s3_overlay.h"
+#include "s3lvol/s3_throttle.h"
 #include "s3lvol/s3_types.h"
 #include "s3lvol/s3_wal.h"
 
@@ -128,9 +130,18 @@
 struct s3_retry_item {
 	void (*retry_fn)(void *arg);
 	void *arg;
+	uint64_t bytes;     /* write throttle: payload of the parked slice */
 
 	STAILQ_ENTRY(s3_retry_item) link;
 };
+
+/* Superseded-object deletes in flight at once. They used to be submitted all at
+ * once on checkpoint publication -- 700+ DELETEs in one burst on a slow bucket,
+ * every one competing with the GETs a guest was waiting on. */
+#define S3_DEFERRED_DELETE_INFLIGHT 8
+
+/* Write throttle: the curve is in s3lvol/s3_throttle.h. */
+#define S3_THROTTLE_POLL_US   1000
 
 /* An object whose chunk mapping has been superseded, kept until a later
  * checkpoint proves no durable snapshot needs it.
@@ -316,6 +327,28 @@ struct s3_ctx {
 	STAILQ_HEAD(, s3_retry_item) retry_q;
 	uint32_t retry_count;
 
+	/* Background S3 work (superseded deletes) is held while the lvstore is
+	 * still attaching: s3_bs_dev_set_bg_hold(). */
+	bool bg_hold;
+	/* Released deletes waiting for one of S3_DEFERRED_DELETE_INFLIGHT. */
+	struct s3_deferred_delete *del_q_head;
+	struct s3_deferred_delete **del_q_tail;
+	uint32_t del_q_count;
+
+	/* Write throttle, see S3_THROTTLE_*. cap 0 = off. */
+	uint64_t throttle_cap;
+	uint64_t throttle_tokens;
+	uint64_t throttle_last_tsc;
+	uint64_t throttled_writes;
+	struct spdk_poller *throttle_poller;
+	STAILQ_HEAD(, s3_retry_item) throttle_q;
+	uint32_t throttle_count;
+
+	/* Persistent metadata cache index, see s3_bs_dev_md_index_configure. */
+	char *md_index_path;
+	uint64_t md_index_max_chunk;
+	bool md_index_final_saved;
+
 	/* Fired once the context is fully released, so the caller knows when it may
 	 * close the journal and the local device. Needed because destroy() is
 	 * asynchronous on the WAL path. */
@@ -431,6 +464,10 @@ struct s3_chunk_io {
 	/* the old object replaced by an overwrite, deleted on completion */
 	struct spdk_uuid         old_uuid;
 	bool                     has_old;
+
+	/* Charged against the write throttle already; a WAL backpressure retry
+	 * must not pay twice. */
+	bool                     throttle_passed;
 
 	/* Which object this GET is reading, and whether a 404 has already sent it
 	 * back for a second attempt.
@@ -914,6 +951,10 @@ s3_chunk_read_submit(struct s3_chunk_io *cio)
  * ========================================================================== */
 
 static void s3_chunk_wal_submit(void *arg);
+struct s3_ctx;
+static bool s3_throttle_admit(struct s3_ctx *ctx, uint64_t bytes);
+static int s3_throttle_park(struct s3_ctx *ctx, void (*fn)(void *), void *arg,
+			    uint64_t bytes);
 
 /* The log entry is durable. Make it visible to reads, then acknowledge.
  *
@@ -971,6 +1012,23 @@ s3_chunk_wal_submit(void *arg)
 	struct s3_chunk_io *cio = arg;
 	struct s3_ctx *ctx = cio->bs_io->ctx;
 
+	/* Graduated backpressure before the hard stops below: see
+	 * S3_THROTTLE_*. FIFO behind anything already parked, so a large
+	 * write cannot be starved by small ones. */
+	if (!cio->throttle_passed && ctx->throttle_cap) {
+		uint64_t bytes = (uint64_t)cio->nblocks * S3LVOL_BLOCK_SIZE;
+
+		if (ctx->throttle_count > 0 || !s3_throttle_admit(ctx, bytes)) {
+			if (s3_throttle_park(ctx, s3_chunk_wal_submit, cio, bytes) == 0) {
+				/* Admitted on resume; the poller does not charge
+				 * twice because admit took the tokens there. */
+				cio->throttle_passed = true;
+				return;
+			}
+		}
+		cio->throttle_passed = true;
+	}
+
 	/* The overlay holds every acknowledged write until the flusher gets to
 	 * it, so it needs a cap of its own -- the WAL's high-water mark bounds
 	 * log space, not RAM. */
@@ -995,6 +1053,8 @@ s3_chunk_wal_submit(void *arg)
 
 static void s3_bs_dev_teardown(struct s3_ctx *ctx);
 
+static void s3_deferred_pump(struct s3_ctx *ctx);
+
 static void
 s3_deferred_deleted(void *cb_arg, int status)
 {
@@ -1010,6 +1070,9 @@ s3_deferred_deleted(void *cb_arg, int status)
 
 	assert(ctx->deferred_inflight > 0);
 	ctx->deferred_inflight--;
+	if (!ctx->destroying) {
+		s3_deferred_pump(ctx);
+	}
 	/* A teardown that found deletes in flight parked itself; this is the
 	 * last one, so resume it. Last, because teardown ends in ctx being
 	 * freed. */
@@ -1072,29 +1135,193 @@ s3_deferred_release(struct s3_ctx *ctx)
 
 		*pp = d->next;
 		ctx->deferred_delete_count--;
-		{
-			int rc;
-
-			d->ctx = ctx;
-			ctx->deferred_inflight++;
-			rc = s3_delete(ctx->client, d->key,
-				       s3_deferred_deleted, d);
-			if (rc != 0) {
-				SPDK_WARNLOG("Failed to submit a deferred delete "
-					     "for '%s': %d (leaked, GC will "
-					     "collect)\n", ctx->prefix, rc);
-				ctx->deferred_inflight--;
-				free(d);
-			}
-		}
+		/* Queued, not submitted: s3_deferred_pump() keeps at most
+		 * S3_DEFERRED_DELETE_INFLIGHT in flight and holds them all while
+		 * the lvstore is attaching (bg_hold). A delete is pure cleanup;
+		 * it must never compete with a read a guest is waiting on. */
+		d->ctx = ctx;
+		d->next = NULL;
+		*ctx->del_q_tail = d;
+		ctx->del_q_tail = &d->next;
+		ctx->del_q_count++;
 		released++;
 	}
 
 	if (released) {
 		SPDK_NOTICELOG("'%s': released %u superseded chunk object(s) "
-			       "after checkpoint publication (%u still held)\n",
-			       ctx->prefix, released, ctx->deferred_delete_count);
+			       "after checkpoint publication (%u still held, %u "
+			       "queued for delete)\n", ctx->prefix, released,
+			       ctx->deferred_delete_count, ctx->del_q_count);
 	}
+	s3_deferred_pump(ctx);
+}
+
+/* Submit queued deletes up to the in-flight bound. */
+static void
+s3_deferred_pump(struct s3_ctx *ctx)
+{
+	while (!ctx->bg_hold && !ctx->destroying && ctx->del_q_head &&
+		      ctx->deferred_inflight < S3_DEFERRED_DELETE_INFLIGHT) {
+		struct s3_deferred_delete *d = ctx->del_q_head;
+		int rc;
+
+		ctx->del_q_head = d->next;
+		if (!ctx->del_q_head) {
+			ctx->del_q_tail = &ctx->del_q_head;
+		}
+		ctx->del_q_count--;
+		ctx->deferred_inflight++;
+		rc = s3_delete(ctx->client, d->key, s3_deferred_deleted, d);
+		if (rc != 0) {
+			SPDK_WARNLOG("Failed to submit a deferred delete for '%s': "
+				     "%d (leaked, GC will collect)\n", ctx->prefix, rc);
+			ctx->deferred_inflight--;
+			free(d);
+		}
+	}
+}
+
+/* Teardown: queued deletes are dropped, the same as retained ones. */
+static void
+s3_deferred_queue_discard(struct s3_ctx *ctx)
+{
+	struct s3_deferred_delete *d;
+
+	while ((d = ctx->del_q_head) != NULL) {
+		ctx->del_q_head = d->next;
+		free(d);
+	}
+	ctx->del_q_tail = &ctx->del_q_head;
+	if (ctx->del_q_count) {
+		SPDK_NOTICELOG("'%s': %u queued superseded-object delete(s) left in "
+			       "S3 for GC at teardown\n", ctx->prefix, ctx->del_q_count);
+		ctx->del_q_count = 0;
+	}
+}
+
+void
+s3_bs_dev_set_bg_hold(struct spdk_bs_dev *bs_dev, bool hold)
+{
+	struct s3_ctx *ctx = (struct s3_ctx *)bs_dev;
+
+	if (!ctx) {
+		return;
+	}
+	ctx->bg_hold = hold;
+	if (ctx->flusher) {
+		s3_flusher_set_paused(ctx->flusher, hold);
+	}
+	if (!hold) {
+		s3_deferred_pump(ctx);
+	}
+}
+
+/* ==========================================================================
+	* Write throttle
+	* ========================================================================== */
+
+/* Unflushed bytes: what the WAL holds that S3 does not. */
+static uint64_t
+s3_throttle_backlog(struct s3_ctx *ctx)
+{
+	uint64_t wal = ctx->wal ? s3_wal_get_used_bytes(ctx->wal) : 0;
+	uint64_t ov = s3_overlay_get_bytes(ctx->overlay);
+
+	return spdk_max(wal, ov);
+}
+
+static void
+s3_throttle_refill(struct s3_ctx *ctx, uint64_t rate)
+{
+	uint64_t now = spdk_get_ticks();
+	uint64_t hz = spdk_get_ticks_hz();
+	uint64_t burst = spdk_max(rate / 10, (uint64_t)S3_WAL_MAX_PAYLOAD);
+	uint64_t add;
+
+	if (ctx->throttle_last_tsc == 0) {
+		ctx->throttle_last_tsc = now;
+		ctx->throttle_tokens = burst;
+		return;
+	}
+	add = (now - ctx->throttle_last_tsc) * rate / hz;
+	if (add > 0) {
+		ctx->throttle_tokens = spdk_min(ctx->throttle_tokens + add, burst);
+		ctx->throttle_last_tsc = now;
+	}
+}
+
+/* True when a write of \p bytes may go now (tokens are taken). */
+static bool
+s3_throttle_admit(struct s3_ctx *ctx, uint64_t bytes)
+{
+	uint64_t rate = s3_throttle_rate(s3_throttle_backlog(ctx), ctx->throttle_cap);
+
+	if (rate == UINT64_MAX) {
+		ctx->throttle_last_tsc = 0;
+		return true;
+	}
+	s3_throttle_refill(ctx, rate);
+	if (ctx->throttle_tokens >= bytes) {
+		ctx->throttle_tokens -= bytes;
+		return true;
+	}
+	return false;
+}
+
+static int
+s3_throttle_poll(void *arg)
+{
+	struct s3_ctx *ctx = arg;
+	struct s3_retry_item *item;
+
+	while ((item = STAILQ_FIRST(&ctx->throttle_q)) != NULL) {
+		if (!s3_throttle_admit(ctx, item->bytes)) {
+			return SPDK_POLLER_BUSY;
+		}
+		STAILQ_REMOVE_HEAD(&ctx->throttle_q, link);
+		ctx->throttle_count--;
+		item->retry_fn(item->arg);
+		free(item);
+	}
+	spdk_poller_unregister(&ctx->throttle_poller);
+	return SPDK_POLLER_IDLE;
+}
+
+/* Park a write until the throttle admits it. 0 parked, else not. */
+static int
+s3_throttle_park(struct s3_ctx *ctx, void (*fn)(void *), void *arg, uint64_t bytes)
+{
+	struct s3_retry_item *item = calloc(1, sizeof(*item));
+
+	if (!item) {
+		return -ENOMEM;
+	}
+	item->retry_fn = fn;
+	item->arg = arg;
+	item->bytes = bytes;
+	STAILQ_INSERT_TAIL(&ctx->throttle_q, item, link);
+	ctx->throttle_count++;
+	ctx->throttled_writes++;
+	if (!ctx->throttle_poller) {
+		ctx->throttle_poller = SPDK_POLLER_REGISTER(s3_throttle_poll, ctx,
+							    S3_THROTTLE_POLL_US);
+	}
+	return 0;
+}
+
+static void
+s3_throttle_drop(struct s3_ctx *ctx)
+{
+	struct s3_retry_item *item;
+
+	if (ctx->throttle_poller) {
+		spdk_poller_unregister(&ctx->throttle_poller);
+	}
+	while ((item = STAILQ_FIRST(&ctx->throttle_q)) != NULL) {
+		STAILQ_REMOVE_HEAD(&ctx->throttle_q, link);
+		free(item);
+	}
+	ctx->throttle_count = 0;
 }
 
 /* Teardown: the process is going away. Do not delete, because no checkpoint
@@ -2089,6 +2316,10 @@ s3_bs_dev_free_cb(void *io_device)
 	}
 
 	s3_deferred_discard(ctx);
+	s3_deferred_queue_discard(ctx);
+	/* Last chance to record what the cache holds; it is idle by now. */
+	(void)s3_bs_dev_md_index_save(&ctx->bs_dev);
+	free(ctx->md_index_path);
 	s3_overlay_destroy(ctx->overlay);
 	/* After the overlay and before the chunk map, though the order does not
 	 * matter here: by now nothing can reach the cache, and teardown has already
@@ -2128,6 +2359,7 @@ s3_bs_dev_drop_retries(struct s3_ctx *ctx)
 		free(item);
 	}
 	ctx->retry_count = 0;
+	s3_throttle_drop(ctx);
 }
 
 static void
@@ -3427,6 +3659,15 @@ s3_bs_dev_create(const struct s3_lvs_opts *opts,
 	ctx->ckpt_interval_tsc = ctx->ckpt_interval_sec * spdk_get_ticks_hz();
 
 	STAILQ_INIT(&ctx->retry_q);
+	STAILQ_INIT(&ctx->throttle_q);
+	ctx->del_q_tail = &ctx->del_q_head;
+	{
+		const char *env = getenv("S3LVOL_WAL_MAX_DIRTY_GB");
+
+		/* 0 turns it off; unset selects the default. */
+		ctx->throttle_cap = (env && *env ? strtoull(env, NULL, 10) :
+				     S3_THROTTLE_DEFAULT_CAP_GB) << 30;
+	}
 
 	ctx->prefix = strdup(opts->lvs_name ? opts->lvs_name : "s3lvol");
 	if (!ctx->prefix) {
@@ -3831,6 +4072,10 @@ ckpt_recovery_published(void *cb_arg, int status)
 		 * descriptor) are durable. Only now may objects superseded
 		 * before this checkpoint was sampled be deleted. */
 		s3_deferred_release(ctx);
+		/* Same cadence for the metadata cache index: the chunk map just
+		 * became durable, so the entries saved now name objects that
+		 * map will name after a restart. */
+		(void)s3_bs_dev_md_index_save(&ctx->bs_dev);
 	}
 
 	ckpt_finish(ctx, (ctx->source_hold || ctx->scoped_source_hold) ? status : 0);
@@ -4230,6 +4475,11 @@ s3_bs_dev_get_stats(struct spdk_bs_dev *bs_dev, struct s3_bs_dev_stats *out)
 		out->flush_in_flight = fstats.in_flight;
 	}
 
+	out->throttle_cap_bytes     = ctx->throttle_cap;
+	out->throttled_writes       = ctx->throttled_writes;
+	out->throttle_queued        = ctx->throttle_count;
+	out->deferred_delete_queued = ctx->del_q_count;
+
 	if (ctx->cache) {
 		struct s3_cache_stats cstats = {};
 
@@ -4469,7 +4719,15 @@ s3_warm_pump(struct s3_warm_job *job)
 			job->st.holes++;       /* reads as zeroes, nothing to cache */
 			continue;
 		}
-		if (s3_overlay_chunk_is_live(ctx->overlay, chunk)) {
+		/* Only a chunk the overlay covers *entirely* never reads its base.
+		 * A partly overlaid one still reads every block the overlay does
+		 * not hold from the base object, and skipping those here is what
+		 * made a restart with a large WAL replay load the blobstore
+		 * metadata one 4 KiB S3 GET at a time (23 min on app2): after a
+		 * replay nearly every metadata chunk is partly overlaid. */
+		if (s3_overlay_covers(ctx->overlay,
+				      chunk * (ctx->chunk_size / S3LVOL_BLOCK_SIZE),
+				      ctx->chunk_size / S3LVOL_BLOCK_SIZE)) {
 			job->st.already++;     /* served from the overlay anyway */
 			continue;
 		}
@@ -4587,4 +4845,316 @@ s3_bs_dev_warm(struct spdk_bs_dev *bs_dev, const uint64_t *chunks, uint64_t n,
 	ctx->warm_list = job;
 	s3_warm_pump(job);
 	return 0;
+}
+
+/* ==========================================================================
+ * Persistent metadata cache index
+ *
+ * Why: after a restart the chunk cache index is empty, so every blobstore
+ * metadata page the load reads was an S3 GET even though the bytes were still
+ * on the local cache device. On a degraded bucket that made attach take as long
+ * as S3 wanted. The index of resident metadata chunks is saved to a small file
+ * next to the other state files (on every checkpoint publication and at clean
+ * teardown) and re-adopted on attach, each slot verified by CRC32C against the
+ * device before it is served. Only entries whose uuid the recovered chunk map
+ * still names are adopted, so a stale entry is a miss, never wrong data.
+ *
+ * File: header + entries, crc32c over everything after the crc field. Written
+ * to <path>.tmp, fsynced and renamed, so a crash leaves the old or the new file.
+ * ========================================================================== */
+
+#define S3_MD_INDEX_MAGIC   0x5844494d44335333ULL   /* "S3DMIDX" */
+#define S3_MD_INDEX_VERSION 1
+#define S3_MD_INDEX_MAX     65536
+#define S3_MD_ADOPT_WINDOW  16
+
+struct s3_md_index_hdr {
+	uint64_t magic;
+	uint32_t version;
+	uint32_t crc;              /* crc32c of everything after this field */
+	uint64_t n_slots;
+	uint64_t region_offset;
+	uint32_t chunk_size;
+	uint32_t reserved;
+	uint64_t count;
+	char     prefix[64];
+} __attribute__((packed));
+
+static uint32_t
+s3_md_index_hdr_crc(const struct s3_md_index_hdr *hdr)
+{
+	const uint8_t *p = (const uint8_t *)hdr;
+
+	return spdk_crc32c_update(p + offsetof(struct s3_md_index_hdr, n_slots),
+				  sizeof(*hdr) - offsetof(struct s3_md_index_hdr, n_slots), 0);
+}
+
+void
+s3_bs_dev_md_index_configure(struct spdk_bs_dev *bs_dev, const char *path,
+			     uint64_t max_chunk)
+{
+	struct s3_ctx *ctx = (struct s3_ctx *)bs_dev;
+
+	if (!ctx) {
+		return;
+	}
+	free(ctx->md_index_path);
+	ctx->md_index_path = path ? strdup(path) : NULL;
+	ctx->md_index_max_chunk = max_chunk;
+}
+
+int
+s3_bs_dev_md_index_save(struct spdk_bs_dev *bs_dev)
+{
+	struct s3_ctx *ctx = (struct s3_ctx *)bs_dev;
+	struct s3_md_index_hdr hdr;
+	struct s3_cache_index_entry *ents;
+	char tmp[PATH_MAX];
+	uint64_t n;
+	uint32_t crc;
+	int fd, rc = 0;
+
+	if (!ctx || !ctx->cache || !ctx->md_index_path || ctx->md_index_max_chunk == 0) {
+		return -ENOTSUP;
+	}
+	ents = calloc(S3_MD_INDEX_MAX, sizeof(*ents));
+	if (!ents) {
+		return -ENOMEM;
+	}
+	n = s3_cache_index_export(ctx->cache, ctx->md_index_max_chunk, ents,
+				  S3_MD_INDEX_MAX);
+	memset(&hdr, 0, sizeof(hdr));
+	hdr.magic = S3_MD_INDEX_MAGIC;
+	hdr.version = S3_MD_INDEX_VERSION;
+	{
+		uint64_t ns, ro;
+		uint32_t cs;
+
+		s3_cache_geometry(ctx->cache, &ns, &ro, &cs);
+		hdr.n_slots = ns;
+		hdr.region_offset = ro;
+		hdr.chunk_size = cs;
+	}
+	hdr.count = n;
+	snprintf(hdr.prefix, sizeof(hdr.prefix), "%s", ctx->prefix);
+	crc = s3_md_index_hdr_crc(&hdr);
+	crc = spdk_crc32c_update(ents, n * sizeof(*ents), crc);
+	hdr.crc = crc;
+
+	snprintf(tmp, sizeof(tmp), "%s.tmp", ctx->md_index_path);
+	fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+	if (fd < 0) {
+		rc = -errno;
+		goto out;
+	}
+	if (write(fd, &hdr, sizeof(hdr)) != (ssize_t)sizeof(hdr) ||
+	    (n && write(fd, ents, n * sizeof(*ents)) != (ssize_t)(n * sizeof(*ents))) ||
+	    fsync(fd) != 0) {
+		rc = errno ? -errno : -EIO;
+		close(fd);
+		unlink(tmp);
+		goto out;
+	}
+	close(fd);
+	if (rename(tmp, ctx->md_index_path) != 0) {
+		rc = -errno;
+		unlink(tmp);
+	}
+out:
+	free(ents);
+	if (rc != 0) {
+		SPDK_WARNLOG("'%s': could not save the metadata cache index to %s: %s\n",
+			     ctx->prefix, ctx->md_index_path, spdk_strerror(-rc));
+	}
+	return rc;
+}
+
+struct s3_md_adopt_job;
+
+struct s3_md_adopt_slot {
+	struct s3_md_adopt_job *job;
+	void                   *buf;
+	bool                    busy;
+};
+
+struct s3_md_adopt_job {
+	struct s3_ctx               *ctx;
+	struct s3_cache_index_entry *ents;
+	uint64_t                     n, next;
+	uint32_t                     inflight;
+	struct s3_md_adopt_slot      slots[S3_MD_ADOPT_WINDOW];
+	struct s3_bs_dev_md_index_stats st;
+	uint64_t                     start_us;
+	s3_bs_dev_md_index_cb        cb_fn;
+	void                        *cb_arg;
+};
+
+static void s3_md_adopt_pump(struct s3_md_adopt_job *job);
+
+static void
+s3_md_adopt_done(void *arg, int status)
+{
+	struct s3_md_adopt_slot *slot = arg;
+	struct s3_md_adopt_job *job = slot->job;
+
+	slot->busy = false;
+	job->inflight--;
+	if (status == 0) {
+		job->st.adopted++;
+	} else if (status == -EILSEQ) {
+		job->st.crc_mismatch++;
+	} else {
+		job->st.skipped++;
+	}
+	s3_md_adopt_pump(job);
+}
+
+static void
+s3_md_adopt_finish(struct s3_md_adopt_job *job)
+{
+	struct s3_ctx *ctx = job->ctx;
+	s3_bs_dev_md_index_cb cb_fn = job->cb_fn;
+	void *cb_arg = job->cb_arg;
+	struct s3_bs_dev_md_index_stats st = job->st;
+	uint32_t i;
+
+	st.elapsed_ms = (s3_warm_now_us() - job->start_us) / 1000;
+	for (i = 0; i < S3_MD_ADOPT_WINDOW; i++) {
+		spdk_dma_free(job->slots[i].buf);
+	}
+	free(job->ents);
+	free(job);
+	SPDK_NOTICELOG("'%s': metadata cache index: %" PRIu64 " entr%s, %" PRIu64
+		       " adopted from the local cache, %" PRIu64 " stale, %" PRIu64
+		       " CRC mismatch, %" PRIu64 " skipped, %" PRIu64 " ms\n",
+		       ctx->prefix, st.entries, st.entries == 1 ? "y" : "ies",
+		       st.adopted, st.stale, st.crc_mismatch, st.skipped, st.elapsed_ms);
+	cb_fn(cb_arg, 0, &st);
+}
+
+static void
+s3_md_adopt_pump(struct s3_md_adopt_job *job)
+{
+	struct s3_ctx *ctx = job->ctx;
+
+	while (job->next < job->n && job->inflight < S3_MD_ADOPT_WINDOW &&
+	       !ctx->destroying) {
+		struct s3_cache_index_entry *e = &job->ents[job->next++];
+		struct s3_md_adopt_slot *slot = NULL;
+		struct spdk_uuid now;
+		uint32_t valid = 0;
+		uint32_t i;
+		int rc;
+
+		/* Only an object the recovered map still names for this chunk. */
+		if (s3_chunk_map_lookup(ctx->chunk_map, e->chunk_index, &now, &valid) != 0 ||
+		    spdk_uuid_compare(&now, &e->uuid) != 0 || valid != e->valid_bytes) {
+			job->st.stale++;
+			continue;
+		}
+		for (i = 0; i < S3_MD_ADOPT_WINDOW; i++) {
+			if (!job->slots[i].busy) {
+				slot = &job->slots[i];
+				break;
+			}
+		}
+		assert(slot);
+		slot->busy = true;
+		job->inflight++;
+		rc = s3_cache_adopt(ctx->cache, e, slot->buf, s3_md_adopt_done, slot);
+		if (rc != 0) {
+			slot->busy = false;
+			job->inflight--;
+			job->st.skipped++;
+		}
+	}
+	if (job->inflight == 0 && (job->next >= job->n || ctx->destroying)) {
+		s3_md_adopt_finish(job);
+	}
+}
+
+int
+s3_bs_dev_md_index_load(struct spdk_bs_dev *bs_dev, s3_bs_dev_md_index_cb cb_fn,
+			void *cb_arg)
+{
+	struct s3_ctx *ctx = (struct s3_ctx *)bs_dev;
+	struct s3_md_index_hdr hdr;
+	struct s3_md_adopt_job *job;
+	uint64_t n_slots, region_offset;
+	uint32_t chunk_size, crc, i;
+	ssize_t want;
+	int fd;
+
+	if (!ctx || !cb_fn) {
+		return -EINVAL;
+	}
+	if (!ctx->cache || !ctx->md_index_path) {
+		return -ENOTSUP;
+	}
+	fd = open(ctx->md_index_path, O_RDONLY | O_CLOEXEC);
+	if (fd < 0) {
+		return -errno;
+	}
+	if (read(fd, &hdr, sizeof(hdr)) != (ssize_t)sizeof(hdr) ||
+	    hdr.magic != S3_MD_INDEX_MAGIC || hdr.version != S3_MD_INDEX_VERSION ||
+	    hdr.count > S3_MD_INDEX_MAX ||
+	    strncmp(hdr.prefix, ctx->prefix, sizeof(hdr.prefix)) != 0) {
+		close(fd);
+		return -EILSEQ;
+	}
+	s3_cache_geometry(ctx->cache, &n_slots, &region_offset, &chunk_size);
+	if (hdr.n_slots != n_slots || hdr.region_offset != region_offset ||
+	    hdr.chunk_size != chunk_size) {
+		close(fd);
+		return -ESTALE;
+	}
+	job = calloc(1, sizeof(*job));
+	if (!job) {
+		close(fd);
+		return -ENOMEM;
+	}
+	job->ents = calloc(hdr.count ? hdr.count : 1, sizeof(*job->ents));
+	want = (ssize_t)(hdr.count * sizeof(*job->ents));
+	if (!job->ents || (want && read(fd, job->ents, want) != want)) {
+		close(fd);
+		free(job->ents);
+		free(job);
+		return -EILSEQ;
+	}
+	close(fd);
+	crc = s3_md_index_hdr_crc(&hdr);
+	crc = spdk_crc32c_update(job->ents, (size_t)want, crc);
+	if (crc != hdr.crc) {
+		free(job->ents);
+		free(job);
+		return -EILSEQ;
+	}
+	for (i = 0; i < S3_MD_ADOPT_WINDOW; i++) {
+		job->slots[i].job = job;
+		job->slots[i].buf = spdk_dma_malloc(chunk_size, S3LVOL_BLOCK_SIZE, NULL);
+		if (!job->slots[i].buf) {
+			while (i-- > 0) {
+				spdk_dma_free(job->slots[i].buf);
+			}
+			free(job->ents);
+			free(job);
+			return -ENOMEM;
+		}
+	}
+	job->ctx = ctx;
+	job->n = hdr.count;
+	job->st.entries = hdr.count;
+	job->cb_fn = cb_fn;
+	job->cb_arg = cb_arg;
+	job->start_us = s3_warm_now_us();
+	s3_md_adopt_pump(job);
+	return 0;
+}
+
+uint64_t
+s3_bs_dev_throttled_writes(struct spdk_bs_dev *bs_dev)
+{
+	struct s3_ctx *ctx = (struct s3_ctx *)bs_dev;
+
+	return ctx ? ctx->throttled_writes : 0;
 }

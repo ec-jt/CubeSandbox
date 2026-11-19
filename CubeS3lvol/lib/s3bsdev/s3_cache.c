@@ -6,6 +6,7 @@
  */
 
 #include "spdk/stdinc.h"
+#include "spdk/crc32.h"
 #include "spdk/env.h"
 #include "spdk/log.h"
 #include "spdk/thread.h"
@@ -48,6 +49,13 @@ struct cache_slot {
 	bool             resident;
 	bool             on_lru;
 
+	/* CRC32C of the whole object, known only when one write put all of it
+	 * here (a flush populate or a fill_chunk). This is what lets a later
+	 * process adopt the slot after a restart: the bytes on the device are
+	 * re-read and must hash to this before they are served again. */
+	bool             crc_valid;
+	uint32_t         crc;
+
 	TAILQ_ENTRY(cache_slot) link;
 };
 
@@ -70,6 +78,10 @@ struct cache_fill {
 	uint32_t                 first_block;
 	uint32_t                 n_blocks;
 	uint32_t                 bytes;      /* real object bytes, for stats */
+
+	/* Whole object written by this fill: its CRC becomes the slot's. */
+	bool                     whole;
+	uint32_t                 crc;
 };
 
 /* One in-flight read. */
@@ -271,6 +283,7 @@ slot_release(struct s3_cache *cache, struct cache_slot *slot)
 	 * must not be able to serve them as its own. */
 	bitmap_clear_all(slot->bitmap, cache->bitmap_words);
 	slot->filled_blocks = 0;
+	slot->crc_valid = false;
 
 	spdk_uuid_set_null(&slot->uuid);
 	slot->valid_bytes = 0;
@@ -697,6 +710,10 @@ cache_fill_done(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
 
 		slot->filled_blocks += newly;
 		cache->resident_blocks += newly;
+		if (fill->whole) {
+			slot->crc = fill->crc;
+			slot->crc_valid = true;
+		}
 
 		cache->stats.populates++;
 		cache->stats.bytes_populated += fill->bytes;
@@ -830,6 +847,8 @@ s3_cache_fill_chunk(struct s3_cache *cache, uint64_t chunk_index,
 	fill->first_block = 0;
 	fill->n_blocks    = n_blocks;
 	fill->bytes       = object_valid_bytes;
+	fill->whole       = true;
+	fill->crc         = spdk_crc32c_update(dma_buf, object_valid_bytes, 0);
 
 	slot->fills++;
 	slot_lru_remove(cache, slot);
@@ -1004,6 +1023,12 @@ s3_cache_populate(struct s3_cache *cache, uint64_t chunk_index,
 	fill->first_block = first_block;
 	fill->n_blocks    = n_blocks;
 	fill->bytes       = end_byte - offset_in_chunk;
+	/* The flush populate hands over the whole object at offset 0; that is
+	 * the case worth a CRC (it is how metadata chunks reach the cache). */
+	if (offset_in_chunk == 0 && end_byte == object_valid_bytes) {
+		fill->whole = true;
+		fill->crc   = spdk_crc32c_update(staging->buf, object_valid_bytes, 0);
+	}
 
 	slot->fills++;
 	/* Off the LRU while a fill is in flight, for the same reason as a pin:
@@ -1093,6 +1118,177 @@ s3_cache_quiesce(struct s3_cache *cache, s3_cache_quiesce_cb cb_fn,
 	cache->quiesce_cb = cb_fn;
 	cache->quiesce_arg = cb_arg;
 	return -EINPROGRESS;
+}
+
+/* ==========================================================================
+ * Persistent index
+ * ========================================================================== */
+
+uint64_t
+s3_cache_index_export(struct s3_cache *cache, uint64_t max_chunk,
+		      struct s3_cache_index_entry *out, uint64_t max)
+{
+	uint64_t n = 0, c, lim;
+
+	if (!cache || !out || max == 0) {
+		return 0;
+	}
+	lim = spdk_min(max_chunk, cache->num_chunks);
+	for (c = 0; c < lim && n < max; c++) {
+		uint32_t idx = cache->chunk_to_slot[c];
+		struct cache_slot *slot;
+
+		if (idx == S3_CACHE_NO_SLOT) {
+			continue;
+		}
+		slot = &cache->slots[idx];
+		if (!slot->resident || !slot->crc_valid || slot->fills > 0 ||
+		    slot->filled_blocks != spdk_divide_round_up(slot->valid_bytes,
+				    cache->block_size)) {
+			continue;
+		}
+		memset(&out[n], 0, sizeof(out[n]));
+		out[n].chunk_index = c;
+		spdk_uuid_copy(&out[n].uuid, &slot->uuid);
+		out[n].valid_bytes = slot->valid_bytes;
+		out[n].slot = idx;
+		out[n].crc = slot->crc;
+		n++;
+	}
+	return n;
+}
+
+void
+s3_cache_geometry(const struct s3_cache *cache, uint64_t *n_slots,
+		  uint64_t *region_offset, uint32_t *chunk_size)
+{
+	if (n_slots) {
+		*n_slots = cache ? cache->n_slots : 0;
+	}
+	if (region_offset) {
+		*region_offset = cache ? cache->region_offset : 0;
+	}
+	if (chunk_size) {
+		*chunk_size = cache ? cache->chunk_size : 0;
+	}
+}
+
+struct cache_adopt {
+	struct s3_cache            *cache;
+	struct cache_slot          *slot;
+	struct s3_cache_index_entry e;
+	void                       *buf;
+	s3_cache_fill_cb            cb_fn;
+	void                       *cb_arg;
+};
+
+static void
+cache_adopt_done(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
+{
+	struct cache_adopt *ad = cb_arg;
+	struct s3_cache *cache = ad->cache;
+	struct cache_slot *slot = ad->slot;
+	uint32_t n_blocks = spdk_divide_round_up(ad->e.valid_bytes, cache->block_size);
+	int status = 0;
+
+	spdk_bdev_free_io(bdev_io);
+	assert(slot->fills > 0);
+	slot->fills--;
+	cache->fills_in_flight--;
+
+	if (!success) {
+		status = -EIO;
+	} else if (spdk_crc32c_update(ad->buf, ad->e.valid_bytes, 0) != ad->e.crc) {
+		status = -EILSEQ;
+	}
+
+	if (status == 0) {
+		uint32_t newly = bitmap_set_range(slot->bitmap, 0, n_blocks);
+
+		slot->filled_blocks += newly;
+		cache->resident_blocks += newly;
+		slot->crc = ad->e.crc;
+		slot->crc_valid = true;
+		cache->stats.populates++;
+		cache->stats.bytes_populated += ad->e.valid_bytes;
+		slot_lru_touch(cache, slot);
+	} else if (slot->pins == 0 && slot->fills == 0) {
+		slot_release(cache, slot);
+	}
+
+	cache->frames++;
+	ad->cb_fn(ad->cb_arg, status);
+	cache->frames--;
+	free(ad);
+	cache_maybe_quiesced(cache);   /* last */
+}
+
+int
+s3_cache_adopt(struct s3_cache *cache, const struct s3_cache_index_entry *e,
+	       void *dma_buf, s3_cache_fill_cb cb_fn, void *cb_arg)
+{
+	struct cache_slot *slot;
+	struct cache_adopt *ad;
+	uint32_t n_blocks;
+	int rc;
+
+	if (!cache || !e || !dma_buf || !cb_fn) {
+		return -EINVAL;
+	}
+	assert(cache->owner_thread == spdk_get_thread());
+	if (cache->quiescing) {
+		return -ESHUTDOWN;
+	}
+	if (e->slot >= cache->n_slots || e->chunk_index >= cache->num_chunks ||
+	    e->valid_bytes == 0 || e->valid_bytes > cache->chunk_size) {
+		return -EINVAL;
+	}
+	slot = &cache->slots[e->slot];
+	/* The slot must still be on the free list (untouched since start) and
+	 * the chunk must have no slot yet. Anything else means this process has
+	 * already used the slot, and its bytes are no longer the saved ones. */
+	if (slot->resident || slot->fills > 0 || slot->pins > 0 ||
+	    cache->chunk_to_slot[e->chunk_index] != S3_CACHE_NO_SLOT) {
+		return -EBUSY;
+	}
+	ad = calloc(1, sizeof(*ad));
+	if (!ad) {
+		return -ENOMEM;
+	}
+	TAILQ_REMOVE(&cache->free_slots, slot, link);
+	spdk_uuid_copy(&slot->uuid, &e->uuid);
+	slot->chunk_index = e->chunk_index;
+	slot->valid_bytes = e->valid_bytes;
+	slot->resident = true;
+	slot->crc_valid = false;
+	cache->chunk_to_slot[e->chunk_index] = e->slot;
+	cache->resident++;
+	slot->fills++;
+	cache->fills_in_flight++;
+
+	ad->cache = cache;
+	ad->slot = slot;
+	ad->e = *e;
+	ad->buf = dma_buf;
+	ad->cb_fn = cb_fn;
+	ad->cb_arg = cb_arg;
+
+	n_blocks = spdk_divide_round_up(e->valid_bytes, cache->block_size);
+	cache->frames++;
+	rc = spdk_bdev_read(cache->desc, cache->ch, dma_buf, slot_offset(cache, slot),
+			    (uint64_t)n_blocks * cache->block_size, cache_adopt_done, ad);
+	if (rc != 0) {
+		slot->fills--;
+		cache->fills_in_flight--;
+		slot_release(cache, slot);
+		free(ad);
+		cache->frames--;
+		cache_maybe_quiesced(cache);
+		return rc;
+	}
+	cache->frames--;
+	cache_maybe_quiesced(cache);
+	return 0;
 }
 
 void

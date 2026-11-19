@@ -118,6 +118,10 @@ struct s3_flusher {
 	bool                        super_sync_active;
 	bool                        super_sync_again;
 
+	/* s3_flusher_set_paused(): start no new upload unless a drain asks or
+	 * the WAL is backpressured. */
+	bool                        paused;
+
 	struct s3_flusher_stats     stats;
 };
 
@@ -451,7 +455,11 @@ s3_flusher_kick(struct s3_flusher *f)
 	 * log -- so this is the guard for a configuration where it is not. */
 	force = (f->drain_cb != NULL) || s3_wal_is_backpressured(f->wal);
 
-	while (!f->stopping && f->in_flight < f->max_concurrent) {
+	/* Paused (lvstore attach in progress): uploads would only compete with
+	 * the metadata reads the attach is blocked on. A drain or a full WAL
+	 * still wins, so a pause can never become a hang or refused writes. */
+	while (!f->stopping && (!f->paused || force) &&
+	       f->in_flight < f->max_concurrent) {
 		uint64_t chunk_index;
 
 		if (s3_overlay_next_dirty(f->overlay, force, &chunk_index) != 0) {
@@ -796,6 +804,20 @@ s3_flusher_destroy(struct s3_flusher *f)
 
 	spdk_poller_unregister(&f->poller);
 	free(f);
+}
+
+void
+s3_flusher_set_paused(struct s3_flusher *f, bool paused)
+{
+	if (!f || f->paused == paused) {
+		return;
+	}
+	f->paused = paused;
+	SPDK_NOTICELOG("Flusher %s\n", paused ? "paused: new uploads held until "
+		       "the lvstore is up" : "resumed");
+	if (!paused) {
+		s3_flusher_kick(f);
+	}
 }
 
 void
