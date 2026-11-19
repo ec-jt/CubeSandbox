@@ -60,7 +60,11 @@ if [[ -f "${S3_BUCKET_PY}" ]]; then
     s3_flags=()
     rcow_s3_addr_flags s3_flags
     if [[ -n "${s3_host}" && -n "${s3_bucket}" ]]; then
-      if python3 "${S3_BUCKET_PY}" ensure \
+      # Bounded: with S3 degraded this hung on the TLS handshake for 78 s
+      # (app2, 2026-11-19) in front of an attach that needs no S3 at all
+      # on a same-node restart. The bucket of a node that has attached
+      # before exists; a missing one is still reported by the attach.
+      if timeout "${CUBE_S3LVOL_BUCKET_ENSURE_TIMEOUT_S:-10}" python3 "${S3_BUCKET_PY}" ensure \
           -e "${s3_host}" -b "${s3_bucket}" -r "${s3_region}" \
           "${s3_flags[@]+"${s3_flags[@]}"}"; then
         log "CubeS3lvol: bucket ${s3_bucket} is ready"

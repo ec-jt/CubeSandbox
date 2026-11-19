@@ -259,6 +259,23 @@ void s3_checkpoint_load(struct s3_client *client, const char *lvs_name,
 			s3_checkpoint_load_cb cb_fn, void *cb_arg);
 
 /**
+ * Keep a node-local copy of every checkpoint uploaded or downloaded, at
+ * <dir>/ckpt.<lvs_name>.bin. NULL turns it off (the default).
+ */
+void s3_checkpoint_set_local_dir(const char *dir);
+
+/**
+ * Apply the node-local copy, without any S3 request, when it is exactly
+ * checkpoint \c gen covering \c lsn of lvstore \c lvs_uuid (what the local
+ * super block records). Returns 0 when it was applied -- \c cb_fn has then
+ * been called -- or a negative errno without calling \c cb_fn, in which case
+ * the caller loads from S3 as before.
+ */
+int s3_checkpoint_load_local(const char *lvs_name, struct s3_chunk_map *map,
+			     const struct spdk_uuid *lvs_uuid, uint64_t gen,
+			     uint64_t lsn, s3_checkpoint_load_cb cb_fn, void *cb_arg);
+
+/**
  * Delete the snapshot. For destroying an lvstore; not part of normal operation.
  */
 void s3_checkpoint_delete(struct s3_client *client, const char *lvs_name,

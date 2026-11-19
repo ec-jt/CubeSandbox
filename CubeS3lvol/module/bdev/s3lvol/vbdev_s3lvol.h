@@ -1591,6 +1591,33 @@ struct s3lvol_export;
 /* Reactor-thread lifecycle gates. Unknown/incomplete registries are not empty. */
 bool s3lvol_lvstore_exports_ready(const struct s3lvol_lvstore *lvs);
 bool s3lvol_lvstore_is_up(const struct s3lvol_lvstore *lvs);
+
+/* Node-local copies of the small S3 metadata objects an attach reads, so a
+ * same-node restart does not need S3 (see vbdev_s3lvol_localstate.c). */
+enum s3lvol_local_kind {
+	S3LVOL_LOCAL_CLAIM = 0,
+	S3LVOL_LOCAL_IMPORTS,
+	S3LVOL_LOCAL_EXPORTS,
+};
+const char *s3lvol_local_dir(void);
+int s3lvol_local_path(const char *lvs_name, enum s3lvol_local_kind kind,
+		      char *out, size_t out_len);
+int s3lvol_local_write(const char *lvs_name, enum s3lvol_local_kind kind,
+		       const struct spdk_uuid *lvs_uuid, const void *body, size_t len);
+/* 0 and a malloc'd body (NUL-terminated, may be empty), -ENOENT when there is
+ * no file, another negative errno when it is unusable (torn, foreign, stale). */
+int s3lvol_local_read(const char *lvs_name, enum s3lvol_local_kind kind,
+		      const struct spdk_uuid *lvs_uuid, void **out, size_t *out_len);
+void s3lvol_local_remove(const char *lvs_name, enum s3lvol_local_kind kind);
+/* The lvstore uuid recorded on the local device (known before blobstore is
+ * loaded); NULL when there is none yet. */
+const struct spdk_uuid *s3lvol_lvstore_local_uuid(const struct s3lvol_lvstore *lvs);
+/* True while the attach was brought up from the node-local state, i.e. the
+ * registries may be read from the local copies. */
+bool s3lvol_lvstore_local_attach(const struct s3lvol_lvstore *lvs);
+/* Write the registries to their node-local copies (best effort). */
+void s3lvol_xfer_imports_save_local(struct s3lvol_lvstore *lvs);
+void s3lvol_xfer_exports_save_local(struct s3lvol_lvstore *lvs);
 void s3lvol_lvstore_exports_set_ready(struct s3lvol_lvstore *lvs, bool ready);
 bool s3lvol_lvstore_xfer_allowed(const struct s3lvol_lvstore *lvs);
 bool s3lvol_lvstore_dependency_view_complete(const struct s3lvol_lvstore *lvs);

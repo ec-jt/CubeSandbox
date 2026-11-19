@@ -121,6 +121,9 @@ struct s3_flusher {
 	/* s3_flusher_set_paused(): start no new upload unless a drain asks or
 	 * the WAL is backpressured. */
 	bool                        paused;
+	/* s3_flusher_set_fenced(): no upload at all, not even a forced one.
+	 * Ownership of the bucket prefix is not proven yet. */
+	bool                        fenced;
 
 	struct s3_flusher_stats     stats;
 };
@@ -458,7 +461,7 @@ s3_flusher_kick(struct s3_flusher *f)
 	/* Paused (lvstore attach in progress): uploads would only compete with
 	 * the metadata reads the attach is blocked on. A drain or a full WAL
 	 * still wins, so a pause can never become a hang or refused writes. */
-	while (!f->stopping && (!f->paused || force) &&
+	while (!f->stopping && !f->fenced && (!f->paused || force) &&
 	       f->in_flight < f->max_concurrent) {
 		uint64_t chunk_index;
 
@@ -816,6 +819,20 @@ s3_flusher_set_paused(struct s3_flusher *f, bool paused)
 	SPDK_NOTICELOG("Flusher %s\n", paused ? "paused: new uploads held until "
 		       "the lvstore is up" : "resumed");
 	if (!paused) {
+		s3_flusher_kick(f);
+	}
+}
+
+void
+s3_flusher_set_fenced(struct s3_flusher *f, bool fenced)
+{
+	if (!f || f->fenced == fenced) {
+		return;
+	}
+	f->fenced = fenced;
+	SPDK_NOTICELOG("Flusher %s\n", fenced ? "fenced: no upload until the "
+		       "owner claim is proven" : "unfenced");
+	if (!fenced) {
 		s3_flusher_kick(f);
 	}
 }

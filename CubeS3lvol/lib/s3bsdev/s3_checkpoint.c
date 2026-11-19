@@ -26,6 +26,7 @@
 struct ckpt_ctx {
 	struct s3_client        *client;
 	char                     key[CKPT_KEY_MAX];
+	char                     name[CKPT_KEY_MAX];
 
 	/* The serialised object. Its lifetime must cover the whole PUT/GET,
 	 * hence living here rather than on the stack. */
@@ -90,6 +91,143 @@ ckpt_collect(void *cb_arg, uint64_t chunk_index, const struct spdk_uuid *uuid,
 	return 0;
 }
 
+/* ==========================================================================
+ * Node-local copy
+ *
+ * Every checkpoint this node uploads (and every one it downloads on attach) is
+ * also kept at <dir>/ckpt.<lvs>.bin, so a same-node restart can rebuild the
+ * chunk map without S3. Only ever used when its gen and LSN equal what the
+ * local super block records, and only through the same validator as a
+ * download -- see s3_checkpoint_load_local().
+ * ========================================================================== */
+
+static char *g_ckpt_local_dir;
+
+void
+s3_checkpoint_set_local_dir(const char *dir)
+{
+	free(g_ckpt_local_dir);
+	g_ckpt_local_dir = (dir && *dir) ? strdup(dir) : NULL;
+}
+
+static int
+ckpt_local_path(const char *lvs_name, char *out, size_t len)
+{
+	int rc;
+
+	if (!g_ckpt_local_dir || !lvs_name || !*lvs_name) {
+		return -ENOENT;
+	}
+	rc = snprintf(out, len, "%s/ckpt.%s.bin", g_ckpt_local_dir, lvs_name);
+	return (rc < 0 || (size_t)rc >= len) ? -ENAMETOOLONG : 0;
+}
+
+static void
+ckpt_local_write(const char *lvs_name, const void *buf, uint64_t len)
+{
+	char path[PATH_MAX], tmp[PATH_MAX + 8];
+	const char *p = buf;
+	uint64_t left = len;
+	int fd, rc = 0;
+
+	if (ckpt_local_path(lvs_name, path, sizeof(path)) != 0) {
+		return;
+	}
+	snprintf(tmp, sizeof(tmp), "%s.tmp", path);
+	fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+	if (fd < 0) {
+		rc = -errno;
+		goto out;
+	}
+	while (left > 0) {
+		ssize_t n = write(fd, p, left);
+
+		if (n < 0) {
+			if (errno == EINTR) {
+				continue;
+			}
+			rc = -errno;
+			break;
+		}
+		p += n;
+		left -= (uint64_t)n;
+	}
+	if (rc == 0 && fsync(fd) != 0) {
+		rc = -errno;
+	}
+	close(fd);
+	if (rc == 0 && rename(tmp, path) != 0) {
+		rc = -errno;
+	}
+out:
+	if (rc != 0) {
+		unlink(tmp);
+		SPDK_WARNLOG("Could not keep a local copy of the checkpoint of '%s' "
+			     "(%d); a restart will read it from S3\n", lvs_name, rc);
+	}
+}
+
+int
+s3_checkpoint_load_local(const char *lvs_name, struct s3_chunk_map *map,
+			 const struct spdk_uuid *lvs_uuid, uint64_t gen,
+			 uint64_t lsn, s3_checkpoint_load_cb cb_fn, void *cb_arg)
+{
+	struct s3_ckpt_expect expect = {0};
+	struct s3_ckpt_view view;
+	char path[PATH_MAX];
+	struct stat st;
+	void *buf = NULL;
+	int fd, rc;
+
+	if (!map || !lvs_uuid) {
+		return -EINVAL;
+	}
+	rc = ckpt_local_path(lvs_name, path, sizeof(path));
+	if (rc != 0) {
+		return rc;
+	}
+	fd = open(path, O_RDONLY | O_CLOEXEC);
+	if (fd < 0) {
+		return -errno;
+	}
+	if (fstat(fd, &st) != 0 || st.st_size <= 0 ||
+	    (uint64_t)st.st_size > CKPT_MAX_BYTES) {
+		close(fd);
+		return -EILSEQ;
+	}
+	buf = malloc(st.st_size);
+	if (!buf || pread(fd, buf, st.st_size, 0) != st.st_size) {
+		close(fd);
+		free(buf);
+		return buf ? -EIO : -ENOMEM;
+	}
+	close(fd);
+
+	/* Exactly the checkpoint the super block points at, of exactly this
+	 * lvstore: anything else (a stale copy, a copy of a recreated lvstore of
+	 * the same name) is refused and the caller reads S3. */
+	expect.chunk_size = s3_chunk_map_get_chunk_size(map);
+	expect.lvs_uuid = lvs_uuid;
+	expect.check_point = true;
+	expect.gen = gen;
+	expect.lsn = lsn;
+	rc = s3_checkpoint_validate(buf, st.st_size, &expect, &view);
+	if (rc != 0) {
+		SPDK_NOTICELOG("Local checkpoint copy %s is not gen=%" PRIu64
+			       " LSN %" PRIu64 " of this lvstore (%d); reading S3\n",
+			       path, gen, lsn, rc);
+		free(buf);
+		return rc;
+	}
+	SPDK_NOTICELOG("Loading checkpoint gen=%" PRIu64 " for '%s' from the local "
+		       "copy (no S3 read)\n", gen, lvs_name);
+	rc = s3_checkpoint_apply(map, buf, st.st_size, &expect, cb_fn, cb_arg);
+	free(buf);
+	/* apply has called cb_fn either way. */
+	(void)rc;
+	return 0;
+}
+
 static void
 ckpt_ctx_free(struct ckpt_ctx *ctx)
 {
@@ -116,6 +254,9 @@ ckpt_put_done(void *cb_arg, int status)
 		const struct s3_ckpt_header *hdr = ctx->buf;
 
 		entries_crc = hdr->entries_crc;
+		/* Before the callback: the caller updates the super block next,
+		 * and a copy must never be older than what it points at. */
+		ckpt_local_write(ctx->name, ctx->buf, ctx->buf_len);
 	}
 
 	ckpt_ctx_free(ctx);
@@ -160,6 +301,7 @@ s3_checkpoint_save(struct s3_client *client, const char *lvs_name,
 		cb_fn(cb_arg, -ENAMETOOLONG, 0, 0);
 		return;
 	}
+	snprintf(ctx->name, sizeof(ctx->name), "%s", lvs_name);
 
 	allocated = s3_chunk_map_get_allocated(map);
 	total = sizeof(*hdr) + allocated * sizeof(struct s3_ckpt_entry);
@@ -486,6 +628,8 @@ ckpt_get_done(void *cb_arg, uint64_t bytes_read, int status)
 		return;
 	}
 
+	ckpt_local_write(ctx->name, ctx->buf, bytes_read);
+
 	SPDK_NOTICELOG("Loaded checkpoint gen=%" PRIu64 " from '%s': %" PRIu64
 		       " mappings, covers LSN %" PRIu64 "\n",
 		       view.hdr->gen, ctx->key, view.hdr->num_entries,
@@ -567,6 +711,7 @@ s3_checkpoint_load(struct s3_client *client, const char *lvs_name,
 	ctx->map     = map;
 	ctx->load_cb = cb_fn;
 	ctx->cb_arg  = cb_arg;
+	snprintf(ctx->name, sizeof(ctx->name), "%s", lvs_name);
 
 	rc = snprintf(ctx->key, sizeof(ctx->key), CKPT_KEY_FMT, lvs_name);
 	if (rc < 0 || (size_t)rc >= sizeof(ctx->key)) {

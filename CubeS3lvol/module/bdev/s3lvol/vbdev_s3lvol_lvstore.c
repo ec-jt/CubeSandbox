@@ -138,6 +138,19 @@ struct s3lvol_lvstore {
 	struct s3_owner_caps    owner_caps;
 	struct s3_owner_claim   owner_claim;
 
+	/* The lvstore uuid on the local device, known before blobstore loads.
+	 * Keys the node-local state files (vbdev_s3lvol_localstate.c). */
+	struct spdk_uuid        local_uuid;
+	/* The strict claim was adopted from this node's claim file instead of
+	 * being acquired in S3 (same-node restart). Until a read of the marker
+	 * proves it, nothing is uploaded and no checkpoint is taken: the guests
+	 * run from the local WAL and cache. */
+	bool                    claim_local;
+	bool                    claim_unverified;
+	bool                    claim_fenced;
+	bool                    claim_verify_inflight;
+	struct spdk_poller     *claim_poller;
+
 	TAILQ_ENTRY(s3lvol_lvstore) link;
 };
 
@@ -365,6 +378,8 @@ lvs_md_index_configure(struct s3lvol_lvstore *lvs)
 		 lvs->name);
 	s3_bs_dev_md_index_configure(lvs->bs_dev, path, LVS_MD_INDEX_MAX_CHUNK);
 }
+
+static void lvs_claim_file_drop(const char *lvs_name);
 
 static TAILQ_HEAD(, s3lvol_lvstore) g_lvstores = TAILQ_HEAD_INITIALIZER(g_lvstores);
 
@@ -796,6 +811,7 @@ lvs_destroy_release(struct lvs_destroy_ctx *ctx)
 	 * conditional PUT of a free tombstone against the claim's ETag. Legacy:
 	 * the legacy release (DELETE of the marker), which also removes the
 	 * owner key the legacy destroy used to delete directly. */
+	lvs_claim_file_drop(ctx->lvs_name);
 	if (ctx->owner.mode == S3_OWNER_MODE_STRICT) {
 		s3_owner_release_strict(ctx->client, ctx->lvs_name,
 					&ctx->owner.claim, &ctx->owner.caps,
@@ -1346,6 +1362,275 @@ s3lvol_lvstore_is_up(const struct s3lvol_lvstore *lvs)
 	return lvs && lvs->up;
 }
 
+const struct spdk_uuid *
+s3lvol_lvstore_local_uuid(const struct s3lvol_lvstore *lvs)
+{
+	return (lvs && !spdk_uuid_is_null(&lvs->local_uuid)) ? &lvs->local_uuid : NULL;
+}
+
+bool
+s3lvol_lvstore_local_attach(const struct s3lvol_lvstore *lvs)
+{
+	return lvs && lvs->claim_local;
+}
+
+/* ==========================================================================
+ * Same-node restart without S3: the node-local owner claim
+ *
+ * A keep-connected restart attaches the lvstore this node was running a moment
+ * ago, from the same device. The strict claim it held is still in S3 (the old
+ * process was killed, nothing released it), so the ordinary path -- probe,
+ * acquire, see "held by a dead pid of this node", clear it out of band,
+ * acquire again -- is ~20 S3 round trips before the WAL is even opened. With
+ * the store degraded that never completed (live: 70% loss, attach -ETIMEDOUT,
+ * guests without disks for ~9 min).
+ *
+ * The claim is kept in <dir>/owner.<lvs>.claim while this node holds it and is
+ * adopted on attach when ALL of these hold:
+ *   - strict mode, not force, no in-process retained claim;
+ *   - the file is intact and names the lvstore uuid on this local device;
+ *   - it was written by this host, and its pid is not a live process;
+ *   - its capability record is valid for this endpoint/bucket/prefix.
+ * The attach then runs entirely from local state, with every S3 write fenced
+ * (no upload, no delete, no checkpoint): the guests run from the WAL and the
+ * cache. In the background the marker is read until one read proves it is
+ * still exactly this claim (nonce AND ETag); only then is the fence lifted. A
+ * read that shows anything else keeps the fence for good and says so: then
+ * someone else owns the prefix and this node must not write to it.
+ *
+ * The file is removed before the claim is released, so a crash in between
+ * leaves at worst a held marker without a file -- the ordinary path, as before.
+ * S3LVOL_LOCAL_RESTART=0 turns adoption off.
+ * ========================================================================== */
+
+struct lvs_claim_file {
+	struct s3_owner_caps  caps;
+	struct s3_owner_claim claim;
+};
+
+#define LVS_CLAIM_VERIFY_US (5ULL * 1000 * 1000)
+
+static void
+lvs_host_ident(char *out, size_t len)
+{
+	char host[S3_OWNER_NODE_ID_MAX] = {0};
+	size_t i;
+
+	if (gethostname(host, sizeof(host) - 1) != 0) {
+		snprintf(host, sizeof(host), "unknown");
+	}
+	/* Same mapping as s3_owner.c's sanitise_ident(). */
+	for (i = 0; i + 1 < len && host[i] != '\0'; i++) {
+		unsigned char c = (unsigned char)host[i];
+
+		out[i] = (isalnum(c) || c == '.' || c == '-' || c == '_') ? (char)c : '_';
+	}
+	out[i] = '\0';
+}
+
+static void
+lvs_claim_file_save(struct s3lvol_lvstore *lvs)
+{
+	struct lvs_claim_file f;
+
+	if (lvs->owner_mode != S3_OWNER_MODE_STRICT || !lvs->owner_held ||
+	    !lvs->owner_claim.valid || spdk_uuid_is_null(&lvs->local_uuid)) {
+		return;
+	}
+	memset(&f, 0, sizeof(f));
+	f.caps = lvs->owner_caps;
+	f.claim = lvs->owner_claim;
+	(void)s3lvol_local_write(lvs->name, S3LVOL_LOCAL_CLAIM, &lvs->local_uuid,
+				 &f, sizeof(f));
+}
+
+static void
+lvs_claim_file_drop(const char *lvs_name)
+{
+	s3lvol_local_remove(lvs_name, S3LVOL_LOCAL_CLAIM);
+}
+
+/* 0 and *out filled when the claim may be adopted; negative otherwise (the
+ * caller takes the ordinary S3 path, which is always correct). */
+static int
+lvs_claim_file_load(struct s3lvol_lvstore *lvs, const struct spdk_uuid *uuid,
+		    struct lvs_claim_file *out)
+{
+	const char *env = getenv("S3LVOL_LOCAL_RESTART");
+	char me[S3_OWNER_NODE_ID_MAX];
+	void *body = NULL;
+	size_t len = 0;
+	int rc;
+
+	if (env && strcmp(env, "0") == 0) {
+		return -ENOTSUP;
+	}
+	rc = s3lvol_local_read(lvs->name, S3LVOL_LOCAL_CLAIM, uuid, &body, &len);
+	if (rc != 0) {
+		return rc;
+	}
+	if (len != sizeof(*out)) {
+		free(body);
+		return -EILSEQ;
+	}
+	memcpy(out, body, sizeof(*out));
+	free(body);
+
+	lvs_host_ident(me, sizeof(me));
+	if (!out->claim.valid || out->claim.etag[0] == '\0' ||
+	    spdk_uuid_is_null(&out->claim.info.nonce)) {
+		return -EINVAL;
+	}
+	if (strncmp(out->claim.info.node_id, me, sizeof(me)) != 0) {
+		SPDK_NOTICELOG("lvstore '%s': local claim names node '%s', not this "
+			       "one; acquiring in S3\n", lvs->name, out->claim.info.node_id);
+		return -EXDEV;
+	}
+	if (out->claim.info.pid <= 0 || out->claim.info.pid == (int32_t)getpid() ||
+	    kill(out->claim.info.pid, 0) == 0 || errno != ESRCH) {
+		SPDK_NOTICELOG("lvstore '%s': the pid in the local claim (%d) may still "
+			       "be running; acquiring in S3\n", lvs->name,
+			       out->claim.info.pid);
+		return -EBUSY;
+	}
+	if (!s3_owner_caps_valid(&out->caps, lvs->client, lvs->name)) {
+		return -ENOTSUP;
+	}
+	return 0;
+}
+
+struct lvs_claim_verify {
+	char             *name;
+	struct spdk_uuid  nonce;
+};
+
+static int lvs_claim_verify_poll(void *arg);
+static void lvs_claim_reacquired(void *cb_arg, const struct s3_owner_info *self,
+				 const struct s3_owner_claim *claim, int status);
+
+static void
+lvs_claim_verified(void *cb_arg, int status)
+{
+	struct lvs_claim_verify *v = cb_arg;
+	struct s3lvol_lvstore *lvs = s3lvol_lvstore_find(v->name);
+
+	if (!lvs || !lvs->claim_unverified ||
+	    spdk_uuid_compare(&lvs->owner_claim.info.nonce, &v->nonce) != 0) {
+		goto out;     /* unloaded meanwhile, or no longer relevant */
+	}
+	lvs->claim_verify_inflight = false;
+	if (status == 0) {
+		lvs->claim_unverified = false;
+		spdk_poller_unregister(&lvs->claim_poller);
+		if (lvs->bs_dev) {
+			s3_bs_dev_set_s3_fence(lvs->bs_dev, false);
+		}
+		SPDK_NOTICELOG("lvstore '%s': the S3 owner marker is still this node's "
+			       "claim; uploads, deletes and checkpoints resume\n",
+			       lvs->name);
+		lvs_claim_file_save(lvs);
+		s3lvol_pending_load(lvs);
+	} else if (status == -EBUSY || status == -ESTALE || status == -ENOENT) {
+		/* Not our claim any more. If the marker is free (an operator
+		 * cleared this node's dead claim while it was down) a strict
+		 * acquire takes it; if anybody else holds it, the acquire is
+		 * refused and the fence stays. Never a takeover. */
+		struct lvs_claim_verify *a = calloc(1, sizeof(*a));
+
+		if (a && (a->name = strdup(lvs->name)) != NULL) {
+			spdk_uuid_copy(&a->nonce, &lvs->owner_claim.info.nonce);
+			lvs->claim_verify_inflight = true;
+			SPDK_NOTICELOG("lvstore '%s': the owner marker no longer holds "
+				       "the adopted claim (%d); trying a strict acquire\n",
+				       lvs->name, status);
+			s3_owner_acquire_strict(lvs->client, lvs->name, &lvs->local_uuid,
+						&lvs->owner_caps, lvs_claim_reacquired, a);
+		} else {
+			free(a);
+		}
+	} else {
+		SPDK_NOTICELOG("lvstore '%s': owner marker not readable yet (%d); "
+			       "uploads stay held, retrying\n", lvs->name, status);
+	}
+out:
+	free(v->name);
+	free(v);
+}
+
+static void
+lvs_claim_reacquired(void *cb_arg, const struct s3_owner_info *self,
+		     const struct s3_owner_claim *claim, int status)
+{
+	struct lvs_claim_verify *v = cb_arg;
+	struct s3lvol_lvstore *lvs = s3lvol_lvstore_find(v->name);
+
+	if (!lvs || !lvs->claim_unverified ||
+	    spdk_uuid_compare(&lvs->owner_claim.info.nonce, &v->nonce) != 0) {
+		goto out;
+	}
+	lvs->claim_verify_inflight = false;
+	if (status == 0 && claim) {
+		lvs->owner_claim = *claim;
+		lvs->claim_unverified = false;
+		spdk_poller_unregister(&lvs->claim_poller);
+		if (lvs->bs_dev) {
+			s3_bs_dev_set_s3_fence(lvs->bs_dev, false);
+		}
+		lvs_claim_file_save(lvs);
+		s3lvol_pending_load(lvs);
+		SPDK_NOTICELOG("lvstore '%s': owner claim re-acquired in S3; uploads, "
+			       "deletes and checkpoints resume\n", lvs->name);
+	} else if (status == -EBUSY) {
+		lvs->claim_fenced = true;
+		spdk_poller_unregister(&lvs->claim_poller);
+		SPDK_ERRLOG("lvstore '%s': the S3 owner marker is held by somebody "
+			    "else. This lvstore stays fenced -- nothing is written "
+			    "to S3 -- and must be unloaded by an operator; the local "
+			    "WAL keeps every acknowledged write\n", lvs->name);
+	} else {
+		SPDK_NOTICELOG("lvstore '%s': re-acquire not possible yet (%d); "
+			       "uploads stay held, retrying\n", lvs->name, status);
+	}
+	(void)self;
+out:
+	free(v->name);
+	free(v);
+}
+
+static int
+lvs_claim_verify_poll(void *arg)
+{
+	struct s3lvol_lvstore *lvs = arg;
+	struct lvs_claim_verify *v;
+
+	if (!lvs->claim_unverified || lvs->claim_verify_inflight) {
+		return SPDK_POLLER_IDLE;
+	}
+	v = calloc(1, sizeof(*v));
+	if (!v || !(v->name = strdup(lvs->name))) {
+		free(v);
+		return SPDK_POLLER_IDLE;
+	}
+	spdk_uuid_copy(&v->nonce, &lvs->owner_claim.info.nonce);
+	lvs->claim_verify_inflight = true;
+	s3_owner_verify_claim_strict(lvs->client, lvs->name, &lvs->owner_claim,
+				     &lvs->local_uuid, &lvs->owner_caps,
+				     lvs_claim_verified, v);
+	return SPDK_POLLER_BUSY;
+}
+
+static void
+lvs_claim_verify_start(struct s3lvol_lvstore *lvs)
+{
+	if (!lvs->claim_unverified || lvs->claim_poller) {
+		return;
+	}
+	lvs->claim_poller = SPDK_POLLER_REGISTER(lvs_claim_verify_poll, lvs,
+						 LVS_CLAIM_VERIFY_US);
+	/* First check now rather than in 5 s. */
+	(void)lvs_claim_verify_poll(lvs);
+}
+
 void
 s3lvol_lvstore_exports_set_ready(struct s3lvol_lvstore *lvs, bool ready)
 {
@@ -1355,7 +1640,10 @@ s3lvol_lvstore_exports_set_ready(struct s3lvol_lvstore *lvs, bool ready)
 bool
 s3lvol_lvstore_xfer_allowed(const struct s3lvol_lvstore *lvs)
 {
+	/* Not while running under an unverified local claim: exports and imports
+	 * write registries and manifests to S3. */
 	return lvs && lvs->lvs && lvs->exports_ready && !lvs->unload_in_progress &&
+		!lvs->claim_unverified &&
 		!s3lvol_lvstore_source_closed((struct s3lvol_lvstore *)lvs) &&
 		!s3lvol_scoped_source_held((struct s3lvol_lvstore *)lvs);
 }
@@ -1473,7 +1761,8 @@ s3lvol_lvstore_free(struct s3lvol_lvstore *lvs)
 		return;
 	}
 
- assert(!lvs->scoped_sources);
+	spdk_poller_unregister(&lvs->claim_poller);
+	assert(!lvs->scoped_sources);
  while(lvs->source_gates){struct source_gate_entry *e=lvs->source_gates;lvs->source_gates=e->next;free(e);}
 
 	/* Pending-delete marks belong to this lvstore's lvols, all of which are
@@ -1623,6 +1912,17 @@ lvs_setup_report(struct lvs_setup_ctx *ctx)
 	 *
 	 * Clearing owner_held first is what stops this from recursing: the release
 	 * completion comes back here and takes the normal path. */
+	if (status != 0 && lvs->owner_held && lvs->claim_unverified) {
+		/* Adopted from local state and never proven in S3: this attach
+		 * neither acquired the marker nor wrote to the prefix (fenced).
+		 * Releasing it would need S3 and is not ours to decide here;
+		 * keep the marker AND the claim file, so the next same-node
+		 * attach can adopt it again. */
+		lvs->owner_held = false;
+		SPDK_NOTICELOG("lvstore '%s': attach under the adopted local claim "
+			       "failed (%d); the claim and its local file are kept\n",
+			       lvs->name, status);
+	}
 	if (status != 0 && lvs->owner_held) {
 		struct lvs_owner_teardown td = {
 			.owner_held      = true,
@@ -1697,13 +1997,31 @@ lvs_setup_report(struct lvs_setup_ctx *ctx)
 		s3_bs_dev_set_bg_hold(lvs->bs_dev, false);
 	}
 
+	if (spdk_uuid_is_null(&lvs->local_uuid)) {
+		spdk_uuid_copy(&lvs->local_uuid, &lvs->uuid);
+	}
+	if (lvs->claim_unverified) {
+		SPDK_NOTICELOG("lvstore '%s' is up from node-local state; S3 writes "
+			       "stay fenced until the owner marker is confirmed\n",
+			       lvs->name);
+		lvs_claim_verify_start(lvs);
+	} else {
+		lvs_claim_file_save(lvs);
+	}
+	/* The registries as they are now, so the next same-node restart does
+	 * not have to read them from S3. */
+	s3lvol_xfer_imports_save_local(lvs);
+	s3lvol_xfer_exports_save_local(lvs);
+
 	/* Deletes that were asked for before the last restart and could not be
 	 * carried out. Started here rather than earlier in the chain because the
 	 * queue is keyed by lvstore uuid, which only exists once blobstore is up,
 	 * and because it must not be able to hold the attach up: it is fire and
 	 * forget. Callbacks re-resolve this wrapper by uuid, so an unload that
 	 * wins the race drops the body instead of using a freed pointer. */
-	s3lvol_pending_load(lvs);
+	if (!lvs->claim_unverified) {
+		s3lvol_pending_load(lvs);
+	}
 
 	SPDK_NOTICELOG("lvstore '%s' %s: cluster=%" PRIu64 " bytes, "
 		       "%" PRIu64 " free clusters, write path=%s\n",
@@ -2161,6 +2479,10 @@ lvs_setup_begin(const struct s3_lvs_opts *opts, s3lvol_lvs_op_cb cb_fn,
 	ctx->journal_size = (uint64_t)opts->journal_size_mb * 1024 * 1024;
 	ctx->wal_size = (uint64_t)opts->wal_size_mb * 1024 * 1024;
 
+	/* Every checkpoint this process uploads or downloads also lands in the
+	 * node-local state directory (see s3_checkpoint_load_local). */
+	s3_checkpoint_set_local_dir(s3lvol_local_dir());
+
 	rc = s3_client_get_or_create(&opts->target, &lvs->client);
 	if (rc != 0) {
 		SPDK_ERRLOG("Failed to get S3 client for %s: %d\n",
@@ -2509,6 +2831,9 @@ lvs_recover_owner_claim_acquired(void *cb_arg,
 static void
 lvs_owner_release(struct s3lvol_lvstore *lvs, s3_owner_cb cb_fn, void *cb_arg)
 {
+	/* First: a claim file must never outlive the claim it names. */
+	lvs_claim_file_drop(lvs->name);
+	spdk_poller_unregister(&lvs->claim_poller);
 	if (lvs->owner_mode == S3_OWNER_MODE_STRICT) {
 		s3_owner_release_strict(lvs->client, lvs->name,
 					&lvs->owner_claim, &lvs->owner_caps,
@@ -3518,6 +3843,10 @@ lvs_attach_wal_opened(void *cb_arg, struct s3_wal *wal, int status)
 	 * which is blobstore's super block. */
 	(void)s3_bs_dev_attach_cache(lvs->bs_dev);
 
+	if (lvs->claim_unverified) {
+		s3_bs_dev_set_s3_fence(lvs->bs_dev, true);
+	}
+
 	/* Rebuild the table from the snapshot before replaying anything.
 	 *
 	 * *Skipping this loses data as soon as any checkpoint has ever run.* Once
@@ -3526,6 +3855,22 @@ lvs_attach_wal_opened(void *cb_arg, struct s3_wal *wal, int status)
 	 * snapshot. Replaying the journal alone would come up with a table missing
 	 * everything older than the last checkpoint, and every S3 object behind
 	 * those mappings would be unreachable. */
+	s3_checkpoint_set_local_dir(s3lvol_local_dir());
+	{
+		const struct s3_super_block *sb = s3_local_dev_get_super(lvs->local_dev);
+
+		/* The local copy, when it is exactly the checkpoint the super
+		 * block points at; otherwise (and for a lvstore that never
+		 * checkpointed) S3, as before. */
+		if (sb && sb->checkpoint_gen != 0 &&
+		    s3_checkpoint_load_local(lvs->name,
+					     s3_bs_dev_get_chunk_map(lvs->bs_dev),
+					     &sb->lvs_uuid, sb->checkpoint_gen,
+					     sb->checkpoint_lsn,
+					     lvs_attach_checkpoint_loaded, ctx) == 0) {
+			return;
+		}
+	}
 	s3_checkpoint_load(lvs->client, lvs->name,
 			   s3_bs_dev_get_chunk_map(lvs->bs_dev),
 			   lvs_attach_checkpoint_loaded, ctx);
@@ -3643,9 +3988,33 @@ lvs_attach_local_dev_opened(void *cb_arg, struct s3_local_dev *dev, int status)
 	/* This process retains the claim for this name after a failed teardown:
 	 * the ordinary acquire would (correctly) see its own held marker as busy.
 	 * Reuse it only for the same device, after verifying the marker. */
+	spdk_uuid_copy(&lvs->local_uuid, &sb->lvs_uuid);
+
 	if (lvs_retained_find(&g_retained, lvs->name)) {
 		lvs_attach_with_retained(ctx, sb);
 		return;
+	}
+
+	/* Same-node restart: adopt the claim from the node-local state instead
+	 * of re-acquiring it in S3 (see "Same-node restart without S3"). */
+	if (s3_owner_mode_from_env() == S3_OWNER_MODE_STRICT && !ctx->force &&
+	    !spdk_uuid_is_null(&sb->lvs_uuid)) {
+		struct lvs_claim_file f;
+
+		if (lvs_claim_file_load(lvs, &sb->lvs_uuid, &f) == 0) {
+			lvs->owner_mode = S3_OWNER_MODE_STRICT;
+			lvs->owner_caps = f.caps;
+			lvs->owner_claim = f.claim;
+			lvs->owner_held = true;
+			lvs->claim_local = true;
+			lvs->claim_unverified = true;
+			SPDK_NOTICELOG("lvstore '%s': adopted this node's owner claim "
+				       "from local state (previous pid %d); attaching "
+				       "without S3, writes fenced until the marker is "
+				       "confirmed\n", lvs->name, f.claim.info.pid);
+			lvs_attach_after_owner(ctx);
+			return;
+		}
 	}
 
 	/* Claim the lvstore now: after the local device has been read, because the

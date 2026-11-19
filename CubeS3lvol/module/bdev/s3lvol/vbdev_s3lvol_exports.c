@@ -1819,6 +1819,21 @@ s3lvol_xfer_exports_load(struct s3lvol_lvstore *lvs, spdk_lvs_op_complete cb_fn,
 	ctx->cb_arg = cb_arg;
 	exports_registry_key(s3lvol_lvstore_get_name(lvs), ctx->key, sizeof(ctx->key));
 
+	if (s3lvol_lvstore_local_attach(lvs)) {
+		void *body = NULL;
+		size_t len = 0;
+
+		rc = s3lvol_local_read(s3lvol_lvstore_get_name(lvs), S3LVOL_LOCAL_EXPORTS,
+				       s3lvol_lvstore_local_uuid(lvs), &body, &len);
+		if (rc == 0) {
+			ctx->body = body;
+			SPDK_NOTICELOG("lvstore '%s': exports registry from local state\n",
+				       s3lvol_lvstore_get_name(lvs));
+			exports_load_done(ctx, len ? exports_parse(lvs, body, len) : 0);
+			return 0;
+		}
+	}
+
 	rc = s3_head(s3lvol_lvstore_get_client(lvs), ctx->key, &ctx->size,
 		     exports_load_head_done, ctx);
 	if (rc != 0) {
@@ -1902,6 +1917,10 @@ export_registry_save(struct s3lvol_lvstore *lvs, spdk_lvs_op_complete cb_fn,
 		free(ctx);
 		return rc;
 	}
+	if (s3lvol_lvstore_local_uuid(lvs)) {
+		(void)s3lvol_local_write(s3lvol_lvstore_get_name(lvs), S3LVOL_LOCAL_EXPORTS,
+					 s3lvol_lvstore_local_uuid(lvs), ctx->json, len);
+	}
 	ctx->iov.iov_base = ctx->json;
 	ctx->iov.iov_len = len;
 
@@ -1955,4 +1974,19 @@ s3lvol_export_publication_save(struct s3lvol_export *exp, struct s3_export_manif
 	rc = export_registry_save(exp->lvs, publication_saved, p, exp, m);
 	if (rc) { s3_export_manifest_unref(m); free(p); }
 	return rc;
+}
+
+void
+s3lvol_xfer_exports_save_local(struct s3lvol_lvstore *lvs)
+{
+	char *json = NULL;
+	size_t len = 0;
+
+	if (!s3lvol_lvstore_local_uuid(lvs) ||
+	    exports_serialize(lvs, &json, &len, NULL, NULL) != 0) {
+		return;
+	}
+	(void)s3lvol_local_write(s3lvol_lvstore_get_name(lvs), S3LVOL_LOCAL_EXPORTS,
+				 s3lvol_lvstore_local_uuid(lvs), json, len);
+	free(json);
 }

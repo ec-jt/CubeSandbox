@@ -330,6 +330,8 @@ struct s3_ctx {
 	/* Background S3 work (superseded deletes) is held while the lvstore is
 	 * still attaching: s3_bs_dev_set_bg_hold(). */
 	bool bg_hold;
+	/* No S3 write of any kind: s3_bs_dev_set_s3_fence(). */
+	bool s3_fenced;
 	/* Released deletes waiting for one of S3_DEFERRED_DELETE_INFLIGHT. */
 	struct s3_deferred_delete *del_q_head;
 	struct s3_deferred_delete **del_q_tail;
@@ -1160,7 +1162,7 @@ s3_deferred_release(struct s3_ctx *ctx)
 static void
 s3_deferred_pump(struct s3_ctx *ctx)
 {
-	while (!ctx->bg_hold && !ctx->destroying && ctx->del_q_head &&
+	while (!ctx->bg_hold && !ctx->s3_fenced && !ctx->destroying && ctx->del_q_head &&
 		      ctx->deferred_inflight < S3_DEFERRED_DELETE_INFLIGHT) {
 		struct s3_deferred_delete *d = ctx->del_q_head;
 		int rc;
@@ -1216,6 +1218,25 @@ s3_bs_dev_set_bg_hold(struct spdk_bs_dev *bs_dev, bool hold)
 	}
 }
 
+void
+s3_bs_dev_set_s3_fence(struct spdk_bs_dev *bs_dev, bool fenced)
+{
+	struct s3_ctx *ctx = (struct s3_ctx *)bs_dev;
+
+	if (!ctx || ctx->s3_fenced == fenced) {
+		return;
+	}
+	ctx->s3_fenced = fenced;
+	if (ctx->flusher) {
+		s3_flusher_set_fenced(ctx->flusher, fenced);
+	}
+	s3_bs_dev_set_checkpoint_suppressed(bs_dev, fenced, fenced ?
+		"the owner claim was adopted locally and is not proven yet" : NULL);
+	if (!fenced) {
+		s3_deferred_pump(ctx);
+	}
+}
+
 /* ==========================================================================
 	* Write throttle
 	* ========================================================================== */
@@ -1224,10 +1245,26 @@ s3_bs_dev_set_bg_hold(struct spdk_bs_dev *bs_dev, bool hold)
 static uint64_t
 s3_throttle_backlog(struct s3_ctx *ctx)
 {
-	uint64_t wal = ctx->wal ? s3_wal_get_used_bytes(ctx->wal) : 0;
-	uint64_t ov = s3_overlay_get_bytes(ctx->overlay);
+	/* The overlay holds exactly the acknowledged writes the flusher has not
+	 * yet put in S3. WAL used bytes are not a backlog measure: the WAL tail
+	 * only moves at checkpoint truncation, so flushed but not yet
+	 * checkpointed records keep it large with S3 perfectly healthy (seen
+	 * live: throttling at 11 MiB of real backlog). */
+	return s3_overlay_get_bytes(ctx->overlay);
+}
 
-	return spdk_max(wal, ov);
+/* The configured cap, clamped below the overlay's hard cap so the slope
+ * always comes before the wall (s3_overlay_is_full stops writes dead). */
+static uint64_t
+s3_throttle_cap_eff(struct s3_ctx *ctx)
+{
+	uint64_t hard = s3_overlay_get_max_bytes(ctx->overlay);
+	uint64_t lim = hard / 10 * 9;
+
+	if (ctx->throttle_cap == 0 || hard == 0) {
+		return ctx->throttle_cap;
+	}
+	return spdk_min(ctx->throttle_cap, lim);
 }
 
 static void
@@ -1254,7 +1291,7 @@ s3_throttle_refill(struct s3_ctx *ctx, uint64_t rate)
 static bool
 s3_throttle_admit(struct s3_ctx *ctx, uint64_t bytes)
 {
-	uint64_t rate = s3_throttle_rate(s3_throttle_backlog(ctx), ctx->throttle_cap);
+	uint64_t rate = s3_throttle_rate(s3_throttle_backlog(ctx), s3_throttle_cap_eff(ctx));
 
 	if (rate == UINT64_MAX) {
 		ctx->throttle_last_tsc = 0;
@@ -3763,6 +3800,9 @@ s3_bs_dev_attach_wal(struct spdk_bs_dev *bs_dev, struct s3_wal *wal,
 	}
 
 	ctx->wal = wal;
+	if (ctx->s3_fenced) {
+		s3_flusher_set_fenced(ctx->flusher, true);
+	}
 
 	SPDK_NOTICELOG("s3_bs_dev '%s' switched to the WAL write path\n",
 		       ctx->prefix);
@@ -4475,7 +4515,7 @@ s3_bs_dev_get_stats(struct spdk_bs_dev *bs_dev, struct s3_bs_dev_stats *out)
 		out->flush_in_flight = fstats.in_flight;
 	}
 
-	out->throttle_cap_bytes     = ctx->throttle_cap;
+	out->throttle_cap_bytes     = s3_throttle_cap_eff(ctx);
 	out->throttled_writes       = ctx->throttled_writes;
 	out->throttle_queued        = ctx->throttle_count;
 	out->deferred_delete_queued = ctx->del_q_count;

@@ -433,6 +433,14 @@ int s3_bs_dev_warm(struct spdk_bs_dev *bs_dev, const uint64_t *chunks, uint64_t 
  */
 void s3_bs_dev_set_bg_hold(struct spdk_bs_dev *bs_dev, bool hold);
 
+/**
+ * No S3 write of any kind while \p fenced: no upload (a drain waits), no
+ * superseded-object delete, no checkpoint. Reads still go to S3. Set while
+ * the lvstore runs under an owner claim adopted from node-local state and not
+ * yet re-read from S3; everything acknowledged stays durable in the WAL.
+ */
+void s3_bs_dev_set_s3_fence(struct spdk_bs_dev *bs_dev, bool fenced);
+
 uint64_t s3_bs_dev_throttled_writes(struct spdk_bs_dev *bs_dev);
 
 struct s3_bs_dev_md_index_stats {

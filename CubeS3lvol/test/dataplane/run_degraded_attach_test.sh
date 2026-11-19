@@ -20,18 +20,13 @@
 #        data, flushes and checkpoints (so the metadata cache index is saved);
 #    [2] writes more without flushing (a WAL backlog the attach must replay);
 #    [3] SIGKILLs the target with the store stalled -- no clean unload, the
-#        realistic crash -- then clears this node's dead owner marker the way
-#        rcow_start.sh does (rcow_owner_clear_stale);
-#    [4] makes the store DEGRADED (every forwarded segment delayed DELAY_MS)
-#        and attaches. Pass: attach < ATTACH_MAX_S, metadata adopted from the
-#        local cache, uploads held during the attach, and the unflushed data
-#        reads back correctly while the store is still degraded.
-#
-#  Why degraded and not dead for [4]: the attach takes the strict ownership
-#  marker with a conditional PUT and reads the checkpoint object. Those few
-#  small requests are the fence that stops two writers; with no object store at
-#  all no attach may succeed, by design. Everything else -- the blobstore
-#  metadata, the replayed WAL -- is now served locally.
+#        realistic crash. The strict owner marker in S3 still names the
+#        dead pid, and the store stays unreachable.
+#    [4] attaches with the store still STALLED (nothing answers): the owner
+#        claim, the checkpoint, the registries and the metadata come from the
+#        node-local state, and every S3 write stays fenced. Pass: attach
+#        < ATTACH_MAX_S, and the unflushed data reads back correctly while
+#        the store is still unreachable.
 #    [5] lifts the stall and waits for the backlog to drain to S3.
 #
 #  Needs root, nvme-cli, and an S3 endpoint WITHOUT TLS at S3_HOST:S3_PORT
@@ -172,30 +167,28 @@ info "overlay bytes before the crash: ${OV}"
 [ -n "${OV}" ] && [ "${OV}" -gt 0 ] && pass "unflushed backlog present (${OV} bytes)" || fail "no backlog (${OV})"
 
 echo ""
-echo "=== [3] SIGKILL with the store stalled"
+echo "=== [3] SIGKILL with the store stalled (the owner marker stays held)"
 nvme disconnect -n "${NQN}" >/dev/null 2>&1
-DEAD_PID="${TGT_PID}"
 stop_tgt KILL
 pass "target killed"
-rm -f "${CTL}"
-python3 "${ROOT}/test/tools/s3_owner_clear.py" -e "${S3_HOST}:${S3_PORT}" -b "${BUCKET}" \
-	--lvs "${LVS}" --expect-node "$(hostname)" --expect-pid "${DEAD_PID}" --path-style --no-tls \
-	>/tmp/degattach_clear.log 2>&1 && pass "dead owner marker cleared" || { fail "owner clear: $(tail -1 /tmp/degattach_clear.log)"; exit 1; }
+CLAIM="${S3LVOL_MDCACHE_DIR}/owner.${LVS}.claim"
+[ -s "${CLAIM}" ] && pass "node-local owner claim present" || fail "no ${CLAIM}"
+[ -s "${S3LVOL_MDCACHE_DIR}/ckpt.${LVS}.bin" ] && pass "node-local checkpoint copy present" || fail "no local checkpoint copy"
 
 echo ""
-echo "=== [4] restart and attach with the store degraded (${DELAY_MS} ms per segment)"
-echo "${DELAY_MS}" > "${CTL}"
+echo "=== [4] restart and attach with the store STILL STALLED (nothing answers)"
 start_tgt || { fail "target restart"; exit 1; }
 T0=$(date +%s%N)
 AOUT="$(timeout 600 "${RPC}" --timeout 600 rcow_attach_lvstore "$(printf '{"lvs_name":"%s","namespace":"%s","wal_bdev":"dgwal"}' \
 	"${LVS}" "${BUCKET}")" 2>&1)"; ARC=$?
 AMS=$(( ($(date +%s%N) - T0) / 1000000 ))
-[ "${ARC}" -eq 0 ] && pass "attach succeeded in ${AMS} ms with the store degraded" || fail "attach: ${AOUT}"
+[ "${ARC}" -eq 0 ] && pass "attach succeeded in ${AMS} ms with S3 unreachable" || fail "attach: ${AOUT}"
 [ "${AMS}" -lt $((ATTACH_MAX_S * 1000)) ] && pass "attach under ${ATTACH_MAX_S} s" || fail "attach took ${AMS} ms"
+grep -q "adopted this node's owner claim" "${TGT_LOG}" && pass "owner claim adopted from local state" || fail "claim not adopted"
+grep -q "from the local copy" "${TGT_LOG}" && pass "checkpoint loaded locally" || fail "checkpoint not loaded locally"
 grep -m1 "metadata cache index:" "${TGT_LOG}" | sed 's/^/  ---- /'
 grep -q "adopted from the local cache" "${TGT_LOG}" && pass "metadata adopted locally" || fail "no adopt line"
-grep -m1 "Flusher paused" "${TGT_LOG}" >/dev/null && pass "uploads held during the attach" || fail "flusher was not paused"
-grep -m1 "Flusher resumed" "${TGT_LOG}" >/dev/null && pass "uploads resumed after the attach" || fail "flusher not resumed"
+grep -q "Flusher fenced" "${TGT_LOG}" && pass "uploads fenced until the claim is proven" || fail "flusher was not fenced"
 
 ${SPDK_RPC} nvmf_create_transport -t TCP >/dev/null
 ${SPDK_RPC} nvmf_create_subsystem "${NQN}" -a -s RCOW00000000000000 -m 4 >/dev/null
@@ -222,8 +215,10 @@ else
 fi
 
 echo ""
-echo "=== [5] store back: backlog drains"
+echo "=== [5] store back: claim confirmed, fence lifted, backlog drains"
 rm -f "${CTL}"
+for _ in $(seq 60); do grep -q "is still this node's claim" "${TGT_LOG}" && break; sleep 1; done
+grep -q "is still this node's claim" "${TGT_LOG}" && pass "owner marker confirmed, fence lifted" || fail "claim never confirmed"
 T1=$(date +%s)
 DRAINED=0
 for _ in $(seq 120); do

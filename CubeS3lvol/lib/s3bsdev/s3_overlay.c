@@ -994,6 +994,12 @@ s3_overlay_get_bytes(const struct s3_overlay *ov)
 }
 
 uint64_t
+s3_overlay_get_max_bytes(const struct s3_overlay *ov)
+{
+	return ov ? ov->max_bytes : 0;
+}
+
+uint64_t
 s3_overlay_get_live_chunks(const struct s3_overlay *ov)
 {
 	return ov ? ov->live_chunks : 0;

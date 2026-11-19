@@ -223,6 +223,8 @@ uint64_t s3_overlay_chunk_epoch(struct s3_overlay *ov, uint64_t chunk_index);
 bool s3_overlay_is_full(const struct s3_overlay *ov);
 
 uint64_t s3_overlay_get_bytes(const struct s3_overlay *ov);
+/* The hard cap: writes stop (retry) once the overlay holds this much. */
+uint64_t s3_overlay_get_max_bytes(const struct s3_overlay *ov);
 uint64_t s3_overlay_get_live_chunks(const struct s3_overlay *ov);
 void s3_overlay_get_stats(const struct s3_overlay *ov, struct s3_overlay_stats *out);
 

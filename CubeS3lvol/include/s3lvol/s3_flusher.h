@@ -193,4 +193,12 @@ void s3_flusher_get_stats(const struct s3_flusher *f, struct s3_flusher_stats *o
  */
 void s3_flusher_set_paused(struct s3_flusher *f, bool paused);
 
+/**
+ * Stronger than a pause: no upload starts at all, a drain included (it then
+ * waits, and times out the way it would with S3 down). Used while this node
+ * runs an lvstore under an owner claim adopted from its local state and not
+ * yet re-read from S3: until then nothing may be written to the prefix.
+ */
+void s3_flusher_set_fenced(struct s3_flusher *f, bool fenced);
+
 #endif /* S3LVOL_FLUSHER_H */

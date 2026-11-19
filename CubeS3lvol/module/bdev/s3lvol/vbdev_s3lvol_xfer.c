@@ -818,6 +818,23 @@ s3lvol_xfer_imports_load(struct s3lvol_lvstore *lvs, spdk_lvs_op_complete cb_fn,
 	ctx->cb_arg = cb_arg;
 	imports_registry_key(s3lvol_lvstore_get_name(lvs), ctx->key, sizeof(ctx->key));
 
+	/* Same-node restart: the copy this node wrote before its last save is at
+	 * least as new as the S3 object. */
+	if (s3lvol_lvstore_local_attach(lvs)) {
+		void *body = NULL;
+		size_t len = 0;
+
+		rc = s3lvol_local_read(s3lvol_lvstore_get_name(lvs), S3LVOL_LOCAL_IMPORTS,
+				       s3lvol_lvstore_local_uuid(lvs), &body, &len);
+		if (rc == 0) {
+			ctx->body = body;
+			SPDK_NOTICELOG("lvstore '%s': imports registry from local state\n",
+				       s3lvol_lvstore_get_name(lvs));
+			imports_load_done(ctx, len ? imports_parse(lvs, body, len) : 0);
+			return 0;
+		}
+	}
+
 	/* HEAD then GET, because aranged GET needs a length and this object has no
 	 * fixed size. Two round trips once per attach is not worth optimising. */
 	rc = s3_head(s3lvol_lvstore_get_client(lvs), ctx->key, &ctx->size,
@@ -878,6 +895,10 @@ imports_save(struct s3lvol_lvstore *lvs, spdk_lvs_op_complete cb_fn, void *cb_ar
 	if (rc != 0) {
 		free(ctx);
 		return rc;
+	}
+	if (s3lvol_lvstore_local_uuid(lvs)) {
+		(void)s3lvol_local_write(s3lvol_lvstore_get_name(lvs), S3LVOL_LOCAL_IMPORTS,
+					 s3lvol_lvstore_local_uuid(lvs), ctx->json, len);
 	}
 	ctx->iov.iov_base = ctx->json;
 	ctx->iov.iov_len = len;
@@ -7558,4 +7579,18 @@ s3lvol_lvol_import(struct s3lvol_lvstore *lvs, const struct s3lvol_import_opts *
 	rc = s3lvol_lvol_import_admitted(lvs, opts, source_control_lvol_done, ticket);
 	if (rc) { s3lvol_control_leave(owner, 0); free(ticket); }
 	return rc;
+}
+
+void
+s3lvol_xfer_imports_save_local(struct s3lvol_lvstore *lvs)
+{
+	char *json = NULL;
+	size_t len = 0;
+
+	if (!s3lvol_lvstore_local_uuid(lvs) || imports_serialize(lvs, &json, &len) != 0) {
+		return;
+	}
+	(void)s3lvol_local_write(s3lvol_lvstore_get_name(lvs), S3LVOL_LOCAL_IMPORTS,
+				 s3lvol_lvstore_local_uuid(lvs), json, len);
+	free(json);
 }
