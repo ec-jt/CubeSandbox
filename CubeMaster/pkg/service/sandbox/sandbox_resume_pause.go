@@ -733,6 +733,12 @@ func remoteUUIDsFromExtInfo(extInfo map[string][]byte) string {
 // target for peer pull, or "" when there is none worth naming: unknown,
 // the same node, or not an IPv4 address.
 func crossNodeSourcePeer(originIP, targetIP string) string {
+	return CrossNodeSourcePeer(originIP, targetIP)
+}
+
+// CrossNodeSourcePeer is crossNodeSourcePeer for the from-snapshot create
+// path, which lives in another package and needs the same rule.
+func CrossNodeSourcePeer(originIP, targetIP string) string {
 	origin := strings.TrimSpace(originIP)
 	if origin == "" || origin == strings.TrimSpace(targetIP) {
 		return ""

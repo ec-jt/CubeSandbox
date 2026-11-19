@@ -712,6 +712,12 @@ func bindSnapshotCreateReplicaWithPlacement(ctx context.Context, snapshotID stri
 	if placement.CrossNode {
 		reqInOut.Annotations[constants.CubeAnnotationSnapshotAllowNonLocal] = "true"
 		reqInOut.Annotations[constants.CubeAnnotationSnapshotCrossNode] = "true"
+		// Peer pull: the origin node still holds the export packs, so the
+		// target's importer may fetch them from there before S3 (same as
+		// the cross-node resume path).
+		if peer := sandbox.CrossNodeSourcePeer(src.OriginNodeIP, placement.NodeIP); peer != "" {
+			reqInOut.Annotations[constants.CubeAnnotationSnapshotSourcePeer] = peer
+		}
 		if resolved := templateResolveResultFromContext(ctx); resolved != nil {
 			resolved.ChosenReplica = templatecenter.ReplicaStatus{
 				NodeID:       placement.NodeID,

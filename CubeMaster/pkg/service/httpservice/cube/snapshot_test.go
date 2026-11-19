@@ -465,6 +465,50 @@ func TestBindSnapshotCreateReplicaAllowsPluginVolumeCrossNode(t *testing.T) {
 	assert.Equal(t, []string{"node-b"}, req.DistributionScope)
 	assert.Equal(t, "true", req.Annotations[constants.CubeAnnotationSnapshotAllowNonLocal])
 	assert.Equal(t, "true", req.Annotations[constants.CubeAnnotationSnapshotCrossNode])
+	assert.Equal(t, "10.0.0.1", req.Annotations[constants.CubeAnnotationSnapshotSourcePeer],
+		"cross-node from-snapshot create names the origin node for peer pull")
+}
+
+func TestBindSnapshotCreateReplicaSourcePeerOnlyCrossNode(t *testing.T) {
+	stubSnapshotReadyForNewUse(t)
+	origSource := getSnapshotRestoreSourceFn
+	origDecide := decideRestorePlacementFn
+	origReplica := resolveSnapshotReadyReplicaFn
+	t.Cleanup(func() {
+		getSnapshotRestoreSourceFn = origSource
+		decideRestorePlacementFn = origDecide
+		resolveSnapshotReadyReplicaFn = origReplica
+	})
+	origin := "10.0.0.1"
+	getSnapshotRestoreSourceFn = func(context.Context, string) (*templatecenter.RestoreSource, error) {
+		return &templatecenter.RestoreSource{
+			SnapshotID: "snap-1", Backend: constants.SnapshotBackendS3,
+			RemoteStatus: constants.RemoteStatusReady, ExportUUIDs: `{"rootfs":"r","metadata":"m"}`,
+			OriginNodeID: "node-a", OriginNodeIP: origin,
+		}, nil
+	}
+	resolveSnapshotReadyReplicaFn = func(context.Context, string, string) (templatecenter.ReplicaStatus, error) {
+		return templatecenter.ReplicaStatus{NodeID: "node-a", NodeIP: origin}, nil
+	}
+
+	// Same node: no peer.
+	decideRestorePlacementFn = func(context.Context, restoreplace.Input) (*restoreplace.Placement, error) {
+		return &restoreplace.Placement{NodeID: "node-a", NodeIP: origin}, nil
+	}
+	req := &types.CreateCubeSandboxReq{}
+	require.NoError(t, bindSnapshotCreateReplica(context.Background(), "snap-1", req))
+	assert.Empty(t, req.Annotations[constants.CubeAnnotationSnapshotSourcePeer])
+
+	// Cross-node but the origin IP is not usable: no peer, create still works.
+	for _, bad := range []string{"", "127.0.0.1", "0.0.0.0", "fe80::1", "node-a"} {
+		origin = bad
+		decideRestorePlacementFn = func(context.Context, restoreplace.Input) (*restoreplace.Placement, error) {
+			return &restoreplace.Placement{NodeID: "node-b", NodeIP: "10.0.0.2", CrossNode: true}, nil
+		}
+		req = &types.CreateCubeSandboxReq{}
+		require.NoError(t, bindSnapshotCreateReplica(context.Background(), "snap-1", req))
+		assert.Empty(t, req.Annotations[constants.CubeAnnotationSnapshotSourcePeer], "origin %q", bad)
+	}
 }
 
 func TestSnapshotRestorePinsOnlyRawHostMountFromStoredTemplate(t *testing.T) {
