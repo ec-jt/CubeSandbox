@@ -1426,6 +1426,67 @@ SPDK_RPC_REGISTER("rcow_unload_lvstore", rpc_rcow_unload_lvstore,
 		  SPDK_RPC_RUNTIME)
 
 /* ==========================================================================
+ * rcow_quiesce_nvmf
+ *
+ * Stop every rcow NVMf subsystem and drain its I/O, expiring stalled S3
+ * requests while it waits. rcow_stop.sh calls this before rcow_unload_lvstore;
+ * see s3lvol_nvmf_quiesce_all() for why the unload aborted without it (B3).
+ * Params: {"timeout_ms": N} (optional, default 20000).
+ * ========================================================================== */
+
+struct rpc_quiesce_nvmf {
+	uint32_t timeout_ms;
+};
+
+static const struct spdk_json_object_decoder rpc_quiesce_nvmf_decoders[] = {
+	{"timeout_ms", offsetof(struct rpc_quiesce_nvmf, timeout_ms), spdk_json_decode_uint32, true},
+};
+
+static void
+rpc_quiesce_nvmf_done(void *cb_arg, const struct s3lvol_nvmf_quiesce_result *r,
+		      int status)
+{
+	struct spdk_jsonrpc_request *request = cb_arg;
+	struct spdk_json_write_ctx *w;
+
+	if (status != 0) {
+		spdk_jsonrpc_send_error_response_fmt(request, status,
+			"quiesce %s after %" PRIu64 " ms: %u stopped, %u failed, %u draining",
+			spdk_strerror(-status), r->elapsed_ms, r->stopped, r->failed,
+			r->pending);
+		return;
+	}
+	w = spdk_jsonrpc_begin_result(request);
+	spdk_json_write_object_begin(w);
+	spdk_json_write_named_uint32(w, "stopped", r->stopped);
+	spdk_json_write_named_uint32(w, "removed_ns", r->removed_ns);
+	spdk_json_write_named_uint32(w, "expire_rounds", r->expire_rounds);
+	spdk_json_write_named_uint64(w, "elapsed_ms", r->elapsed_ms);
+	spdk_json_write_object_end(w);
+	spdk_jsonrpc_end_result(request, w);
+}
+
+static void
+rpc_rcow_quiesce_nvmf(struct spdk_jsonrpc_request *request,
+		      const struct spdk_json_val *params)
+{
+	struct rpc_quiesce_nvmf req = { .timeout_ms = 20000 };
+	int rc;
+
+	if (params && spdk_json_decode_object(params, rpc_quiesce_nvmf_decoders,
+					      SPDK_COUNTOF(rpc_quiesce_nvmf_decoders), &req)) {
+		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
+						 "Invalid parameters");
+		return;
+	}
+	rc = s3lvol_nvmf_quiesce_all(req.timeout_ms, rpc_quiesce_nvmf_done, request);
+	if (rc != 0) {
+		spdk_jsonrpc_send_error_response(request, rc, spdk_strerror(-rc));
+	}
+}
+SPDK_RPC_REGISTER("rcow_quiesce_nvmf", rpc_rcow_quiesce_nvmf, SPDK_RPC_RUNTIME)
+
+/* ==========================================================================
  * rcow_delete_lvstore
  *
  * Fully destroy an lvstore and remove it from bstore.json.

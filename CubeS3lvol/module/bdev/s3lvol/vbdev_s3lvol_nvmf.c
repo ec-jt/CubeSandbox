@@ -29,6 +29,9 @@
 #include "spdk/log.h"
 #include "spdk/nvmf.h"
 #include "spdk/string.h"
+#include "spdk/thread.h"
+
+#include "s3lvol/s3_deadline.h"
 
 #include <sys/sysmacros.h>
 
@@ -661,4 +664,209 @@ s3lvol_nvmf_set_readahead(const char *leaf, uint32_t kb)
 
 	SPDK_NOTICELOG("%s: readahead set to %" PRIu32 " KiB\n", leaf, kb);
 	return true;
+}
+
+/* --------------------------------------------------------------------------
+ * Quiesce before unload (B3)
+ *
+ * The lvstore unload unregisters every lvol bdev. NVMf holds a bdev channel per
+ * namespace per poll group, and that channel is released when the namespace
+ * goes away. If a host read is still waiting on S3 at that moment (a stalled GET
+ * runs up to its 60 s deadline), the channel is destroyed with the bdev_io still
+ * on its io_submitted list:
+ *
+ *   bdev_channel_destroy_resource: Assertion `TAILQ_EMPTY(&ch->io_submitted)'
+ *
+ * Observed three times on app2 (2026-11-18 14:47, 19:00, 2026-11-19 01:43), each
+ * within 5 s of rcow_unload_lvstore on a keep-connected restart, each while
+ * host I/O was stuck in S3 GETs; the 01:43 core was written 90 ms into the
+ * unload, far too early for any drain to have waited on S3.
+ *
+ * The mechanism is in lib/nvmf: the unload unregisters every lvol at once, so
+ * nvmf hot-removes many namespaces of the same subsystem concurrently. Each
+ * hot-remove pauses its nsid, but state changes are queued per subsystem, and a
+ * pause that finds the subsystem already PAUSED (by the previous nsid's
+ * removal, whose resume is queued behind it) completes immediately without
+ * looking at this nsid's io_outstanding. Its namespace is removed and the
+ * following resume puts the channel with the read still on it.
+ *
+ * So every rcow subsystem is stopped (made INACTIVE) first and its namespaces
+ * are removed while it is inactive. Stopping disconnects
+ * the qpairs, waits for each qpair's outstanding requests, and only then puts
+ * the namespace channels, so no channel can go away with I/O on it. To keep the
+ * wait short, pending S3 deadlines are expired every 500 ms while it lasts:
+ * stalled GETs complete with an error on a qpair that is already gone, so the
+ * host never sees it and requeues the I/O on reconnect.
+ *
+ * The host is unaffected on a keep-connected restart: it sees a transport
+ * disconnect, keeps the namespaces and requeues I/O, and reconnects to the new
+ * process on the same NQN/NSID. Nothing here is undone; the process exits next.
+ * -------------------------------------------------------------------------- */
+
+#define S3LVOL_QUIESCE_POLL_US (500 * 1000)
+
+struct nvmf_quiesce_ctx {
+	struct spdk_poller	*poller;
+	uint64_t		 start_tsc;
+	uint64_t		 deadline_tsc;
+	uint32_t		 pending;
+	uint32_t		 stopped;
+	uint32_t		 failed;
+	uint32_t		 removed_ns;
+	uint32_t		 expire_rounds;
+	bool			 reported;
+	s3lvol_nvmf_quiesce_cb	 cb_fn;
+	void			*cb_arg;
+};
+
+static uint64_t
+quiesce_elapsed_ms(struct nvmf_quiesce_ctx *ctx)
+{
+	return (spdk_get_ticks() - ctx->start_tsc) * 1000 / spdk_get_ticks_hz();
+}
+
+static void
+quiesce_report(struct nvmf_quiesce_ctx *ctx, int status)
+{
+	struct s3lvol_nvmf_quiesce_result r = {
+		.stopped       = ctx->stopped,
+		.failed        = ctx->failed,
+		.removed_ns    = ctx->removed_ns,
+		.pending       = ctx->pending,
+		.expire_rounds = ctx->expire_rounds,
+		.elapsed_ms    = quiesce_elapsed_ms(ctx),
+	};
+
+	if (ctx->reported) {
+		return;
+	}
+	ctx->reported = true;
+	if (status == 0) {
+		SPDK_NOTICELOG("NVMf quiesce: %u subsystem(s) stopped, %u namespace(s) "
+			       "removed in %" PRIu64 " ms (%u S3 expire round(s))\n",
+			       r.stopped, r.removed_ns, r.elapsed_ms, r.expire_rounds);
+	} else {
+		SPDK_ERRLOG("NVMf quiesce: %s after %" PRIu64 " ms: %u stopped, "
+			    "%u failed, %u still draining\n", spdk_strerror(-status),
+			    r.elapsed_ms, r.stopped, r.failed, r.pending);
+	}
+	if (ctx->cb_fn) {
+		ctx->cb_fn(ctx->cb_arg, &r, status);
+	}
+}
+
+static void
+quiesce_maybe_free(struct nvmf_quiesce_ctx *ctx)
+{
+	if (ctx->pending > 0) {
+		return;
+	}
+	spdk_poller_unregister(&ctx->poller);
+	quiesce_report(ctx, ctx->failed ? -EIO : 0);
+	free(ctx);
+}
+
+static int
+quiesce_poll(void *arg)
+{
+	struct nvmf_quiesce_ctx *ctx = arg;
+
+	if (ctx->pending == 0) {
+		return SPDK_POLLER_IDLE;
+	}
+	/* Requests submitted after the previous round got a fresh deadline;
+	 * expire those too. Cheap: one pass over the in-flight list. */
+	s3_deadline_expire_all();
+	ctx->expire_rounds++;
+	if (!ctx->reported && spdk_get_ticks() >= ctx->deadline_tsc) {
+		/* Report, but keep the context: the stop callbacks still have it. */
+		quiesce_report(ctx, -ETIMEDOUT);
+	}
+	return SPDK_POLLER_BUSY;
+}
+
+static void
+quiesce_stopped(struct spdk_nvmf_subsystem *subsystem, void *cb_arg, int status)
+{
+	struct nvmf_quiesce_ctx *ctx = cb_arg;
+
+	if (status != 0) {
+		SPDK_ERRLOG("NVMf quiesce: subsystem '%s' did not stop: %d\n",
+			    spdk_nvmf_subsystem_get_nqn(subsystem), status);
+		ctx->failed++;
+	} else {
+		struct spdk_nvmf_ns *ns, *next;
+		uint32_t removed = 0;
+
+		/* INACTIVE: the poll groups have dropped their channels, and
+		 * remove_ns is legal without a pause. With no namespace left the
+		 * unload's bdev unregister never reaches nvmf's hot-remove path,
+		 * which is where concurrent removals in one subsystem skip the
+		 * I/O drain (see the comment above). */
+		for (ns = spdk_nvmf_subsystem_get_first_ns(subsystem); ns; ns = next) {
+			next = spdk_nvmf_subsystem_get_next_ns(subsystem, ns);
+			if (spdk_nvmf_subsystem_remove_ns(subsystem,
+							  spdk_nvmf_ns_get_id(ns)) == 0) {
+				removed++;
+			} else {
+				ctx->failed++;
+			}
+		}
+		ctx->removed_ns += removed;
+		ctx->stopped++;
+	}
+	assert(ctx->pending > 0);
+	ctx->pending--;
+	quiesce_maybe_free(ctx);
+}
+
+int
+s3lvol_nvmf_quiesce_all(uint32_t timeout_ms, s3lvol_nvmf_quiesce_cb cb_fn,
+			void *cb_arg)
+{
+	struct nvmf_quiesce_ctx *ctx;
+	char nqn[SPDK_NVMF_NQN_MAX_LEN + 1];
+	uint32_t i;
+	int rc;
+
+	ctx = calloc(1, sizeof(*ctx));
+	if (!ctx) {
+		return -ENOMEM;
+	}
+	ctx->cb_fn = cb_fn;
+	ctx->cb_arg = cb_arg;
+	ctx->start_tsc = spdk_get_ticks();
+	ctx->deadline_tsc = ctx->start_tsc +
+			    (uint64_t)timeout_ms * spdk_get_ticks_hz() / 1000;
+	ctx->poller = SPDK_POLLER_REGISTER(quiesce_poll, ctx, S3LVOL_QUIESCE_POLL_US);
+	if (!ctx->poller) {
+		free(ctx);
+		return -ENOMEM;
+	}
+
+	/* Self reference: a stop that completes inline must not free ctx before
+	 * the loop has submitted the rest. */
+	ctx->pending = 1;
+	s3_deadline_expire_all();
+	ctx->expire_rounds++;
+	for (i = 0; i < RCOW_NUM_SUBSYS; i++) {
+		struct spdk_nvmf_subsystem *subsystem;
+
+		s3lvol_nvmf_subsys_nqn(i, nqn, sizeof(nqn));
+		subsystem = nvmf_find_subsystem(nqn);
+		if (!subsystem) {
+			continue;
+		}
+		ctx->pending++;
+		rc = spdk_nvmf_subsystem_stop(subsystem, quiesce_stopped, ctx);
+		if (rc != 0) {
+			SPDK_ERRLOG("NVMf quiesce: cannot stop '%s': %s\n", nqn,
+				    spdk_strerror(-rc));
+			ctx->pending--;
+			ctx->failed++;
+		}
+	}
+	ctx->pending--;
+	quiesce_maybe_free(ctx);
+	return 0;
 }

@@ -340,6 +340,9 @@ RCOW_REPLAY_FILE="${RCOW_REPLAY_FILE:-${RCOW_ACTIVE_FILE}.replay}"
 RCOW_REPLAY_PARALLEL="${RCOW_REPLAY_PARALLEL:-8}"
 
 RCOW_STOP_TIMEOUT="${RCOW_STOP_TIMEOUT:-120}"
+# Budget for rcow_quiesce_nvmf inside a stop (seconds). Stalled S3 GETs are
+# expired every 500 ms while it waits, so this is a ceiling, not a typical time.
+RCOW_QUIESCE_TIMEOUT="${RCOW_QUIESCE_TIMEOUT:-20}"
 RCOW_RPC_TIMEOUT="${RCOW_RPC_TIMEOUT:-300}"
 
 # --------------------------------------------------------------------------

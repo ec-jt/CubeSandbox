@@ -11,6 +11,10 @@
 #                           writing into a namespace whose lvstore is gone, which
 #                           the host reports as I/O errors on a device that was
 #                           working a second ago.
+#    1b. rcow_quiesce_nvmf  stop every subsystem, wait for in-flight I/O
+#                           (expiring stalled S3 requests), remove namespaces.
+#                           Without it the unload can release a namespace
+#                           channel under a read still waiting on S3 (B3).
 #    2. rcow_unload_lvstore drain everything acknowledged so far into S3 and close
 #                           the log. This is the only clean shutdown on the WAL
 #                           path; killing the process instead is safe but leaves a
@@ -143,6 +147,26 @@ if [ "${FORCE}" -eq 1 ]; then
 	rcow_step "unload: skipped (--force)"
 	rcow_warn "the log will not be closed; the next attach replays its tail"
 else
+	# Stop every NVMf subsystem and remove its namespaces before the unload
+	# (B3). The unload unregisters all lvols at once, and nvmf's concurrent
+	# hot-remove of several namespaces in one subsystem can release a
+	# namespace channel while a host read on it is still waiting for S3:
+	# "bdev_channel_destroy_resource: Assertion TAILQ_EMPTY(&ch->io_submitted)"
+	# (app2, three times). The quiesce waits for every qpair's I/O, expiring
+	# stalled S3 requests while it waits. The host keeps its controllers on
+	# --keep-connected: it sees a transport drop, requeues the I/O and
+	# reconnects to the next process on the same NQN/NSID.
+	rcow_step "quiescing NVMf subsystems"
+	QUIESCE_MS=$(( RCOW_QUIESCE_TIMEOUT * 1000 ))
+	if QOUT="$(RCOW_RPC_TIMEOUT=$(( RCOW_QUIESCE_TIMEOUT + 5 )) \
+		rcow_rpc rcow_quiesce_nvmf "$(printf '{"timeout_ms":%s}' "${QUIESCE_MS}")" 2>&1)"; then
+		rcow_log "quiesced: ${QOUT}"
+	else
+		# Not fatal, but the unload below is what aborts if a namespace is
+		# still carrying I/O; say so loudly.
+		rcow_warn "rcow_quiesce_nvmf did not complete: ${QOUT}"
+	fi
+
 	rcow_step "unloading lvstore '${RCOW_LVS_NAME}'"
 
 	# Leave a share of the budget for the process shutdown itself, and at least

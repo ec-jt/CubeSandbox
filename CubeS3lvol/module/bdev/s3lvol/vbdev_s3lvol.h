@@ -535,6 +535,31 @@ int s3lvol_nvmf_ns_state(const char *nqn, uint32_t nsid, const char *uuid_str);
 int s3lvol_nvmf_add_ns(const char *nqn, const char *bdev_name, uint32_t nsid,
 		s3lvol_nvmf_op_cb cb_fn, void *cb_arg);
 
+/** Outcome of s3lvol_nvmf_quiesce_all(). */
+struct s3lvol_nvmf_quiesce_result {
+	uint32_t stopped;	/* subsystems now INACTIVE */
+	uint32_t failed;	/* stops or namespace removals that failed */
+	uint32_t removed_ns;	/* namespaces removed after the stop */
+	uint32_t pending;	/* stops still draining (only on -ETIMEDOUT) */
+	uint32_t expire_rounds;	/* S3 deadline expiry passes issued */
+	uint64_t elapsed_ms;
+};
+
+typedef void (*s3lvol_nvmf_quiesce_cb)(void *cb_arg,
+				       const struct s3lvol_nvmf_quiesce_result *r,
+				       int status);
+
+/**
+ * Stop every rcow subsystem before an lvstore unload, so no NVMf namespace
+ * channel can be released with a bdev I/O still on it (B3). Pending S3 request
+ * deadlines are expired every 500 ms while the stops drain. The callback runs
+ * once: 0 when all stopped, -EIO when one failed, -ETIMEDOUT after
+ * \c timeout_ms (the stops keep draining in the background). Irreversible: for
+ * a process that is about to exit.
+ */
+int s3lvol_nvmf_quiesce_all(uint32_t timeout_ms, s3lvol_nvmf_quiesce_cb cb_fn,
+			    void *cb_arg);
+
 /** Remove namespace \c nsid from \c nqn. */
 int s3lvol_nvmf_remove_ns(const char *nqn, uint32_t nsid,
 			  s3lvol_nvmf_op_cb cb_fn, void *cb_arg);
