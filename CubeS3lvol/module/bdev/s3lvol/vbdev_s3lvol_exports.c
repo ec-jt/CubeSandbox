@@ -2277,10 +2277,40 @@ export_settle_step(struct export_settle *st)
 	}
 }
 
+/* How long a fresh peer_ready export waits before its packs go to S3
+ * (S3LVOL_EXPORT_SETTLE_DELAY_S, default 30, 0 = at once). The pause that
+ * produced it usually has more roles to export, and a cross-node resume may
+ * follow at once: both are on the critical path and share this node's S3
+ * slots and its disk with the upload. The export is importable from the peer
+ * the whole time, so the wait costs only how soon S3 holds a second copy. */
+static uint64_t
+export_settle_delay_us(void)
+{
+	static int64_t cached = -1;
+
+	if (cached < 0) {
+		const char *v = getenv("S3LVOL_EXPORT_SETTLE_DELAY_S");
+		char *end = NULL;
+		long s = 30;
+
+		if (v && *v) {
+			s = strtol(v, &end, 10);
+			if (!end || *end != '\0' || s < 0 || s > 3600) {
+				SPDK_WARNLOG("S3LVOL_EXPORT_SETTLE_DELAY_S='%s' is not 0..3600; "
+					     "using 30\n", v);
+				s = 30;
+			}
+		}
+		cached = s;
+	}
+	return (uint64_t)cached * SPDK_SEC_TO_USEC;
+}
+
 int
 s3lvol_export_settle_start(struct s3lvol_export *exp)
 {
 	struct export_settle *st;
+	uint64_t delay_us;
 
 	if (!exp || !exp->packs_pending) {
 		return 0;
@@ -2298,6 +2328,13 @@ s3lvol_export_settle_start(struct s3lvol_export *exp)
 	/* Keep it pinned whatever happened before (a restart, an operator):
 	 * the pin is what stops the cache from evicting the only copy. */
 	(void)s3_peer_pin_export(exp->uuid_str);
+	delay_us = export_settle_delay_us();
+	if (delay_us > 0) {
+		st->retry = SPDK_POLLER_REGISTER(export_settle_retry_fire, st, delay_us);
+		if (st->retry) {
+			return 0;
+		}
+	}
 	export_settle_step(st);
 	return 0;
 }
