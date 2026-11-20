@@ -500,3 +500,32 @@ func TestExportWorkerSettleResubmitsWhenNativeReadsNone(t *testing.T) {
 	require.Equal(t, []string{entry.MemoryVol, entry.MetadataVol}, e.submits)
 	require.Equal(t, cow.ExportStatusDone, e.volumeInfos[entry.MemoryVol].ExportStatus)
 }
+
+// peer_ready (s3lvol PEER_READY): every role importable, at least one only from
+// this node's peer. UploadStatus reports peer_ready with the export uuids and
+// does not commit the checkpoint; once every role is DONE it is ready.
+func TestUploadStatusPeerReadyThenReady(t *testing.T) {
+	_, e, entry := newTestWorker(t)
+	for name, info := range e.volumeInfos {
+		info.ExportUUID = "exp-" + name
+		info.ExportStatus = cow.ExportStatusDone
+	}
+	e.volumeInfos[entry.MemoryVol].ExportStatus = cow.ExportStatusPeerReady
+	st, err := (&S3Cow{engine: e}).UploadStatus(context.Background(), entry.SnapshotID)
+	require.NoError(t, err)
+	require.Equal(t, cow.RemoteStatePeerReady, st.State)
+	require.NotNil(t, st.RemoteUUIDs)
+	require.Equal(t, "exp-"+entry.MemoryVol, st.RemoteUUIDs.Memory)
+
+	e.volumeInfos[entry.MemoryVol].ExportStatus = cow.ExportStatusDone
+	st, err = (&S3Cow{engine: e}).UploadStatus(context.Background(), entry.SnapshotID)
+	require.NoError(t, err)
+	require.Equal(t, cow.RemoteStateReady, st.State)
+}
+
+func TestExportStatusIsImportable(t *testing.T) {
+	require.True(t, cow.ExportStatusIsImportable("DONE"))
+	require.True(t, cow.ExportStatusIsImportable("peer_ready"))
+	require.False(t, cow.ExportStatusIsImportable("INPROGRESS"))
+	require.False(t, cow.ExportStatusIsImportable(""))
+}

@@ -203,7 +203,8 @@ func recoverTimedOutPauseForResume(ctx context.Context, req *types.UpdateRequest
 		req.SandboxID, rec.SnapshotID, probeIP)
 	// No ApplyFromExtInfo: timeout means Master never saw volume events.
 	// Keep an already-inprogress async export open (B15); otherwise legacy.
-	pending := strings.EqualFold(strings.TrimSpace(rec.RemoteStatus), constants.RemoteStatusInProgress)
+	pending := strings.EqualFold(strings.TrimSpace(rec.RemoteStatus), constants.RemoteStatusInProgress) ||
+		strings.EqualFold(strings.TrimSpace(rec.RemoteStatus), constants.RemoteStatusPeerReady)
 	if err := pausesnap.CompleteWithExport(ctx, req.SandboxID, rec.SnapshotID, nodeID, probeIP, req.InstanceType, nil, rec.ExportUUIDs, pending); err != nil {
 		return nil, fmt.Errorf("cannot resume: pause timeout heal complete failed: %w", err)
 	}
@@ -650,8 +651,12 @@ func resolvePauseHostIP(ctx context.Context, sandboxID string) (string, bool) {
 // cross-node source-quiesced gate.
 func resumePlacement(ctx context.Context, rec *pausesnap.Record, instanceType string, createReq *types.CreateCubeSandboxReq) (*restoreplace.Placement, error) {
 	in := pauseResumePlacementInput(rec, instanceType, createReq)
-	crossNodeOK := restoreplace.CanCrossNodeWithExports(in.Backend, in.RemoteStatus, rec.ExportUUIDs)
+	crossNodeOK := restoreplace.CanCrossNodeWithExportsAt(in.Backend, in.RemoteStatus, rec.ExportUUIDs,
+		rec.NodeID, rec.NodeIP)
 	if rec.Evicted() {
+		// Evicted means its origin dropped the local state: peer_ready
+		// (packs only on that origin) can never be the source.
+		crossNodeOK = restoreplace.CanCrossNodeWithExports(in.Backend, in.RemoteStatus, rec.ExportUUIDs)
 		if in.PinToOrigin || !crossNodeOK {
 			return nil, fmt.Errorf("evicted sandbox %s cannot be restored: checkpoint is not cross-node restorable", rec.SandboxID)
 		}

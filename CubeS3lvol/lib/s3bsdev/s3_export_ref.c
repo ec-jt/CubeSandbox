@@ -148,6 +148,11 @@ struct pack_writer {
 	uint64_t                   start_ms;
 	int                        status;
 	bool                       pumping;
+	/* peer_ready (s3_export_run_packonly): packs are written to the pinned
+	 * local peer cache only, never PUT here, and the manifest is published
+	 * with packs_pending. A failure fails the export: there are no live refs
+	 * to fall back to. */
+	bool                       peer_ready;
 };
 
 static uint64_t
@@ -205,6 +210,30 @@ pack_finish(struct pack_writer *w)
 {
 	int rc;
 
+	if (w->peer_ready) {
+		if (w->status != 0) {
+			SPDK_ERRLOG("Export %s: peer_ready packing failed (%s) after %u of "
+				    "%u pack(s); the export fails\n", w->m->uuid_str,
+				    spdk_strerror(-w->status), w->done_packs, w->m->pack_count);
+			w->cb(w->cb_arg, NULL, w->status);
+			s3_export_manifest_unref(w->m);
+			pack_writer_free(w);
+			return;
+		}
+		w->m->packs_pending = true;
+		s3_export_manifest_seal(w->m);
+		SPDK_NOTICELOG("Export %s: %" PRIu64 " own chunk(s) in %u pinned local "
+			       "pack(s) in %" PRIu64 " ms; publishing as peer_ready\n",
+			       w->m->uuid_str, w->nchunks, w->m->pack_count,
+			       pack_now_ms() - w->start_ms);
+		rc = s3_export_manifest_publish(w->client, w->m, w->cb, w->cb_arg);
+		if (rc != 0) {
+			w->cb(w->cb_arg, NULL, rc);
+		}
+		s3_export_manifest_unref(w->m);
+		pack_writer_free(w);
+		return;
+	}
 	if (w->status != 0) {
 		SPDK_WARNLOG("Export %s: packing failed (%s) after %u of %u pack(s); "
 			     "publishing the unpacked delta instead\n", w->m->uuid_str,
@@ -286,6 +315,16 @@ pack_job_hashed(void *arg)
 	struct pack_job *j = arg;
 	int rc;
 
+	if (j->w->peer_ready) {
+		/* The pinned local copy is the only copy until the background
+		 * upload finishes: failing to write it fails the export. */
+		if (j->store_rc != 0) {
+			SPDK_ERRLOG("Export %s: pack %u could not be kept locally: %s\n",
+				    j->uuid, j->pack, spdk_strerror(-j->store_rc));
+		}
+		pack_job_end(j, j->store_rc);
+		return;
+	}
 	if (j->store_rc != 0) {
 		/* Only the peer copy failed: S3 is still the source of truth and
 		 * the digest is still right, so an importer just misses the peer. */
@@ -439,8 +478,19 @@ pack_pump(struct pack_writer *w)
 
 /* Takes its own reference on m. 0 means the callback will run. */
 static int
+pack_writer_run_mode(const struct s3_export_ref_opts *opts, struct s3_export_manifest *m,
+		     s3_export_cb cb, void *cb_arg, bool peer_ready);
+
+static int
 pack_writer_run(const struct s3_export_ref_opts *opts, struct s3_export_manifest *m,
 		s3_export_cb cb, void *cb_arg)
+{
+	return pack_writer_run_mode(opts, m, cb, cb_arg, false);
+}
+
+static int
+pack_writer_run_mode(const struct s3_export_ref_opts *opts, struct s3_export_manifest *m,
+		     s3_export_cb cb, void *cb_arg, bool peer_ready)
 {
 	struct pack_writer *w;
 	uint64_t i, n = 0;
@@ -466,7 +516,7 @@ pack_writer_run(const struct s3_export_ref_opts *opts, struct s3_export_manifest
 		pack_writer_free(w);
 		return rc;
 	}
-	if (s3_peer_pull_enabled()) {
+	if (peer_ready || s3_peer_pull_enabled()) {
 		/* Filled by each pack job before its PUT; the manifest carrying
 		 * it is published only after every pack is durable. */
 		m->pack_sha = calloc(m->pack_count, 32);
@@ -487,6 +537,7 @@ pack_writer_run(const struct s3_export_ref_opts *opts, struct s3_export_manifest
 	w->blocks_per_chunk = m->chunk_size / S3LVOL_BLOCK_SIZE;
 	w->max_inflight = pack_inflight_from_env();
 	w->start_ms = pack_now_ms();
+	w->peer_ready = peer_ready;
 	SPDK_NOTICELOG("Export %s: packing %" PRIu64 " own chunk(s) into %u pack(s) of "
 		       "%u MiB, %u in flight\n", m->uuid_str, n, m->pack_count,
 		       (uint32_t)(((uint64_t)m->pack_chunks * m->chunk_size) >> 20),
@@ -637,6 +688,116 @@ walk_layer(struct ref_walk *w, struct spdk_blob *blob, const char *uuid_str,
 	}
 
 	return contributed;
+}
+
+/* ==========================================================================
+ * peer_ready: pack-only export without a drain
+ *
+ * The ref walk needs every cluster's object to be durable in S3, which is what
+ * the drain before it waits for: on a busy node that is the whole lvstore's
+ * WAL backlog, measured at 130 s (app1 2026-11-20). A template delta does not
+ * need refs at all when it is packed -- an importer reads every own chunk from
+ * a pack -- so this walk names chunks by allocation alone, reads their bytes
+ * through blobstore (which serves the WAL and the overlay too), and writes the
+ * packs to the pinned local peer cache. The manifest goes out with
+ * packs_pending: readable from the source peer at once, from S3 once the
+ * caller's background upload has PUT every pack and republished it.
+ *
+ * The refs carry no object (nil uuid, full chunk). They are never read: a
+ * version 6 manifest is always read from its packs, and this one is never
+ * downgraded to version 5.
+ * ========================================================================== */
+
+int
+s3_export_run_packonly(const struct s3_export_ref_opts *opts, s3_export_cb cb, void *cb_arg)
+{
+	struct s3_export_manifest *m = NULL;
+	struct spdk_uuid nil = {0};
+	uint64_t num_io_units, io_units_per_chunk, size_bytes, n = 0;
+	uint32_t chunk_size, i;
+	int rc;
+
+	if (!opts || !opts->chain || opts->chain_len == 0 || !opts->client ||
+	    !opts->uuid_str || !opts->base_uuid || opts->base_uuid[0] == '\0' ||
+	    !opts->pack_blob || !opts->pack_channel || opts->pack_chunks == 0 ||
+	    opts->parent) {
+		return -EINVAL;
+	}
+	for (i = 0; i < opts->chain_len; i++) {
+		if (!opts->chain[i] || spdk_blob_is_esnap_clone(opts->chain[i])) {
+			return -EINVAL;
+		}
+	}
+	chunk_size = opts->cluster_size;
+	if (chunk_size < S3LVOL_BLOCK_SIZE || (chunk_size & (chunk_size - 1)) != 0) {
+		return -EINVAL;
+	}
+	io_units_per_chunk = chunk_size / S3LVOL_BLOCK_SIZE;
+	num_io_units = spdk_blob_get_num_io_units(opts->chain[0]);
+	size_bytes = num_io_units * S3LVOL_BLOCK_SIZE;
+
+	rc = s3_export_manifest_create(opts->uuid_str, size_bytes, chunk_size,
+				       S3_EXPORT_LAYOUT_REF, &m);
+	if (rc != 0) {
+		return rc;
+	}
+	m->src = opts->src;
+	m->cluster_size = opts->cluster_size;
+	m->created_at = (uint64_t)time(NULL);
+	m->expires_at = opts->expires_at;
+	m->generation = opts->generation;
+
+	/* Nearest layer first is irrelevant here: a chunk is present when any
+	 * layer above the base allocated it, and its bytes are read through the
+	 * snapshot, which resolves the layers itself. */
+	for (i = 0; i < opts->chain_len; i++) {
+		uint64_t layer = spdk_blob_get_num_io_units(opts->chain[i]);
+		uint64_t off = 0;
+
+		if (layer > num_io_units) {
+			layer = num_io_units;
+		}
+		while (off < layer) {
+			uint64_t c;
+
+			off = spdk_blob_get_next_allocated_io_unit(opts->chain[i], off);
+			if (off == UINT64_MAX || off >= layer) {
+				break;
+			}
+			c = off / io_units_per_chunk;
+			if (!s3_export_manifest_is_present(m, c)) {
+				rc = s3_export_manifest_set_ref(m, c, &nil, chunk_size);
+				if (rc != 0) {
+					goto err;
+				}
+				n++;
+			}
+			off = (c + 1) * io_units_per_chunk;
+		}
+	}
+	if (n == 0) {
+		/* Nothing of its own: an empty pack table does not parse. The
+		 * caller takes the ordinary path. */
+		rc = -ENOTSUP;
+		goto err;
+	}
+	rc = s3_export_manifest_set_base(m, opts->base_uuid);
+	if (rc != 0) {
+		goto err;
+	}
+	s3_export_manifest_seal(m);
+	SPDK_NOTICELOG("Export %s is a template delta over base %s: %" PRIu64 " own "
+		       "chunk(s) by allocation, no drain (peer_ready)\n", opts->uuid_str,
+		       opts->base_uuid, n);
+	rc = pack_writer_run_mode(opts, m, cb, cb_arg, true);
+	if (rc != 0) {
+		goto err;
+	}
+	s3_export_manifest_unref(m);
+	return 0;
+err:
+	s3_export_manifest_unref(m);
+	return rc;
 }
 
 int

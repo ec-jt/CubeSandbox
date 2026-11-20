@@ -1339,6 +1339,8 @@ export_drop_unpublished(struct export_ctx *ctx, int status)
 		return;
 	}
 	s3lvol_export_forget(exp);
+	/* Nothing named it: its pinned peer copies (peer_ready) can go. */
+	s3_peer_drop_export(ctx->info.export_uuid);
 	rc = s3lvol_export_registry_save(ctx->lvs, NULL, NULL);
 	SPDK_NOTICELOG("Export %s failed at step '%s' before any manifest or admission "
 		       "write; its reservation was dropped (status NONE, resubmit "
@@ -1498,6 +1500,22 @@ static void
 export_recorded(void *cb_arg, int status)
 {
 	struct export_ctx *ctx = cb_arg;
+
+	if (status == 0) {
+		struct s3lvol_export *exp = s3lvol_export_find(ctx->lvs, ctx->info.export_uuid);
+		struct s3lvol_export_entry e;
+
+		if (exp) {
+			s3lvol_export_get(exp, &e);
+			if (e.packs_pending) {
+				SPDK_NOTICELOG("Export %s of snapshot '%s' is peer_ready after "
+					       "%" PRIu64 " ms; uploading its packs to S3 "
+					       "in the background\n", ctx->info.export_uuid,
+					       ctx->info.snapshot_name, export_elapsed_ms(ctx));
+				(void)s3lvol_export_settle_start(exp);
+			}
+		}
+	}
 
 	if (status != 0) {
 		/* The prepublication reservation remains durable and pinned. Readers may
@@ -2085,6 +2103,36 @@ s3lvol_export_template_delta_enabled(void)
 	return cached == 1;
 }
 
+/* S3LVOL_EXPORT_PEER_READY: template deltas skip the drain and publish as soon
+	* as their packs are pinned locally (packs_pending), uploading them to S3 in
+	* the background. Needs template deltas, packs and a peer server. Off unless
+	* set to 1/true/yes. Read once. */
+bool
+s3lvol_export_peer_ready_enabled(void)
+{
+	static int cached = -1;
+
+	if (cached < 0) {
+		const char *v = getenv("S3LVOL_EXPORT_PEER_READY");
+
+		cached = v && (strcmp(v, "1") == 0 || strcasecmp(v, "true") == 0 ||
+			       strcasecmp(v, "yes") == 0);
+		if (cached && !(s3lvol_export_template_delta_enabled() &&
+				s3_export_packs_enabled() && s3_peer_serve_enabled())) {
+			SPDK_WARNLOG("S3LVOL_EXPORT_PEER_READY needs "
+				     "S3LVOL_EXPORT_TEMPLATE_DELTA, S3LVOL_EXPORT_PACKS and "
+				     "S3LVOL_PEER_LISTEN; it stays off\n");
+			cached = 0;
+		}
+		if (cached) {
+			SPDK_NOTICELOG("S3LVOL_EXPORT_PEER_READY is on: template deltas "
+				       "publish from the pinned peer cache without a "
+				       "drain and upload to S3 in the background\n");
+		}
+	}
+	return cached == 1;
+}
+
 /* \p base_uuid, when not NULL, asks the walk to stop above a template base:
  * the base is left out of the chain and its uuid is returned instead, so the
  * manifest describes only what the layers above it own. The exported snapshot
@@ -2398,11 +2446,122 @@ export_ref(struct export_ctx *ctx)
  *
  * After the snapshot, not before: a write landing between a flush and the snapshot
  * would be in the snapshot with nothing to name it. */
+/* Snapshots up to this many allocated clusters that are not template deltas
+ * (the metadata disk) are exported by copying, without a drain, when
+ * peer_ready is on: a few MiB of PUTs instead of waiting out the whole
+ * lvstore's WAL. Larger ones keep the drain. */
+#define EXPORT_PEER_READY_DENSE_MAX_DEFAULT 256
+
+static uint64_t
+export_peer_ready_dense_max(void)
+{
+	const char *v = getenv("S3LVOL_EXPORT_PEER_READY_DENSE_MAX");
+	char *end = NULL;
+	unsigned long long n;
+
+	if (!v || !*v) {
+		return EXPORT_PEER_READY_DENSE_MAX_DEFAULT;
+	}
+	n = strtoull(v, &end, 10);
+	return end && *end == '\0' ? n : EXPORT_PEER_READY_DENSE_MAX_DEFAULT;
+}
+
+/* peer_ready: export without the lvstore drain. 0 when it took over (the
+ * export reports through the usual callbacks); anything else means "take the
+ * ordinary drain path", which is always correct.
+ *
+ *   template delta  -> pack-only writer: packs pinned in the local peer cache,
+ *                      manifest published with packs_pending, S3 upload later
+ *   small non-delta -> the copying engine: reads through blobstore, which
+ *                      serves the WAL and the overlay, so it needs no drain
+ */
+static int
+export_try_peer_ready(struct export_ctx *ctx)
+{
+	struct spdk_lvol_store *store = s3lvol_lvstore_get_lvs(ctx->lvs);
+	struct spdk_blob *chain[S3LVOL_DEFAULT_MAX_CHAIN_DEPTH];
+	struct s3_export_ref_opts opts = {0};
+	char esnap_uuid[SPDK_UUID_STRING_LEN];
+	char base_uuid[SPDK_UUID_STRING_LEN] = {0};
+	uint32_t chain_len = 0;
+	int rc;
+
+	if (ctx->release_safe || !s3lvol_export_peer_ready_enabled()) {
+		return -ENOTSUP;
+	}
+	rc = export_build_chain(ctx->lvs, ctx->snapshot->blob, chain, SPDK_COUNTOF(chain),
+				&chain_len, esnap_uuid, sizeof(esnap_uuid),
+				base_uuid, sizeof(base_uuid));
+	if (rc != 0 || esnap_uuid[0] != '\0') {
+		return -ENOTSUP;
+	}
+	if (base_uuid[0] == '\0') {
+		uint64_t alloc = spdk_blob_get_num_allocated_clusters(ctx->snapshot->blob);
+
+		if (alloc > export_peer_ready_dense_max()) {
+			return -ENOTSUP;
+		}
+		SPDK_NOTICELOG("Export %s: layout dense without a drain (peer_ready, "
+			       "%" PRIu64 " allocated cluster(s), not a template delta)\n",
+			       ctx->info.export_uuid, alloc);
+		export_copy(ctx);
+		return 0;
+	}
+
+	rc = s3_peer_pin_export(ctx->info.export_uuid);
+	if (rc != 0) {
+		SPDK_WARNLOG("Export %s: cannot pin the peer cache (%s); exporting the "
+			     "ordinary way\n", ctx->info.export_uuid, spdk_strerror(-rc));
+		return rc;
+	}
+	if (!ctx->channel) {
+		ctx->channel = spdk_bs_alloc_io_channel(store->blobstore);
+	}
+	if (!ctx->channel) {
+		s3_peer_drop_export(ctx->info.export_uuid);
+		return -ENOMEM;
+	}
+	opts.bs_dev = s3lvol_lvstore_get_bs_dev(ctx->lvs);
+	opts.chain = chain;
+	opts.chain_len = chain_len;
+	opts.client = s3lvol_lvstore_get_client(ctx->lvs);
+	opts.prefix = s3lvol_lvstore_get_name(ctx->lvs);
+	opts.uuid_str = ctx->info.export_uuid;
+	opts.cluster_size = (uint32_t)spdk_bs_get_cluster_size(store->blobstore);
+	opts.expires_at = ctx->expires_at;
+	opts.base_uuid = base_uuid;
+	opts.pack_blob = ctx->snapshot->blob;
+	opts.pack_channel = ctx->channel;
+	opts.pack_chunks = s3_export_pack_chunks_from_env(opts.cluster_size);
+	rc = export_fill_src(ctx, &opts.src);
+	if (rc != 0) {
+		s3_peer_drop_export(ctx->info.export_uuid);
+		return rc;
+	}
+	ctx->step = "peer_ready";
+	rc = s3_export_run_packonly(&opts, export_copy_done, ctx);
+	if (rc != 0) {
+		SPDK_NOTICELOG("Export %s: peer_ready declined (%s); exporting the "
+			       "ordinary way\n", ctx->info.export_uuid, spdk_strerror(-rc));
+		s3_peer_drop_export(ctx->info.export_uuid);
+		return rc;
+	}
+	/* The manifest PUT comes later and may land without an answer: from
+	 * here a failure keeps the reservation (B16, fail closed). */
+	ctx->attempts.publish_started = true;
+	SPDK_NOTICELOG("Export %s: layout ref, template delta over base %s, no drain "
+		       "(peer_ready)\n", ctx->info.export_uuid, base_uuid);
+	return 0;
+}
+
 static void
 export_drain(struct export_ctx *ctx)
 {
 	struct s3_bs_dev_stats st = {0};
 
+	if (export_try_peer_ready(ctx) == 0) {
+		return;
+	}
 	ctx->step = "drain";
 	s3_bs_dev_get_stats(s3lvol_lvstore_get_bs_dev(ctx->lvs), &st);
 	export_drain_ctl_start(&ctx->drain_progress, export_now_ms(), st.chunks_flushed);
@@ -3239,6 +3398,7 @@ s3lvol_export_query(const char *export_uuid,
 		if (exp) {
 			s3lvol_export_get(exp, &entry);
 			*state = entry.publication_pending ? S3LVOL_EXPORT_STATE_INPROGRESS :
+				entry.packs_pending ? S3LVOL_EXPORT_STATE_PEER_READY :
 				S3LVOL_EXPORT_STATE_DONE;
 			*deletable = export_snapshot_deletable(lvs, entry.snapshot);
 			return 0;
@@ -3277,6 +3437,9 @@ snapshot_export_state(struct s3lvol_lvstore *lvs, const char *snapshot_name)
 		if (strcmp(entry.snapshot, snapshot_name) == 0) {
 			if (entry.publication_pending) {
 				return S3LVOL_EXPORT_STATE_INPROGRESS;
+			}
+			if (entry.packs_pending) {
+				return S3LVOL_EXPORT_STATE_PEER_READY;
 			}
 			found = true;
 			break;
@@ -7142,6 +7305,17 @@ export_release(struct s3lvol_lvstore *lvs, const char *export_uuid,
 	int rc;
 	if (!lvs || !export_uuid || !cb_fn) return -EINVAL;
 	if (!s3lvol_lvstore_xfer_allowed(lvs) || s3lvol_export_work_busy(lvs)) return -EBUSY;
+	if (held_exp) {
+		s3lvol_export_get(held_exp, &held_info);
+		if (held_info.packs_pending) {
+			/* peer_ready: its packs exist only in this node's pinned
+			 * cache until the background upload finishes; a resume may
+			 * be reading them right now. Deferred, never forced. */
+			SPDK_NOTICELOG("export %s is peer_ready (packs not in S3 yet); "
+				       "release deferred\n", export_uuid);
+			return -EBUSY;
+		}
+	}
 	r = calloc(1, sizeof(*r));
 	if (!r) return -ENOMEM;
 	r->work.lvs = lvs; r->client = s3lvol_lvstore_get_client(lvs);

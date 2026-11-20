@@ -2371,6 +2371,8 @@ export_state_str(enum s3lvol_export_state state)
 		return "INPROGRESS";
 	case S3LVOL_EXPORT_STATE_DONE:
 		return "DONE";
+	case S3LVOL_EXPORT_STATE_PEER_READY:
+		return "PEER_READY";
 	case S3LVOL_EXPORT_STATE_NONE:
 	default:
 		return "NONE";

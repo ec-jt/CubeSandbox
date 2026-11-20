@@ -463,3 +463,85 @@ func TestCanCrossNodeWithExportsRequiresReadyAndUUIDs(t *testing.T) {
 		}
 	}
 }
+
+func TestCanCrossNodeFromPeerReady(t *testing.T) {
+	s3 := constants.SnapshotBackendS3
+	if !CanCrossNodeFrom(s3, constants.RemoteStatusPeerReady, true) {
+		t.Fatal("peer_ready with a healthy origin must cross")
+	}
+	if CanCrossNodeFrom(s3, constants.RemoteStatusPeerReady, false) {
+		t.Fatal("peer_ready with an unhealthy origin must not cross")
+	}
+	if CanCrossNodeFrom(constants.SnapshotBackendXFS, constants.RemoteStatusPeerReady, true) {
+		t.Fatal("xfs never crosses")
+	}
+	if !CanCrossNodeFrom(s3, constants.RemoteStatusReady, false) {
+		t.Fatal("ready crosses whatever the origin")
+	}
+	if CanCrossNodeFrom(s3, constants.RemoteStatusInProgress, true) {
+		t.Fatal("inprogress never crosses")
+	}
+	if CanCrossNode(s3, constants.RemoteStatusPeerReady) {
+		t.Fatal("plain CanCrossNode stays ready-only (eviction, from-snapshot without an origin)")
+	}
+}
+
+func TestCanCrossNodeWithExportsAtPeerReady(t *testing.T) {
+	resetPlacementSeams(t)
+	healthy := &node.Node{InsID: "node-a", IP: "10.0.0.1", Healthy: true}
+	healthy.SetSchedulingDisabled(true) // cordoned: still serves its peer cache
+	lookupNodeFn = func(nodeID, nodeIP string) *node.Node { return healthy }
+	s3 := constants.SnapshotBackendS3
+	if !CanCrossNodeWithExportsAt(s3, constants.RemoteStatusPeerReady, `{"rootfs":"r"}`, "node-a", "10.0.0.1") {
+		t.Fatal("peer_ready, cordoned but healthy origin: may cross")
+	}
+	if CanCrossNodeWithExportsAt(s3, constants.RemoteStatusPeerReady, "", "node-a", "10.0.0.1") {
+		t.Fatal("no export uuids: never")
+	}
+	healthy.Healthy = false
+	if CanCrossNodeWithExportsAt(s3, constants.RemoteStatusPeerReady, `{"rootfs":"r"}`, "node-a", "10.0.0.1") {
+		t.Fatal("peer_ready with an unhealthy origin must wait for ready")
+	}
+	lookupNodeFn = func(nodeID, nodeIP string) *node.Node { return nil }
+	if CanCrossNodeWithExportsAt(s3, constants.RemoteStatusPeerReady, `{"rootfs":"r"}`, "node-a", "10.0.0.1") {
+		t.Fatal("peer_ready with an unknown origin must wait for ready")
+	}
+	if !CanCrossNodeWithExportsAt(s3, constants.RemoteStatusReady, `{"rootfs":"r"}`, "node-a", "10.0.0.1") {
+		t.Fatal("ready crosses without an origin")
+	}
+}
+
+func TestDecidePeerReadyCrossesFromCordonedHealthyOrigin(t *testing.T) {
+	resetPlacementSeams(t)
+	origin := isolatedOrigin("node-a", "10.0.0.1") // cordoned, healthy
+	peer := &node.Node{InsID: "node-b", IP: "10.0.0.2", Healthy: true}
+	lookupNodeFn = func(nodeID, nodeIP string) *node.Node { return origin }
+	listCompatibleFn = func(ctx context.Context, _ *nodemeta.HostFacts) ([]compatibleCandidate, error) {
+		return []compatibleCandidate{{NodeID: "node-b", NodeIP: "10.0.0.2"}}, nil
+	}
+	selectNodeFn = func(ctx context.Context, _ string, _ *selctx.RequestResource, scope []string) (*node.Node, error) {
+		return peer, nil
+	}
+	in := s3ReadyInput("node-a")
+	in.RemoteStatus = constants.RemoteStatusPeerReady
+	got, err := Decide(context.Background(), in)
+	if err != nil || got == nil || !got.CrossNode || got.NodeID != "node-b" {
+		t.Fatalf("want cross-node to node-b, got %+v %v", got, err)
+	}
+}
+
+func TestDecidePeerReadyStaysWhenOriginUnhealthy(t *testing.T) {
+	resetPlacementSeams(t)
+	origin := &node.Node{InsID: "node-a", IP: "10.0.0.1", Healthy: false}
+	lookupNodeFn = func(nodeID, nodeIP string) *node.Node { return origin }
+	listCompatibleFn = func(ctx context.Context, _ *nodemeta.HostFacts) ([]compatibleCandidate, error) {
+		t.Fatal("peer_ready from an unhealthy origin must not look for peers")
+		return nil, nil
+	}
+	in := s3ReadyInput("node-a")
+	in.RemoteStatus = constants.RemoteStatusPeerReady
+	if _, err := Decide(context.Background(), in); err == nil ||
+		!strings.Contains(err.Error(), "cannot restore cross-node") {
+		t.Fatalf("want origin-only failure, got %v", err)
+	}
+}

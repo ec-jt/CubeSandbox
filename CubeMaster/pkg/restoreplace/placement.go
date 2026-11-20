@@ -80,11 +80,11 @@ var (
 	queryHostFactCandidatesFn = nodemeta.QueryHostFactCandidates
 )
 
-func crossNodeBlockedReason(in Input) string {
+func crossNodeBlockedReason(in Input, origin *node.Node) string {
 	if in.PinToOrigin {
 		return "host-mount"
 	}
-	if !CanCrossNode(in.Backend, in.RemoteStatus) {
+	if !CanCrossNodeFrom(in.Backend, in.RemoteStatus, OriginServesPeer(origin)) {
 		return fmt.Sprintf("backend=%s remote_status=%s",
 			strings.TrimSpace(in.Backend), strings.TrimSpace(in.RemoteStatus))
 	}
@@ -98,6 +98,48 @@ func CanCrossNode(backend, remoteStatus string) bool {
 		return false
 	}
 	return strings.EqualFold(strings.TrimSpace(remoteStatus), constants.RemoteStatusReady)
+}
+
+// CanCrossNodeFrom is CanCrossNode that also accepts remote_status=peer_ready
+// when the origin can serve the packs (originServes): such an export is
+// importable from the origin's peer server, not yet from S3. With the origin
+// unhealthy the old rule holds: wait for ready, or stay on the origin.
+func CanCrossNodeFrom(backend, remoteStatus string, originServes bool) bool {
+	if CanCrossNode(backend, remoteStatus) {
+		return true
+	}
+	return originServes && constants.IsS3Backend(backend) &&
+		strings.EqualFold(strings.TrimSpace(remoteStatus), constants.RemoteStatusPeerReady)
+}
+
+// IsPeerReady reports remote_status=peer_ready.
+func IsPeerReady(remoteStatus string) bool {
+	return strings.EqualFold(strings.TrimSpace(remoteStatus), constants.RemoteStatusPeerReady)
+}
+
+// OriginServesPeer reports whether the origin can serve a peer_ready export's
+// packs: registered and healthy. Cordoned is fine (a cordon stops new work,
+// not the peer server). Master cannot see the peer listener itself; if it is
+// down the import fails cleanly and the resume is retried.
+func OriginServesPeer(origin *node.Node) bool {
+	return origin != nil && origin.Healthy
+}
+
+// OriginServesPeerAt is OriginServesPeer for a node named by id or ip.
+func OriginServesPeerAt(originID, originIP string) bool {
+	return OriginServesPeer(lookupNodeFn(originID, originIP))
+}
+
+// CanCrossNodeWithExportsAt is CanCrossNodeWithExports that also accepts a
+// peer_ready export whose origin (by id or ip) is healthy.
+func CanCrossNodeWithExportsAt(backend, remoteStatus, exportUUIDs, originID, originIP string) bool {
+	if strings.TrimSpace(exportUUIDs) == "" {
+		return false
+	}
+	if CanCrossNode(backend, remoteStatus) {
+		return true
+	}
+	return IsPeerReady(remoteStatus) && CanCrossNodeFrom(backend, remoteStatus, OriginServesPeerAt(originID, originIP))
 }
 
 // CanCrossNodeWithExports additionally requires the export identities a
@@ -124,7 +166,7 @@ func Decide(ctx context.Context, in Input) (*Placement, error) {
 		originDesc = "unknown"
 	}
 
-	if reason := crossNodeBlockedReason(in); reason != "" {
+	if reason := crossNodeBlockedReason(in, origin); reason != "" {
 		if origin == nil {
 			return nil, fmt.Errorf("origin node unavailable for %s and snapshot cannot restore cross-node (%s)",
 				strings.TrimSpace(in.SnapshotID), reason)

@@ -24,6 +24,11 @@ const (
 	RemoteStatusRunning    = "running"
 	RemoteStatusReady      = "ready"
 	RemoteStatusFailed     = "failed"
+	// RemoteStatusPeerReady: the export is published and importable, but
+	// only from the origin node's peer server; its packs are still on their
+	// way to S3. A cross-node resume may use it while the origin is healthy.
+	// The reconciler keeps polling until ready.
+	RemoteStatusPeerReady = "peer_ready"
 )
 
 // NormalizeSnapshotBackend maps create/pause backend input onto xfs | s3.

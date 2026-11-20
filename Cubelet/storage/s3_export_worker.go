@@ -481,7 +481,9 @@ func (w *s3ExportWorker) exportRole(ctx context.Context, m *S3Cow, id string, re
 			return fmt.Errorf("%s %s is missing; package cannot be exported", ref.Role, ref.Name)
 		}
 		switch {
-		case v.status == cow.ExportStatusDone && v.uuid != "":
+		case cow.ExportStatusIsImportable(v.status) && v.uuid != "":
+			// PEER_READY settles the role: s3lvol finishes the S3 upload
+			// on its own and UploadStatus reports ready afterwards.
 			return nil
 		case v.uuid != "" && (v.status == cow.ExportStatusInProgress || v.status == ""):
 			// Accepted earlier (this run, a previous run, or before a restart).
@@ -664,7 +666,7 @@ func (w *s3ExportWorker) waitSettled(ctx context.Context, m *S3Cow, id string, r
 				return fmt.Errorf("accepted export %s identity changed to %s for %s", uuid, v.uuid, ref.Name)
 			}
 			switch {
-			case v.status == cow.ExportStatusDone && v.uuid == uuid:
+			case cow.ExportStatusIsImportable(v.status) && v.uuid == uuid:
 				return nil
 			case cow.ExportStatusIsFailed(v.status):
 				return fmt.Errorf("accepted export %s of %s ended %s", uuid, ref.Name, v.status)
@@ -745,7 +747,7 @@ func (w *s3ExportWorker) allRolesDone(ctx context.Context, m *S3Cow, id string) 
 		if err != nil {
 			return false, err
 		}
-		if !(v.status == cow.ExportStatusDone && v.uuid != "") {
+		if !(cow.ExportStatusIsImportable(v.status) && v.uuid != "") {
 			return false, nil
 		}
 	}

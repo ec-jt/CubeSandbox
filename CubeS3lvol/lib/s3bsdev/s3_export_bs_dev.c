@@ -217,6 +217,8 @@ struct export_slot {
 	bool                        peer_phase;
 	uint8_t                    *peer_buf;
 	uint32_t                    peer_buf_len;
+	/* Peer-only (manifest packs_pending): attempts made on this fetch. */
+	uint32_t                    peer_tries;
 };
 
 struct export_peer_ctx {
@@ -1043,6 +1045,22 @@ export_peer_hedge_fire(void *arg)
 	return SPDK_POLLER_BUSY;
 }
 
+/* Peer-only reads (manifest packs_pending): the packs are on the source node
+ * and nowhere else yet. A failed peer read is retried this many times and then
+ * fails the slot with -ENOENT, which makes the reading I/O refetch the manifest
+ * once (the upload may have finished meanwhile, in which case the new manifest
+ * reads S3) and otherwise fail. Never S3 for a pending pack: the object is not
+ * there, and asking would only turn a clear failure into a slow one. */
+#define EXPORT_PEER_ONLY_TRIES 4
+
+static bool export_peer_start(struct s3_export_dev *dev, struct export_slot *s);
+
+static bool
+export_peer_only(const struct s3_export_dev *dev)
+{
+	return dev->m && dev->m->packs_pending;
+}
+
 static void
 export_peer_done(void *cb_arg, int status)
 {
@@ -1056,6 +1074,16 @@ export_peer_done(void *cb_arg, int status)
 		dev->stats.peer_hits++;
 		dev->stats.peer_bytes += ctx->len;
 		dev->peer_fail_streak = 0;
+	} else if (status != -ECANCELED && export_peer_only(dev)) {
+		dev->stats.peer_misses++;
+		if (status == -EBADMSG) {
+			dev->stats.peer_mismatches++;
+		}
+		SPDK_WARNLOG("Export %s pack %u: peer %s %s (%s); the pack is not in S3 "
+			     "yet, attempt %u of %u\n", dev->m->uuid_str, ctx->pack,
+			     dev->peer, status == -EBADMSG ? "returned bytes that do not "
+			     "match the manifest digest" : "failed", spdk_strerror(-status),
+			     s ? s->peer_tries : 0, EXPORT_PEER_ONLY_TRIES);
 	} else if (status != -ECANCELED) {
 		dev->stats.peer_misses++;
 		if (status == -EBADMSG) {
@@ -1100,6 +1128,17 @@ export_peer_done(void *cb_arg, int status)
 	}
 	free(ctx->buf);
 	free(ctx);
+	if (s->peer_phase && export_peer_only(dev)) {
+		s->peer_phase = false;
+		if (status != -ECANCELED && !dev->destroy_pending &&
+		    s->peer_tries < EXPORT_PEER_ONLY_TRIES && export_peer_start(dev, s)) {
+			return;
+		}
+		/* -ENOENT: the I/O refetches the manifest once (the upload may
+		 * have completed), then fails. Never a read of S3. */
+		export_slot_finish(s, status == -ECANCELED ? -ECANCELED : -ENOENT);
+		return;
+	}
 	if (s->peer_phase) {
 		spdk_poller_unregister(&s->peer_hedge);
 		dev->stats.peer_fallbacks++;
@@ -1115,9 +1154,12 @@ export_peer_start(struct s3_export_dev *dev, struct export_slot *s)
 	const struct s3_export_manifest *m = dev->m;
 	struct export_peer_ctx *ctx;
 	uint64_t pack;
+	bool only = export_peer_only(dev);
 
-	if (dev->peer[0] == '\0' || dev->peer_disabled || !m->pack_sha ||
-		   s->offset != 0 || s->object_len == 0 || !s3_peer_pull_enabled()) {
+	/* Peer-only ignores the breaker and the pull flag: there is no other
+	 * source to protect or to prefer. */
+	if (dev->peer[0] == '\0' || (!only && dev->peer_disabled) || !m->pack_sha ||
+	    s->offset != 0 || s->object_len == 0 || (!only && !s3_peer_pull_enabled())) {
 		return false;
 	}
 	pack = UINT64_MAX - s->chunk_index;
@@ -1148,9 +1190,15 @@ export_peer_start(struct s3_export_dev *dev, struct export_slot *s)
 	dev->peer_inflight++;
 	s->peer_ctx = ctx;
 	s->peer_phase = true;
+	s->peer_tries++;
 	s->nranges = 0;
 	s->ranges_left = 0;
 	s->fail_status = 0;
+	if (only) {
+		/* No hedge: S3 does not have it. The peer client's own deadline
+		 * (S3LVOL_PEER_IO_MS) bounds each attempt. */
+		return true;
+	}
 	s->peer_hedge = SPDK_POLLER_REGISTER(export_peer_hedge_fire, s, s3_peer_hedge_us());
 	if (!s->peer_hedge) {
 		/* No timer: race S3 right away rather than wait unbounded. */
@@ -1167,12 +1215,22 @@ export_slot_start_fetch(struct s3_export_dev *dev, struct export_slot *s)
 	int rc;
 
 	s->state = EXPORT_SLOT_FETCHING;
+	s->peer_tries = 0;
 	dev->fetch_inflight++;
 	if (dev->fetch_inflight > dev->stats.peak_fetch_inflight) {
 		dev->stats.peak_fetch_inflight = dev->fetch_inflight;
 	}
 	if (export_peer_start(dev, s)) {
 		return 0;
+	}
+	if (export_peer_only(dev)) {
+		/* No peer to ask (none given, or the request could not be
+		 * queued) and S3 does not have the pack: fail, never guess. */
+		SPDK_ERRLOG("Export %s: pack '%s' is only on the source peer and no "
+			    "peer read could be started\n", dev->m->uuid_str, s->key);
+		dev->fetch_inflight--;
+		s->state = EXPORT_SLOT_FREE;
+		return -EHOSTUNREACH;
 	}
 	rc = export_slot_send_s3(dev, s);
 	if (rc != 0) {

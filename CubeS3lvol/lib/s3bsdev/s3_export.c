@@ -397,6 +397,7 @@ s3_export_manifest_clear_packs(struct s3_export_manifest *m)
 	m->pack_loc = NULL;
 	free(m->pack_sha);
 	m->pack_sha = NULL;
+	m->packs_pending = false;
 	m->pack_chunks = 0;
 	m->pack_count = 0;
 	if (m->version == S3_EXPORT_PACK_VERSION) {
@@ -1164,6 +1165,14 @@ s3_export_manifest_seal(struct s3_export_manifest *m)
 						       (size_t)m->pack_count * 32,
 						       m->crc32c);
 		}
+		/* Only when set, so an ordinary version 6 manifest keeps the crc
+		 * it always had. Covered because clearing it by accident would
+		 * send an importer to S3 for packs that are not there yet. */
+		if (m->packs_pending) {
+			static const uint8_t tag[] = "packs_pending";
+
+			m->crc32c = spdk_crc32c_update(tag, sizeof(tag), m->crc32c);
+		}
 	}
 }
 
@@ -1583,6 +1592,9 @@ s3_export_manifest_serialize(struct s3_export_manifest *m, char **out, size_t *o
 				spdk_json_write_named_string(w, "pack_sha256", sha_b64);
 				free(sha_b64);
 			}
+			if (m->packs_pending) {
+				spdk_json_write_named_bool(w, "packs_pending", true);
+			}
 		}
 	}
 	spdk_json_write_object_end(w);
@@ -1703,6 +1715,7 @@ struct manifest_json {
 	uint32_t          pack_count;
 	char             *pack_loc;
 	char             *pack_sha256;
+	bool              packs_pending;
 };
 
 static int
@@ -1757,6 +1770,8 @@ static const struct spdk_json_object_decoder manifest_decoders[] = {
 	/* Version 6, optional even there: only manifests written with
 	 * S3LVOL_PEER_PULL on carry it. */
 	{"pack_sha256", offsetof(struct manifest_json, pack_sha256), spdk_json_decode_string, true},
+	/* Version 6, optional: peer_ready (packs only on the source node). */
+	{"packs_pending", offsetof(struct manifest_json, packs_pending), spdk_json_decode_bool, true},
 };
 
 static void
@@ -2328,12 +2343,26 @@ s3_export_manifest_parse(const void *json, size_t len, struct s3_export_manifest
 					goto out;
 				}
 			}
-		} else if (j.pack_sha256) {
-			SPDK_ERRLOG("export manifest version %u carries pack digests\n",
-				    j.version);
+			if (j.packs_pending) {
+				/* Packs readable only from the source peer: without a
+				 * digest for every pack nothing could be read at all. */
+				if (!m->pack_sha) {
+					SPDK_ERRLOG("export manifest has pending packs but no "
+						    "pack digests\n");
+					rc = -EINVAL;
+					goto out;
+				}
+				m->packs_pending = true;
+			}
+		} else if (j.pack_sha256 || j.packs_pending) {
+			SPDK_ERRLOG("export manifest version %u carries pack digests or "
+				    "pending packs\n", j.version);
 			rc = -EINVAL;
 			goto out;
 		}
+	} else if (j.packs_pending) {
+		rc = -EINVAL;
+		goto out;
 	}
 
 	/* The two cross-checks. Everything above catches a manifest that is

@@ -340,8 +340,24 @@ cache_ent_cmp(const void *a, const void *b)
 	return x->mtime < y->mtime ? -1 : x->mtime > y->mtime ? 1 : 0;
 }
 
+#define PEER_PIN_MARKER ".pinned"
+
+static bool
+dir_pinned(const char *dir)
+{
+	char p[PATH_MAX];
+	struct stat st;
+
+	return snprintf(p, sizeof(p), "%s/" PEER_PIN_MARKER, dir) < (int)sizeof(p) &&
+	       stat(p, &st) == 0;
+}
+
 /* Delete the oldest copies until the total is within the cap. Called after a
- * store, under g_store_lock. A directory left empty is removed too. */
+ * store, under g_store_lock. A directory left empty is removed too.
+ *
+ * A pinned export (peer_ready: its packs are not in S3 yet) is never touched
+ * and its bytes do not count against the cap: deleting one of its packs would
+ * make the export unreadable from anywhere. */
 static void
 cache_evict(void)
 {
@@ -361,6 +377,9 @@ cache_evict(void)
 
 		if (!uuid_ok(de->d_name) ||
 		    snprintf(d, sizeof(d), "%s/%s", c->dir, de->d_name) >= (int)sizeof(d)) {
+			continue;
+		}
+		if (dir_pinned(d)) {
 			continue;
 		}
 		sub = opendir(d);
@@ -423,6 +442,7 @@ s3_peer_store_pack(const char *uuid_str, uint32_t pack, const void *buf, size_t 
 	const uint8_t *p = buf;
 	size_t done = 0;
 	int fd, rc = 0;
+	bool pinned;
 
 	if (!c->serve) {
 		return 0;
@@ -430,13 +450,17 @@ s3_peer_store_pack(const char *uuid_str, uint32_t pack, const void *buf, size_t 
 	if (!uuid_ok(uuid_str)) {
 		return -EINVAL;
 	}
-	if (c->cache_bytes == 0 || len > c->cache_bytes) {
-		return 0;
-	}
 	if (snprintf(dir, sizeof(dir), "%s/%s", c->dir, uuid_str) >= (int)sizeof(dir) ||
 	    pack_path(uuid_str, pack, path, sizeof(path)) != 0 ||
-	    snprintf(tmp, sizeof(tmp), "%s.tmp.%d", path, (int)getpid()) >= (int)sizeof(tmp)) {
+	    snprintf(tmp, sizeof(tmp), "%s.tmp.%d.%u", path, (int)getpid(), pack) >=
+	    (int)sizeof(tmp)) {
 		return -ENAMETOOLONG;
+	}
+	/* A pinned export's packs exist nowhere else: they are stored whatever
+	 * the cap says. An ordinary copy is only an optimisation. */
+	pinned = dir_pinned(dir);
+	if (!pinned && (c->cache_bytes == 0 || len > c->cache_bytes)) {
+		return 0;
 	}
 	pthread_mutex_lock(&g_store_lock);
 	if (mkdir(c->dir, 0700) != 0 && errno != EEXIST) {
@@ -464,8 +488,13 @@ s3_peer_store_pack(const char *uuid_str, uint32_t pack, const void *buf, size_t 
 		}
 		done += (size_t)w;
 	}
-	/* No fsync: a copy lost in a crash is only a peer miss, and the
-	 * importer verifies every byte against the manifest digest anyway. */
+	/* An ordinary copy is not fsynced: losing it in a crash is only a peer
+	 * miss. A pinned one is the only copy until the S3 upload finishes, so it
+	 * is made durable before anyone is told the export is peer_ready. The
+	 * importer verifies every byte against the manifest digest either way. */
+	if (rc == 0 && pinned && fsync(fd) != 0) {
+		rc = -errno;
+	}
 	if (close(fd) != 0 && rc == 0) {
 		rc = -errno;
 	}
@@ -511,6 +540,144 @@ s3_peer_drop_export(const char *uuid_str)
 		(void)rmdir(dir);
 	}
 	pthread_mutex_unlock(&g_store_lock);
+}
+
+static int
+export_dir(const char *uuid_str, char *dir, size_t len)
+{
+	const struct peer_config *c = cfg();
+
+	if (!uuid_ok(uuid_str)) {
+		return -EINVAL;
+	}
+	return snprintf(dir, len, "%s/%s", c->dir, uuid_str) < (int)len ? 0 : -ENAMETOOLONG;
+}
+
+int
+s3_peer_pin_export(const char *uuid_str)
+{
+	const struct peer_config *c = cfg();
+	char dir[PATH_MAX], marker[PATH_MAX];
+	int fd, rc = 0;
+
+	if (!c->serve) {
+		return -ENOTSUP;
+	}
+	rc = export_dir(uuid_str, dir, sizeof(dir));
+	if (rc != 0) {
+		return rc;
+	}
+	if (snprintf(marker, sizeof(marker), "%s/" PEER_PIN_MARKER, dir) >= (int)sizeof(marker)) {
+		return -ENAMETOOLONG;
+	}
+	pthread_mutex_lock(&g_store_lock);
+	if (mkdir(c->dir, 0700) != 0 && errno != EEXIST) {
+		rc = -errno;
+		goto out;
+	}
+	if (mkdir(dir, 0700) != 0 && errno != EEXIST) {
+		rc = -errno;
+		goto out;
+	}
+	fd = open(marker, O_WRONLY | O_CREAT | O_CLOEXEC, 0600);
+	if (fd < 0) {
+		rc = -errno;
+		goto out;
+	}
+	if (fsync(fd) != 0) {
+		rc = -errno;
+	}
+	(void)close(fd);
+out:
+	pthread_mutex_unlock(&g_store_lock);
+	return rc;
+}
+
+void
+s3_peer_unpin_export(const char *uuid_str)
+{
+	char dir[PATH_MAX], marker[PATH_MAX];
+
+	if (export_dir(uuid_str, dir, sizeof(dir)) != 0 ||
+		   snprintf(marker, sizeof(marker), "%s/" PEER_PIN_MARKER, dir) >= (int)sizeof(marker)) {
+		return;
+	}
+	pthread_mutex_lock(&g_store_lock);
+	(void)unlink(marker);
+	/* The copies are ordinary cache entries now; bring the total back
+		* under the cap. */
+	cache_evict();
+	pthread_mutex_unlock(&g_store_lock);
+}
+
+bool
+s3_peer_export_pinned(const char *uuid_str)
+{
+	char dir[PATH_MAX];
+
+	return export_dir(uuid_str, dir, sizeof(dir)) == 0 && dir_pinned(dir);
+}
+
+int
+s3_peer_pack_size(const char *uuid_str, uint32_t pack, size_t *out)
+{
+	char path[PATH_MAX];
+	struct stat st;
+
+	if (!uuid_ok(uuid_str) || !out) {
+		return -EINVAL;
+	}
+	if (pack_path(uuid_str, pack, path, sizeof(path)) != 0) {
+		return -ENAMETOOLONG;
+	}
+	if (stat(path, &st) != 0 || st.st_size <= 0) {
+		return -ENOENT;
+	}
+	*out = (size_t)st.st_size;
+	return 0;
+}
+
+int
+s3_peer_load_pack(const char *uuid_str, uint32_t pack, void *buf, size_t len)
+{
+	char path[PATH_MAX];
+	struct stat st;
+	uint8_t *p = buf;
+	size_t done = 0;
+	int fd, rc = 0;
+
+	if (!uuid_ok(uuid_str)) {
+		return -EINVAL;
+	}
+	if (pack_path(uuid_str, pack, path, sizeof(path)) != 0) {
+		return -ENAMETOOLONG;
+	}
+	fd = open(path, O_RDONLY | O_CLOEXEC);
+	if (fd < 0) {
+		return errno == ENOENT ? -ENOENT : -errno;
+	}
+	if (fstat(fd, &st) != 0 || (uint64_t)st.st_size != len) {
+		(void)close(fd);
+		return -ENOENT;
+	}
+	while (done < len) {
+		ssize_t r = read(fd, p + done, len - done);
+
+		if (r < 0) {
+			if (errno == EINTR) {
+				continue;
+			}
+			rc = -errno;
+			break;
+		}
+		if (r == 0) {
+			rc = -EIO;
+			break;
+		}
+		done += (size_t)r;
+	}
+	(void)close(fd);
+	return rc;
 }
 
 /* ==========================================================================

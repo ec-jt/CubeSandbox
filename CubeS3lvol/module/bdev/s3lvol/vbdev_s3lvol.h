@@ -987,6 +987,9 @@ enum s3lvol_export_state {
 	S3LVOL_EXPORT_STATE_NONE = 0,   /* no such export (yet, or any more) */
 	S3LVOL_EXPORT_STATE_INPROGRESS, /* uuid handed out, manifest not durable */
 	S3LVOL_EXPORT_STATE_DONE,       /* manifest durable and importable */
+	/* Manifest durable and importable from this node's peer only: its packs
+	 * are pinned locally and still on their way to S3 (peer_ready). */
+	S3LVOL_EXPORT_STATE_PEER_READY,
 };
 
 /**
@@ -1622,6 +1625,14 @@ void s3lvol_lvstore_exports_set_ready(struct s3lvol_lvstore *lvs, bool ready);
 bool s3lvol_lvstore_xfer_allowed(const struct s3lvol_lvstore *lvs);
 bool s3lvol_lvstore_dependency_view_complete(const struct s3lvol_lvstore *lvs);
 bool s3lvol_export_work_busy(struct s3lvol_lvstore *lvs);
+/* peer_ready (S3LVOL_EXPORT_PEER_READY): start or resume the background S3
+ * upload of an export published with packs_pending. */
+int s3lvol_export_settle_start(struct s3lvol_export *exp);
+void s3lvol_exports_settle_resume(struct s3lvol_lvstore *lvs);
+/* Any export of \p snapshot_name (NULL: any) in \p lvs (NULL: any) still has
+ * packs only on this node. */
+bool s3lvol_export_packs_pending(struct s3lvol_lvstore *lvs, const char *snapshot_name);
+bool s3lvol_export_peer_ready_enabled(void);
 bool s3lvol_export_registry_busy(struct s3lvol_lvstore *lvs);
 void s3lvol_export_publication_complete(struct s3lvol_export *exp,
                                       const struct s3_export_manifest *m);
@@ -1672,6 +1683,7 @@ struct s3lvol_export_entry {
 	uint32_t    generation;
 	bool    is_ref;
 	bool    publication_pending;
+	bool    packs_pending;
 	bool    source_obligation;
 	bool    lease_aware;
 	bool    lease_checked;

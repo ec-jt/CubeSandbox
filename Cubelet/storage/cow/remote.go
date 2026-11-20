@@ -16,6 +16,12 @@ const (
 	RemoteStateRunning = "running" // upload in progress / cubecow INPROGRESS
 	RemoteStateReady   = "ready"   // remote_uuids present / cubecow DONE
 	RemoteStateFailed  = "failed"
+	// RemoteStatePeerReady: every role is importable, but at least one only
+	// from this node's peer server (cubecow PEER_READY): its packs are pinned
+	// locally and still uploading to S3. A cross-node resume may go ahead
+	// while this node is healthy; anything that needs S3 (eviction, a source
+	// node going away) still waits for ready.
+	RemoteStatePeerReady = "peer_ready"
 )
 
 // cubecow_get_volume_info export_status values (s3-support).
@@ -23,10 +29,24 @@ const (
 	ExportStatusNone       = "NONE"
 	ExportStatusInProgress = "INPROGRESS"
 	ExportStatusDone       = "DONE"
+	// ExportStatusPeerReady: the manifest is published, its packs are only
+	// in the source node's pinned peer cache (s3lvol peer_ready).
+	ExportStatusPeerReady = "PEER_READY"
 	// s3lvol may report these when an export has actually failed.
 	ExportStatusFailed = "FAILED"
 	ExportStatusError  = "ERROR"
 )
+
+// ExportStatusIsImportable reports whether an export can be imported now:
+// DONE from anywhere, PEER_READY from the source node's peer.
+func ExportStatusIsImportable(status string) bool {
+	switch strings.ToUpper(strings.TrimSpace(status)) {
+	case ExportStatusDone, ExportStatusPeerReady:
+		return true
+	default:
+		return false
+	}
+}
 
 // ExportStatusIsFailed reports whether cubecow/s3lvol marked the export as
 // a terminal failure. Anything else (empty, NONE, INPROGRESS, lookup errors)

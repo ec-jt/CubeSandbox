@@ -362,6 +362,15 @@ struct s3_export_manifest {
 	 * (s3_peer.h): a pack without a digest is never read from a peer. */
 	uint8_t  *pack_sha;
 
+	/* Version 6, optional (peer_ready). True while the packs exist only on
+	 * the source node's peer cache and not yet in S3: an importer must read
+	 * every pack from the source peer and never from S3, and fails rather
+	 * than falls back. Requires pack_sha. Written only when true, covered by
+	 * the crc only when true, so a manifest without it is byte-identical to
+	 * an ordinary version 6 one. The source rewrites the manifest without
+	 * it once every pack is durable in S3. */
+	bool      packs_pending;
+
 	/* Over the bitmap, and for a ref manifest over the full bitmap, the packed
 	 * uuids and the partial-length exceptions too, in that order -- and, from
 	 * version 3, src_idx after those. The stage list follows `version` rather
@@ -919,6 +928,33 @@ struct s3_export_ref_opts {
  * on the importing node, with nothing to say so. Passing an esnap chain with no
  * parent is refused rather than silently truncated.
  */
+/**
+ * peer_ready export (template deltas only, no drain). Names every chunk any
+ * layer of \p opts->chain allocated above the base, reads it through
+ * \p opts->pack_blob, writes the packs to the pinned local peer cache (the
+ * caller has pinned the export's directory), and publishes a version 6
+ * manifest with packs_pending. Nothing but the manifest goes to S3; the caller
+ * uploads the packs afterwards with s3_export_packs_upload() and republishes.
+ *
+ * \return 0 when the callback will run; -ENOTSUP when the chain owns no chunk
+ * (take the ordinary path); -EINVAL for a chain that is not a delta.
+ */
+int s3_export_run_packonly(const struct s3_export_ref_opts *opts,
+			   s3_export_cb cb, void *cb_arg);
+
+/**
+ * Upload the pinned local copies of packs 0..count-1 of export \p uuid_str to
+ * <prefix>/exports/<uuid>/pack-<n>, verifying each against \p sha (count x 32
+ * bytes) first. Every pack is retried with backoff until it lands or
+ * \p *cancel becomes true; there is no attempt cap. Local reads and hashing run
+ * off the reactor. \p cb gets 0, -ECANCELED, or a local error (a missing or
+ * corrupt local copy, which no retry can fix). \p sha is copied.
+ */
+int s3_export_packs_upload(struct s3_client *client, const char *prefix,
+			   const char *uuid_str, uint32_t count, const uint8_t *sha,
+			   const bool *cancel, void (*cb)(void *cb_arg, int status),
+			   void *cb_arg);
+
 int s3_export_run_ref(const struct s3_export_ref_opts *opts,
 		      s3_export_cb cb, void *cb_arg);
 

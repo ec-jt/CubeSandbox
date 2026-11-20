@@ -111,6 +111,32 @@ int s3_peer_store_pack(const char *uuid_str, uint32_t pack, const void *buf, siz
 /** Delete the local copies of an export's packs (release). Blocking, small. */
 void s3_peer_drop_export(const char *uuid_str);
 
+/**
+ * Pin an export's local pack copies (peer_ready): its directory gets a
+ * `.pinned` marker and the cache eviction never deletes anything in it, so the
+ * packs stay servable while they exist nowhere else. Creates the directory.
+ * Blocking, small. \return 0 or a negative errno (also -ENOTSUP when this node
+ * does not serve peers, which is the caller's cue not to rely on the peer).
+ */
+int s3_peer_pin_export(const char *uuid_str);
+
+/** Drop the pin (every pack is durable in S3). The copies stay as ordinary,
+ * evictable cache entries. Blocking, small. */
+void s3_peer_unpin_export(const char *uuid_str);
+
+/** Whether the export's directory is pinned. */
+bool s3_peer_export_pinned(const char *uuid_str);
+
+/**
+ * Read one local pack copy into \p buf (\p len bytes exactly). Blocking file
+ * I/O: never call on a reactor. \return 0, -ENOENT when there is no copy or it
+ * has another length, or a negative errno.
+ */
+int s3_peer_load_pack(const char *uuid_str, uint32_t pack, void *buf, size_t len);
+
+/** Size of one local pack copy. \return 0, or -ENOENT when there is none. */
+int s3_peer_pack_size(const char *uuid_str, uint32_t pack, size_t *out);
+
 /* ==========================================================================
  * Importer side
  * ========================================================================== */

@@ -20,7 +20,17 @@
  *     [9] rescue: the peer is slow and S3 then fails for good, the peer's late
  *         verified copy is used;
  *    [10] the server refuses a wildcard bind and starts without a secret no
- *         longer.
+ *         longer;
+ *    [12] peer_ready manifest: packs_pending round-trips, is covered by the
+ *         crc, and is refused without pack digests;
+ *    [13] pin: a pinned export is stored past the cap and never evicted;
+ *         unpinned, it is an ordinary cache entry again;
+ *    [14] peer-only read (packs_pending): every pack from the peer, S3 never
+ *         asked; with the peer down or a pack missing the read fails cleanly,
+ *         still without a single S3 GET for a pack;
+ *    [15] background upload: every pinned pack is PUT after its digest is
+ *         checked; a corrupt local copy stops it with -EBADMSG; a cancel stops
+ *         it.
  *
  *   No network beyond loopback, no credentials.
  */
@@ -190,19 +200,45 @@ s3_head(struct s3_client *client, const char *key, uint64_t *out_size,
 	return 0;
 }
 
+static bool g_put_ok;            /* PUTs succeed and are recorded */
+static uint32_t g_puts, g_put_fail_first;
+static char g_put_keys[16][S3_EXPORT_KEY_MAX];
+
 int
 s3_put(struct s3_client *client, const char *key, struct iovec *iov, int iovcnt,
        bool if_none_match, s3_op_cb cb, void *cb_arg)
 {
 	(void)client;
-	(void)key;
 	(void)iov;
 	(void)iovcnt;
 	(void)if_none_match;
+	if (!g_put_ok) {
+		if (cb) {
+			cb(cb_arg, -ENOTSUP);
+		}
+		return 0;
+	}
+	if (g_put_fail_first > 0) {
+		g_put_fail_first--;
+		if (cb) {
+			cb(cb_arg, -EIO);
+		}
+		return 0;
+	}
+	if (g_puts < 16) {
+		snprintf(g_put_keys[g_puts], sizeof(g_put_keys[0]), "%s", key);
+	}
+	g_puts++;
 	if (cb) {
-		cb(cb_arg, -ENOTSUP);
+		cb(cb_arg, 0);
 	}
 	return 0;
+}
+
+void
+s3_client_get(struct s3_client *client)
+{
+	(void)client;
 }
 
 int
@@ -407,6 +443,15 @@ read_all(const char *peer, uint32_t ms, struct s3_export_bs_dev_stats *st,
 }
 
 static void
+pu_done(void *arg, int status)
+{
+	struct { bool done; int status; } *pu = arg;
+
+	pu->done = true;
+	pu->status = status;
+}
+
+static void
 set_env(const char *dir, const char *key)
 {
 	char port[16];
@@ -580,6 +625,164 @@ main(void)
 	g_s3_fail = false;
 	g_s3_delay_polls = 0;
 	set_env(g_dir, g_key_file);
+
+	printf("\n[12] peer_ready manifest: packs_pending\n");
+	{
+		struct s3_export_manifest *q = NULL;
+		char *j2 = NULL, *b2;
+		size_t l2 = 0;
+
+		g_m->packs_pending = true;
+		s3_export_manifest_seal(g_m);
+		rc = s3_export_manifest_serialize(g_m, &j2, &l2);
+		check_true("serialized with packs_pending",
+			   rc == 0 && strstr(j2, "\"packs_pending\":true") != NULL);
+		rc = s3_export_manifest_parse(j2, l2, &q);
+		check_true("parses back pending", rc == 0 && q && q->packs_pending);
+		s3_export_manifest_unref(q);
+		q = NULL;
+		b2 = strdup(j2);
+		{
+			char *at = strstr(b2, "\"packs_pending\":true");
+
+			/* Same length: true -> fals(e) breaks the json; drop the member
+			 * instead by renaming it, which keeps the crc of the original. */
+			memcpy(at + 1, "packs_pendinX", 13);
+		}
+		check_true("dropping the flag fails the crc",
+			   s3_export_manifest_parse(b2, strlen(b2), &q) != 0);
+		free(b2);
+		free(j2);
+		j2 = NULL;
+		g_m->packs_pending = false;
+		s3_export_manifest_seal(g_m);
+		rc = s3_export_manifest_serialize(g_m, &j2, &l2);
+		check_true("not written when false",
+			   rc == 0 && strstr(j2, "packs_pending") == NULL);
+		free(j2);
+		{
+			/* Without digests nothing could read the packs at all. */
+			uint8_t *sha = g_m->pack_sha;
+
+			g_m->pack_sha = NULL;
+			g_m->packs_pending = true;
+			s3_export_manifest_seal(g_m);
+			j2 = NULL;
+			rc = s3_export_manifest_serialize(g_m, &j2, &l2);
+			check_true("refused on parse without pack digests", rc == 0 &&
+				   s3_export_manifest_parse(j2, l2, &q) != 0);
+			free(j2);
+			g_m->pack_sha = sha;
+			g_m->packs_pending = false;
+			s3_export_manifest_seal(g_m);
+		}
+	}
+
+	printf("\n[13] pin: never evicted while pinned\n");
+	{
+		char d[256], pth[512];
+		struct stat sb;
+		uint32_t pk;
+		bool all = true, gone = false;
+		uint8_t small[4096];
+
+		setenv("S3LVOL_PEER_CACHE_MB", "4", 1);
+		s3_peer_config_reload();
+		check_true("pin", s3_peer_pin_export(TEST_UUID) == 0 &&
+			   s3_peer_export_pinned(TEST_UUID));
+		publish_packs(g_m);   /* 10 MiB of packs against a 4 MiB cap */
+		memset(small, 7, sizeof(small));
+		/* An unpinned store runs the eviction. */
+		s3_peer_store_pack("8c3f04e0-4f89-11d3-9a0c-0305e82c3308", 0, small,
+				   sizeof(small));
+		for (pk = 0; pk < g_m->pack_count; pk++) {
+			snprintf(pth, sizeof(pth), "%s/%s/pack-%08x", g_dir, TEST_UUID, pk);
+			all = all && stat(pth, &sb) == 0;
+		}
+		check_true("every pinned pack kept past the cap", all);
+		snprintf(d, sizeof(d), "%s/%s/.pinned", g_dir, TEST_UUID);
+		check_true("marker on disk", stat(d, &sb) == 0);
+		s3_peer_unpin_export(TEST_UUID);
+		check_true("unpinned", !s3_peer_export_pinned(TEST_UUID));
+		for (pk = 0; pk < g_m->pack_count; pk++) {
+			snprintf(pth, sizeof(pth), "%s/%s/pack-%08x", g_dir, TEST_UUID, pk);
+			gone = gone || stat(pth, &sb) != 0;
+		}
+		check_true("unpinned copies are evictable again", gone);
+		s3_peer_drop_export("8c3f04e0-4f89-11d3-9a0c-0305e82c3308");
+		setenv("S3LVOL_PEER_CACHE_MB", "16384", 1);
+		s3_peer_config_reload();
+		publish_packs(g_m);
+	}
+
+	printf("\n[14] peer-only read (packs_pending): never S3\n");
+	g_m->packs_pending = true;
+	s3_export_manifest_seal(g_m);
+	ok = read_all(peer, 5000, &st, &el);
+	check_true("every own chunk reads right", ok);
+	check_u64("every pack from the peer", st.peer_hits, g_m->pack_count);
+	check_u64("no S3 GET", g_s3_gets, 0);
+	remove_local_pack(1);
+	ok = read_all(peer, 5000, &st, &el);
+	check_true("a missing pack fails the read", !ok);
+	check_u64("still no S3 GET for a pack", g_s3_gets, 0);
+	ok = read_all("127.0.0.1:1", 5000, &st, &el);
+	check_true("peer down fails the read", !ok);
+	check_u64("no S3 GET with the peer down either", g_s3_gets, 0);
+	corrupt_local_pack(0);
+	publish_packs(g_m);   /* restores pack 1, re-digests everything */
+	corrupt_local_pack(0);
+	ok = read_all(peer, 5000, &st, &el);
+	check_true("a pack that fails its digest fails the read", !ok);
+	check_true("counted as mismatches", st.peer_mismatches >= 1);
+	check_u64("never served from S3", g_s3_gets, 0);
+	g_m->packs_pending = false;
+	publish_packs(g_m);
+
+	printf("\n[15] background upload of pinned packs\n");
+	{
+		struct pu { bool done; int status; } pu = {0};
+		bool cancel = false;
+		uint32_t pk;
+		bool keys = true;
+
+		g_put_ok = true;
+		g_puts = 0;
+		g_put_fail_first = 2;   /* retried, not fatal */
+		rc = s3_export_packs_upload((struct s3_client *)0x1, SRC_PREFIX, TEST_UUID,
+					    g_m->pack_count, g_m->pack_sha, &cancel,
+					    pu_done, &pu);
+		poll_ms(8000);
+		check_true("uploaded", rc == 0 && pu.done && pu.status == 0);
+		check_u64("one PUT per pack", g_puts, g_m->pack_count);
+		for (pk = 0; pk < g_m->pack_count && pk < 16; pk++) {
+			char want[S3_EXPORT_KEY_MAX];
+
+			s3_export_pack_key(SRC_PREFIX, TEST_UUID, pk, want, sizeof(want));
+			keys = keys && strcmp(g_put_keys[pk], want) == 0;
+		}
+		check_true("to the pack keys, in order", keys);
+
+		corrupt_local_pack(1);
+		memset(&pu, 0, sizeof(pu));
+		g_puts = 0;
+		rc = s3_export_packs_upload((struct s3_client *)0x1, SRC_PREFIX, TEST_UUID,
+					    g_m->pack_count, g_m->pack_sha, &cancel,
+					    pu_done, &pu);
+		poll_ms(200);
+		check_true("a corrupt local copy stops it", pu.done && pu.status == -EBADMSG);
+		check_u64("nothing past the corrupt pack was PUT", g_puts, 1);
+		publish_packs(g_m);
+
+		memset(&pu, 0, sizeof(pu));
+		cancel = true;
+		rc = s3_export_packs_upload((struct s3_client *)0x1, SRC_PREFIX, TEST_UUID,
+					    g_m->pack_count, g_m->pack_sha, &cancel,
+					    pu_done, &pu);
+		poll_ms(100);
+		check_true("cancelled", pu.done && pu.status == -ECANCELED);
+		g_put_ok = false;
+	}
 
 	printf("\n[10] the server refuses a wildcard bind\n");
 	s3_peer_server_stop();

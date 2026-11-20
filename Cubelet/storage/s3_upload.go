@@ -179,7 +179,7 @@ func (m *S3Cow) waitExportSettled(ctx context.Context, name, uuid string) error 
 		}
 		status := strings.ToUpper(strings.TrimSpace(info.ExportStatus))
 		switch status {
-		case cow.ExportStatusDone:
+		case cow.ExportStatusDone, cow.ExportStatusPeerReady:
 			return nil
 		case cow.ExportStatusInProgress, "":
 			// An empty status is not a terminal native failure. Wait boundedly.
@@ -257,6 +257,7 @@ func (m *S3Cow) UploadStatus(ctx context.Context, snapshotID string) (*cow.Remot
 	var (
 		sawAny       bool
 		allDone      = true
+		anyPeerReady bool
 		anyProgress  bool
 		anyNone      bool
 		anyFailed    bool
@@ -307,6 +308,9 @@ func (m *S3Cow) UploadStatus(ctx context.Context, snapshotID string) (*cow.Remot
 		switch {
 		case status == cow.ExportStatusDone:
 			// ok
+		case status == cow.ExportStatusPeerReady:
+			// Importable from this node only; S3 still to come.
+			anyPeerReady = true
 		case cow.ExportStatusIsFailed(status):
 			allDone = false
 			anyFailed = true
@@ -338,6 +342,12 @@ func (m *S3Cow) UploadStatus(ctx context.Context, snapshotID string) (*cow.Remot
 		// A native FAILED role (for example a flusher drain timeout) is only
 		// terminal once the async export worker gave up (B15).
 		st.State, st.Message = asyncExportFailedState(id, strings.Join(messages, "; "))
+	case allDone && anyPeerReady:
+		// Not committed yet: the checkpoint commit records DONE exports,
+		// and is what eviction and the source fence rely on. It runs when
+		// every role reads DONE.
+		st.State = cow.RemoteStatePeerReady
+		st.Message = "export_status PEER_READY (packs uploading to S3)"
 	case allDone:
 		committed, err := m.commitCheckpoint(ctx, id)
 		if err != nil {

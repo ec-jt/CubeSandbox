@@ -87,6 +87,14 @@ struct s3lvol_export {
 	 * not forget them. */
 	uint32_t                pack_count;
 
+	/* peer_ready: the manifest is published with packs_pending and the packs
+	 * exist only in this node's pinned peer cache. The S3 upload runs in the
+	 * background (settle); until it has republished the manifest without the
+	 * flag, the export cannot be released and its snapshot not deleted.
+	 * Persisted, so a restart resumes the upload. */
+	bool                    packs_pending;
+	struct export_settle   *settle;
+
 	/* Liveness lease cache. The importer renews
 	 * <this lvstore>/meta/exports/<uuid>.lease in the source bucket; this
 	 * node reads it back so the delete path can tell "an importer is still
@@ -197,6 +205,7 @@ static void exports_reaper_sync(void);
  * s3 client calls they use are defined. */
 static void s3lvol_export_lease_start(struct s3lvol_export *exp);
 static void s3lvol_export_lease_stop(struct s3lvol_export *exp);
+static void export_settle_detach(struct s3lvol_export *exp);
 
 /* ==========================================================================
  * Queries
@@ -929,6 +938,7 @@ s3lvol_export_get(const struct s3lvol_export *exp, struct s3lvol_export_entry *o
 	out->is_ref      = (exp->layout == S3_EXPORT_LAYOUT_REF);
 	out->source_obligation = exp->source_obligation;
 	out->publication_pending = exp->publication_pending;
+	out->packs_pending = exp->packs_pending;
 	out->lease_aware = exp->lease_aware;
 	out->lease_checked = exp->lease_checked;
 	out->lease_absent = exp->lease_absent;
@@ -1054,6 +1064,7 @@ s3lvol_export_publication_complete(struct s3lvol_export *exp,
 	if (s3_export_manifest_is_packed(m)) {
 		exp->pack_count = m->pack_count;
 	}
+	exp->packs_pending = m->packs_pending;
 	/* Only a FIRST publication as dense never exposed source chunk refs.
 	 * Materialisation of a published REF must retain source_obligation. */
 	exp->source_obligation = m->layout == S3_EXPORT_LAYOUT_REF;
@@ -1111,6 +1122,7 @@ s3lvol_export_gc_packs(struct s3lvol_export *exp)
 void
 s3lvol_export_forget(struct s3lvol_export *exp)
 {
+	export_settle_detach(exp);
 	s3lvol_export_lease_stop(exp);
 	/* The only thing that stops the upstream renewals. Deliberately: nothing can
 	 * tell "nobody will ever import this" from "nobody has yet", so releasing the
@@ -1227,7 +1239,8 @@ exports_reap(void *arg)
 
 		for (exp = s3lvol_export_first(lvs); exp;
 		     exp = s3lvol_export_next(exp)) {
-			if (exp->layout != S3_EXPORT_LAYOUT_REF || exp->reaping) {
+			if (exp->layout != S3_EXPORT_LAYOUT_REF || exp->reaping ||
+			    exp->packs_pending) {
 				continue;
 			}
 			if (n >= S3LVOL_EXPORT_REAP_BATCH) {
@@ -1375,6 +1388,10 @@ exports_serialize(struct s3lvol_lvstore *lvs, char **out, size_t *out_len,
 		spdk_json_write_named_bool(w, "source_obligation", exp == completing ?
 			m->layout == S3_EXPORT_LAYOUT_REF : exp->source_obligation);
 		spdk_json_write_named_bool(w, "publication_pending", exp == completing ? false : exp->publication_pending);
+		/* Only when true; older builds ignore the member. */
+		if (exp == completing ? m->packs_pending : exp->packs_pending) {
+			spdk_json_write_named_bool(w, "packs_pending", true);
+		}
 		spdk_json_write_named_uint64(w, "blob_id", exp->blob_id);
 		spdk_json_write_named_string(w, "layout",
 					     (exp == completing ? m->layout : exp->layout) == S3_EXPORT_LAYOUT_REF ?
@@ -1510,6 +1527,7 @@ export_src_lease_restart(struct s3lvol_export *exp,
 struct export_entry_json {
 	bool source_obligation;
 	bool publication_pending;
+	bool packs_pending;
 	char *export_uuid;
 	char    *snapshot;
 	char    *snapshot_uuid;
@@ -1525,6 +1543,7 @@ struct export_entry_json {
 static const struct spdk_json_object_decoder export_entry_decoders[] = {
 	{"source_obligation", offsetof(struct export_entry_json, source_obligation), spdk_json_decode_bool, true},
 	{"publication_pending", offsetof(struct export_entry_json, publication_pending), spdk_json_decode_bool, true},
+	{"packs_pending", offsetof(struct export_entry_json, packs_pending), spdk_json_decode_bool, true},
 	{"export_uuid", offsetof(struct export_entry_json, export_uuid), spdk_json_decode_string, false},
 	{"snapshot",  offsetof(struct export_entry_json, snapshot),    spdk_json_decode_string, false},
 	{"snapshot_uuid", offsetof(struct export_entry_json, snapshot_uuid), spdk_json_decode_string, true},
@@ -1654,6 +1673,7 @@ exports_parse(struct s3lvol_lvstore *lvs, const void *json, size_t len)
 		exp->lease_aware = e->lease_aware;
 		exp->pack_count = e->pack_count;
 		exp->publication_pending = e->publication_pending;
+		exp->packs_pending = e->packs_pending;
 		exp->source_obligation = e->source_obligation || e->publication_pending ||
 			strcmp(e->layout, S3_EXPORT_LAYOUT_REF_STR) == 0;
 		exp->layout     = strcmp(e->layout, S3_EXPORT_LAYOUT_REF_STR) == 0 ?
@@ -1737,6 +1757,10 @@ exports_load_done(struct exports_load_ctx *ctx, int status)
 	void *cb_arg = ctx->cb_arg;
 
 	s3lvol_lvstore_exports_set_ready(ctx->lvs, status == 0);
+	if (status == 0) {
+		/* peer_ready exports whose S3 upload a restart interrupted. */
+		s3lvol_exports_settle_resume(ctx->lvs);
+	}
 	free(ctx->body);
 	free(ctx);
 
@@ -1989,4 +2013,344 @@ s3lvol_xfer_exports_save_local(struct s3lvol_lvstore *lvs)
 	(void)s3lvol_local_write(s3lvol_lvstore_get_name(lvs), S3LVOL_LOCAL_EXPORTS,
 				 s3lvol_lvstore_local_uuid(lvs), json, len);
 	free(json);
+}
+
+/* ==========================================================================
+ * peer_ready settle: packs to S3, then the manifest without packs_pending
+ *
+ * A peer_ready export is published with its packs only in this node's pinned
+ * peer cache. Settle reads its own manifest back (the registry keeps no copy),
+ * uploads every pack from the pinned cache, republishes the manifest without
+ * packs_pending (same generation: the content an importer reads is unchanged,
+ * only where it may read it from), records that in the registry and only then
+ * unpins the cache. Until then the export reads as PEER_READY, cannot be
+ * released, and pins its snapshot.
+ *
+ * Failures are retried forever, with backoff, from the same point. A missing or
+ * corrupt local pack is the one thing no retry can fix: the export stays
+ * PEER_READY (pinned, undeletable) and the log says why, loudly, every time.
+ * ========================================================================== */
+
+#define EXPORT_SETTLE_RETRY_MIN_US (2ULL * SPDK_SEC_TO_USEC)
+#define EXPORT_SETTLE_RETRY_MAX_US (60ULL * SPDK_SEC_TO_USEC)
+
+struct export_settle {
+	struct s3lvol_export      *exp;      /* NULL once the export is forgotten */
+	struct s3_export_manifest *m;
+	char                       uuid[SPDK_UUID_STRING_LEN];
+	char                       key[S3_EXPORT_KEY_MAX];
+	uint64_t                   size;
+	char                      *body;
+	struct spdk_poller        *retry;
+	uint64_t                   backoff_us;
+	uint32_t                   attempts;
+	bool                       cancel;   /* read by the pack uploader */
+	bool                       busy;     /* an async step is in flight */
+};
+
+static void export_settle_step(struct export_settle *st);
+
+static void
+export_settle_free(struct export_settle *st)
+{
+	spdk_poller_unregister(&st->retry);
+	s3_export_manifest_unref(st->m);
+	free(st->body);
+	free(st);
+}
+
+static int
+export_settle_retry_fire(void *arg)
+{
+	struct export_settle *st = arg;
+
+	spdk_poller_unregister(&st->retry);
+	if (!st->exp) {
+		export_settle_free(st);
+		return SPDK_POLLER_BUSY;
+	}
+	export_settle_step(st);
+	return SPDK_POLLER_BUSY;
+}
+
+/* Something failed: start over from the top after a while. Every step is
+ * idempotent (GET, PUTs of fixed bytes, a manifest PUT of fixed bytes, a
+ * registry rewrite), so restarting from the manifest read is always safe. */
+static void
+export_settle_again(struct export_settle *st, const char *what, int status)
+{
+	st->busy = false;
+	if (!st->exp) {
+		export_settle_free(st);
+		return;
+	}
+	st->attempts++;
+	st->backoff_us = st->backoff_us ? st->backoff_us * 2 : EXPORT_SETTLE_RETRY_MIN_US;
+	if (st->backoff_us > EXPORT_SETTLE_RETRY_MAX_US) {
+		st->backoff_us = EXPORT_SETTLE_RETRY_MAX_US;
+	}
+	SPDK_WARNLOG("export %s: settling to S3 failed at %s (%s), attempt %u; "
+		     "retrying in %" PRIu64 " s. It stays peer_ready and pinned "
+		     "until this succeeds.\n", st->uuid, what, spdk_strerror(-status),
+		     st->attempts, (uint64_t)(st->backoff_us / SPDK_SEC_TO_USEC));
+	s3_export_manifest_unref(st->m);
+	st->m = NULL;
+	free(st->body);
+	st->body = NULL;
+	st->retry = SPDK_POLLER_REGISTER(export_settle_retry_fire, st, st->backoff_us);
+}
+
+static void
+export_settle_saved(void *cb_arg, int status)
+{
+	struct export_settle *st = cb_arg;
+	struct s3lvol_export *exp = st->exp;
+
+	if (!exp) {
+		st->busy = false;
+		export_settle_free(st);
+		return;
+	}
+	if (status != 0) {
+		/* The registry still says packs_pending in S3 (and, after
+		 * the restore below, in memory): a restart resumes from the
+		 * top, which is harmless. */
+		exp->packs_pending = true;
+		export_settle_again(st, "registry", status);
+		return;
+	}
+	exp->settle = NULL;
+	st->exp = NULL;
+	st->busy = false;
+	/* Durable everywhere: the pin can go. */
+	s3_peer_unpin_export(exp->uuid_str);
+	SPDK_NOTICELOG("export %s is ready: every pack is in S3 and the manifest "
+		       "no longer names the source peer as the only source\n",
+		       exp->uuid_str);
+	export_settle_free(st);
+}
+
+static void
+export_settle_republished(void *cb_arg, struct s3_export_manifest *m, int status)
+{
+	struct export_settle *st = cb_arg;
+	struct s3lvol_export *exp = st->exp;
+	int rc;
+
+	s3_export_manifest_unref(m);
+	if (!exp) {
+		st->busy = false;
+		export_settle_free(st);
+		return;
+	}
+	if (status != 0) {
+		export_settle_again(st, "manifest republish", status);
+		return;
+	}
+	exp->packs_pending = false;
+	exp->generation = st->m->generation;
+	rc = s3lvol_export_registry_save(exp->lvs, export_settle_saved, st);
+	if (rc != 0) {
+		exp->packs_pending = true;
+		export_settle_again(st, "registry", rc);
+	}
+}
+
+static void
+export_settle_uploaded(void *cb_arg, int status)
+{
+	struct export_settle *st = cb_arg;
+	int rc;
+
+	if (!st->exp) {
+		st->busy = false;
+		export_settle_free(st);
+		return;
+	}
+	if (status != 0) {
+		export_settle_again(st, status == -ENOENT || status == -EBADMSG ?
+				    "the local pack copy (it cannot be uploaded)" :
+				    "pack upload", status);
+		return;
+	}
+	/* A higher generation: an importer that failed against the
+	 * peer-only manifest refetches it, and only a newer generation is
+	 * swapped in -- that is how it learns it may now read S3. */
+	st->m->packs_pending = false;
+	st->m->generation++;
+	rc = s3_export_manifest_publish(s3lvol_lvstore_get_client(st->exp->lvs), st->m,
+					export_settle_republished, st);
+	if (rc != 0) {
+		export_settle_again(st, "manifest republish", rc);
+	}
+}
+
+static void
+export_settle_got_manifest(void *cb_arg, uint64_t bytes_read, int status)
+{
+	struct export_settle *st = cb_arg;
+	struct s3lvol_export *exp = st->exp;
+	int rc;
+
+	if (!exp) {
+		st->busy = false;
+		export_settle_free(st);
+		return;
+	}
+	if (status != 0) {
+		export_settle_again(st, "manifest read", status);
+		return;
+	}
+	rc = s3_export_manifest_parse(st->body, bytes_read, &st->m);
+	if (rc != 0 || strcmp(st->m->uuid_str, exp->uuid_str) != 0 ||
+	    !s3_export_manifest_is_packed(st->m) || !st->m->pack_sha) {
+		export_settle_again(st, "manifest parse", rc ? rc : -EINVAL);
+		return;
+	}
+	if (!st->m->packs_pending) {
+		/* Republished before a crash lost the registry write: only the
+		 * registry is behind. */
+		exp->packs_pending = false;
+		exp->generation = st->m->generation;
+		rc = s3lvol_export_registry_save(exp->lvs, export_settle_saved, st);
+		if (rc != 0) {
+			exp->packs_pending = true;
+			export_settle_again(st, "registry", rc);
+		}
+		return;
+	}
+	rc = s3_export_packs_upload(s3lvol_lvstore_get_client(exp->lvs),
+				    s3lvol_lvstore_get_name(exp->lvs), exp->uuid_str,
+				    st->m->pack_count, st->m->pack_sha, &st->cancel,
+				    export_settle_uploaded, st);
+	if (rc != 0) {
+		export_settle_again(st, "pack upload start", rc);
+	}
+}
+
+static void
+export_settle_head_done(void *cb_arg, int status)
+{
+	struct export_settle *st = cb_arg;
+	int rc;
+
+	if (!st->exp) {
+		st->busy = false;
+		export_settle_free(st);
+		return;
+	}
+	if (status != 0 || st->size == 0 || st->size > 64u * 1024 * 1024) {
+		export_settle_again(st, "manifest head", status ? status : -EINVAL);
+		return;
+	}
+	st->body = malloc(st->size);
+	if (!st->body) {
+		export_settle_again(st, "manifest read", -ENOMEM);
+		return;
+	}
+	rc = s3_get_range(s3lvol_lvstore_get_client(st->exp->lvs), st->key, 0, st->size,
+			  st->body, export_settle_got_manifest, st);
+	if (rc != 0) {
+		export_settle_again(st, "manifest read", rc);
+	}
+}
+
+static void
+export_settle_step(struct export_settle *st)
+{
+	struct s3lvol_export *exp = st->exp;
+	int rc;
+
+	if (!s3lvol_lvstore_xfer_allowed(exp->lvs) ||
+	    s3lvol_export_registry_busy(exp->lvs)) {
+		/* Not yet: try again shortly without counting it as a failure. */
+		st->retry = SPDK_POLLER_REGISTER(export_settle_retry_fire, st,
+						 EXPORT_SETTLE_RETRY_MIN_US);
+		return;
+	}
+	st->busy = true;
+	s3_export_manifest_key(exp->uuid_str, st->key, sizeof(st->key));
+	rc = s3_head(s3lvol_lvstore_get_client(exp->lvs), st->key, &st->size,
+		     export_settle_head_done, st);
+	if (rc != 0) {
+		export_settle_again(st, "manifest head", rc);
+	}
+}
+
+int
+s3lvol_export_settle_start(struct s3lvol_export *exp)
+{
+	struct export_settle *st;
+
+	if (!exp || !exp->packs_pending) {
+		return 0;
+	}
+	if (exp->settle) {
+		return 0;
+	}
+	st = calloc(1, sizeof(*st));
+	if (!st) {
+		return -ENOMEM;
+	}
+	st->exp = exp;
+	snprintf(st->uuid, sizeof(st->uuid), "%s", exp->uuid_str);
+	exp->settle = st;
+	/* Keep it pinned whatever happened before (a restart, an operator):
+	 * the pin is what stops the cache from evicting the only copy. */
+	(void)s3_peer_pin_export(exp->uuid_str);
+	export_settle_step(st);
+	return 0;
+}
+
+/* The export is going away (unload, forget): stop settling. The registry
+ * keeps packs_pending, so the next attach resumes. */
+static void
+export_settle_detach(struct s3lvol_export *exp)
+{
+	struct export_settle *st = exp->settle;
+
+	if (!st) {
+		return;
+	}
+	exp->settle = NULL;
+	st->exp = NULL;
+	st->cancel = true;
+	if (!st->busy) {
+		export_settle_free(st);
+	}
+	/* Otherwise the in-flight step sees exp == NULL and frees it. */
+}
+
+void
+s3lvol_exports_settle_resume(struct s3lvol_lvstore *lvs)
+{
+	struct s3lvol_export *exp;
+	unsigned n = 0;
+
+	TAILQ_FOREACH(exp, &g_exports, link) {
+		if (exp->lvs == lvs && exp->packs_pending && !exp->publication_pending &&
+		    !exp->settle) {
+			if (s3lvol_export_settle_start(exp) == 0) {
+				n++;
+			}
+		}
+	}
+	if (n) {
+		SPDK_NOTICELOG("lvstore '%s': resuming the S3 upload of %u peer_ready "
+			       "export(s)\n", s3lvol_lvstore_get_name(lvs), n);
+	}
+}
+
+bool
+s3lvol_export_packs_pending(struct s3lvol_lvstore *lvs, const char *snapshot_name)
+{
+	struct s3lvol_export *exp;
+
+	TAILQ_FOREACH(exp, &g_exports, link) {
+		if (exp->packs_pending && (!lvs || exp->lvs == lvs) &&
+		    (!snapshot_name || strcmp(exp->snapshot, snapshot_name) == 0)) {
+			return true;
+		}
+	}
+	return false;
 }

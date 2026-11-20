@@ -292,3 +292,67 @@ func TestReconcileOnceRetryingStaysInProgress(t *testing.T) {
 	ReconcileOnce(context.Background(), db)
 	assertRemote(t, db, constants.PauseSnapshotTableName, "pause-retry", constants.RemoteStatusFailed)
 }
+
+func TestReconcileOncePeerReadyThenReady(t *testing.T) {
+	db := setupReconcilerDB(t)
+	requireNoErr(t, db.Create(&models.PauseSnapshotRecord{
+		SnapshotID:   "pause-pr",
+		SandboxID:    "sb-pr",
+		NodeIP:       "10.0.0.2",
+		Backend:      constants.SnapshotBackendS3,
+		RemoteStatus: constants.RemoteStatusInProgress,
+		Status:       "READY",
+	}).Error)
+	state := constants.RemoteStatusPeerReady
+	queries := 0
+	prevQuery := queryStatus
+	prevAddr := cubeletAddr
+	queryStatus = func(_ context.Context, _ string, req *snapshotv1.StatusRequest) (*snapshotv1.StatusResponse, error) {
+		queries++
+		return &snapshotv1.StatusResponse{SnapshotId: req.GetSnapshotId(), State: state,
+			RemoteReady: state == constants.RemoteStatusReady,
+			RemoteUuids: `{"rootfs":"r","memory":"m","metadata":"x"}`}, nil
+	}
+	cubeletAddr = func(hostIP string) string { return hostIP }
+	t.Cleanup(func() {
+		queryStatus = prevQuery
+		cubeletAddr = prevAddr
+	})
+
+	ReconcileOnce(context.Background(), db)
+	assertRemote(t, db, constants.PauseSnapshotTableName, "pause-pr", constants.RemoteStatusPeerReady)
+	var rec models.PauseSnapshotRecord
+	requireNoErr(t, db.Table(constants.PauseSnapshotTableName).Where("snapshot_id = ?", "pause-pr").First(&rec).Error)
+	if rec.ExportUUIDs == "" {
+		t.Fatal("peer_ready must carry the export uuids a target imports")
+	}
+	// Still polled while peer_ready, unchanged while the node says so.
+	ReconcileOnce(context.Background(), db)
+	assertRemote(t, db, constants.PauseSnapshotTableName, "pause-pr", constants.RemoteStatusPeerReady)
+	state = constants.RemoteStatusReady
+	ReconcileOnce(context.Background(), db)
+	assertRemote(t, db, constants.PauseSnapshotTableName, "pause-pr", constants.RemoteStatusReady)
+	if queries != 3 {
+		t.Fatalf("want 3 polls, got %d", queries)
+	}
+}
+
+func TestReconcileOncePeerReadyWithoutUUIDsStays(t *testing.T) {
+	db := setupReconcilerDB(t)
+	requireNoErr(t, db.Create(&models.PauseSnapshotRecord{
+		SnapshotID: "pause-nouuid", SandboxID: "sb-n", NodeIP: "10.0.0.2",
+		Backend: constants.SnapshotBackendS3, RemoteStatus: constants.RemoteStatusInProgress, Status: "READY",
+	}).Error)
+	prevQuery := queryStatus
+	prevAddr := cubeletAddr
+	queryStatus = func(_ context.Context, _ string, req *snapshotv1.StatusRequest) (*snapshotv1.StatusResponse, error) {
+		return &snapshotv1.StatusResponse{SnapshotId: req.GetSnapshotId(), State: constants.RemoteStatusPeerReady}, nil
+	}
+	cubeletAddr = func(hostIP string) string { return hostIP }
+	t.Cleanup(func() {
+		queryStatus = prevQuery
+		cubeletAddr = prevAddr
+	})
+	ReconcileOnce(context.Background(), db)
+	assertRemote(t, db, constants.PauseSnapshotTableName, "pause-nouuid", constants.RemoteStatusInProgress)
+}

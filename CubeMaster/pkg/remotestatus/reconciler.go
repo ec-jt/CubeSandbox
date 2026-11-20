@@ -3,8 +3,9 @@
 //
 
 // Package remotestatus polls Cubelet Snapshot.Status for S3 rows that are
-// still uploading (remote_status=inprogress) and writes the terminal
-// result. Multiple CubeMaster replicas may run this loop; updates use
+// still uploading (remote_status=inprogress or peer_ready) and writes the
+// next state: peer_ready (importable from the origin's peer only), then
+// ready or failed. Multiple CubeMaster replicas may run this loop; updates use
 // WHERE remote_status=inprogress so a replica that already finished the
 // row is not overwritten.
 package remotestatus
@@ -23,10 +24,16 @@ import (
 	"gorm.io/gorm"
 )
 
-const reconcileInterval = 5 * time.Second
+// Short: a peer_ready row is what lets a cross-node resume start, and it is
+// seconds after the pause. One Status RPC per row still uploading.
+const reconcileInterval = 2 * time.Second
+
+// pollingStatuses are the remote_status values still moving toward ready.
+var pollingStatuses = []string{constants.RemoteStatusInProgress, constants.RemoteStatusPeerReady}
 
 type workItem struct {
 	kind        string
+	status      string
 	table       string
 	snapshotID  string
 	hostIP      string
@@ -90,7 +97,7 @@ func listInProgress(ctx context.Context, db *gorm.DB) ([]workItem, error) {
 	var items []workItem
 	var snaps []models.SnapshotRecord
 	if err := db.WithContext(ctx).Table(constants.SnapshotTableName).
-		Where("backend = ? AND remote_status = ?", constants.SnapshotBackendS3, constants.RemoteStatusInProgress).
+		Where("backend = ? AND remote_status IN ?", constants.SnapshotBackendS3, pollingStatuses).
 		Find(&snaps).Error; err != nil {
 		return nil, err
 	}
@@ -101,12 +108,13 @@ func listInProgress(ctx context.Context, db *gorm.DB) ([]workItem, error) {
 			snapshotID:  rec.SnapshotID,
 			hostIP:      rec.OriginNodeIP,
 			backend:     rec.Backend,
+			status:      rec.RemoteStatus,
 			exportUUIDs: rec.ExportUUIDs,
 		})
 	}
 	var pauses []models.PauseSnapshotRecord
 	if err := db.WithContext(ctx).Table(constants.PauseSnapshotTableName).
-		Where("backend = ? AND remote_status = ?", constants.SnapshotBackendS3, constants.RemoteStatusInProgress).
+		Where("backend = ? AND remote_status IN ?", constants.SnapshotBackendS3, pollingStatuses).
 		Find(&pauses).Error; err != nil {
 		return nil, err
 	}
@@ -117,6 +125,7 @@ func listInProgress(ctx context.Context, db *gorm.DB) ([]workItem, error) {
 			snapshotID:  rec.SnapshotID,
 			hostIP:      rec.NodeIP,
 			backend:     rec.Backend,
+			status:      rec.RemoteStatus,
 			exportUUIDs: rec.ExportUUIDs,
 		})
 	}
@@ -138,14 +147,14 @@ func reconcileItem(ctx context.Context, db *gorm.DB, item workItem) {
 		return
 	}
 	next, ok := terminalRemoteStatus(st.GetState(), st.GetRemoteReady())
-	if !ok {
+	if !ok || strings.EqualFold(strings.TrimSpace(item.status), next) {
 		return
 	}
 	updates := map[string]any{
 		"remote_status": next,
 		"updated_at":    nowTimestamp(),
 	}
-	if next == constants.RemoteStatusReady {
+	if next == constants.RemoteStatusReady || next == constants.RemoteStatusPeerReady {
 		// Async export (B15) rows are inprogress with empty export_uuids; the
 		// identities arrive here. A row must never become ready without them,
 		// since cross-node restore imports exactly these uuids. Rows that
@@ -160,7 +169,7 @@ func reconcileItem(ctx context.Context, db *gorm.DB, item workItem) {
 		}
 	}
 	res := db.WithContext(ctx).Table(item.table).
-		Where("snapshot_id = ? AND remote_status = ?", snapshotID, constants.RemoteStatusInProgress).
+		Where("snapshot_id = ? AND remote_status IN ?", snapshotID, pollingStatuses).
 		Updates(updates)
 	if res.Error != nil {
 		log.G(ctx).Warnf("remote_status update %s %s failed: %v", item.kind, snapshotID, res.Error)
@@ -178,6 +187,8 @@ func terminalRemoteStatus(state string, remoteReady bool) (string, bool) {
 		return constants.RemoteStatusReady, true
 	case constants.RemoteStatusFailed:
 		return constants.RemoteStatusFailed, true
+	case constants.RemoteStatusPeerReady:
+		return constants.RemoteStatusPeerReady, true
 	case constants.RemoteStatusRunning, constants.RemoteStatusInProgress, constants.RemoteStatusPending:
 		return "", false
 	}

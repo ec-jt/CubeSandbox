@@ -34,6 +34,7 @@ SRCS = s3_bs_dev.c \
        s3_gc.c \
        s3_export.c \
        s3_export_ref.c \
+       s3_export_upload.c \
        s3_client_aws.c
 
 OBJS = $(SRCS:.c=.o)
